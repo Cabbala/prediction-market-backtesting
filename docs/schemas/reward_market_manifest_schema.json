@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cabbala.local/polymarket/reward-market-manifest.schema.json",
+  "title": "Polymarket reward market scanner manifest",
+  "type": "object",
+  "required": ["schema_version", "mode", "generated_at_utc", "safety", "scoring_rules", "candidates"],
+  "properties": {
+    "schema_version": {"const": "polymarket.reward-market-manifest.v1"},
+    "mode": {"const": "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"},
+    "generated_at_utc": {"type": "string"},
+    "source_scan_timestamp_utc": {"type": ["string", "null"]},
+    "input_scan_path": {"type": "string"},
+    "safety": {
+      "type": "object",
+      "required": ["live_trading", "submit_orders", "sign_orders", "requires_secrets", "intended_uses"],
+      "properties": {
+        "live_trading": {"const": false},
+        "submit_orders": {"const": false},
+        "sign_orders": {"const": false},
+        "requires_secrets": {"const": false},
+        "intended_uses": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["market_id", "slug", "question", "reward_proxy_score", "eligible_for_backtest_queue", "features", "accidental_fill_risk_flags"],
+        "properties": {
+          "market_id": {"type": "string"},
+          "slug": {"type": ["string", "null"]},
+          "question": {"type": ["string", "null"]},
+          "clob_token_ids": {"type": "array"},
+          "reward_proxy_score": {"type": "number"},
+          "eligible_for_backtest_queue": {"type": "boolean"},
+          "blockers": {"type": "array", "items": {"type": "string"}},
+          "accidental_fill_risk_flags": {"type": "array", "items": {"type": "string"}},
+          "features": {"type": "object"}
+        }
+      }
+    }
+  }
+}
