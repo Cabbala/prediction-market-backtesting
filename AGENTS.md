@@ -237,3 +237,14 @@ Explicitly check:
 - Review the PR diff after opening it.
 - Wait for GitHub Actions to pass.
 - Wait for explicit user confirmation before merging to `main`.
+
+## Hermes Phase 0 Polymarket Autonomous Research Addendum
+
+- This worktree is for shadow/backtest research only; live trading and real order submission are forbidden.
+- Do not add wallet, Polymarket API, or Telonex secrets.
+- PMXT/public data first; Telonex only after API key/mirror approval.
+- Use `.venv/bin/python` and focused tests in this worktree.
+- Use PMBT for replay/backtest/optimization, not live CLOB V2 execution.
+- Branch name: `hermes/20260504-phase0-pmbt`.
+- Push only to remote `cabbala` after Hermes reviews diff and tests.
+- Priority sequence: Microprice optimizer, Volatility Spike Deep Limit Maker harness, low-fill-probability liquidity-reward maker scoring/backtest approximation.
