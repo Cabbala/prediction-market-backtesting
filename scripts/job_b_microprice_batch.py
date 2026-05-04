@@ -5,7 +5,6 @@ import asyncio
 import csv
 import json
 import math
-import os
 from dataclasses import dataclass, asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -141,7 +140,29 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
             for raw in raw_candidates:
                 if not isinstance(raw, dict):
                     continue
-                cand = _normalize_candidate(raw, source_strategy="reward_manifest")
+                source_strategy = str(
+                    raw.get("source_strategy")
+                    or raw.get("strategy")
+                    or payload.get("strategy")
+                    or "reward_manifest"
+                )
+                if strategy and source_strategy != strategy:
+                    continue
+                coverage = raw.get("coverage")
+                if isinstance(coverage, dict):
+                    if coverage.get("status") != "pass":
+                        continue
+                    if int(coverage.get("gap_hours_missing") or 0) != 0:
+                        continue
+                    book_events = coverage.get("book_events")
+                    min_book_events = coverage.get("min_book_events")
+                    if book_events is not None and min_book_events is not None:
+                        try:
+                            if int(book_events) < int(min_book_events):
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                cand = _normalize_candidate(raw, source_strategy=source_strategy)
                 if cand is None:
                     continue
                 key = (cand.slug, cand.token_index)
