@@ -17,6 +17,7 @@ def _candidate(**overrides):
         "clob_token_ids": ["yes", "no"],
         "complete_books": True,
         "end_date": "2026-07-20T00:00:00Z",
+        "createdAt": "2026-05-01T00:00:00Z",
         "liquidity": 100000.0,
         "volume": 200000.0,
         "reward_hint": False,
@@ -34,7 +35,38 @@ def test_score_candidate_keeps_reward_scanner_shadow_safe() -> None:
     assert scored["eligible_for_backtest_queue"] is True
     assert scored["features"]["fee_reward_category"] == "public_proxy_only_reward_unverified"
     assert scored["features"]["min_top_book_depth"] == 20000
+    assert scored["features"]["market_age_days"] is not None
     assert scored["accidental_fill_risk_flags"] == []
+
+
+def test_score_candidate_reads_latest_scan_books_and_explicit_reward_terms() -> None:
+    candidate = {
+        "id": "558960",
+        "conditionId": "0xabc",
+        "slug": "world-cup-tail",
+        "question": "Will team win?",
+        "endDate": "2026-07-20T00:00:00Z",
+        "liquidity": 5_000_000,
+        "volume24hr": 50_000,
+        "rewardsMinSize": 100,
+        "rewardsMaxSpread": 2.5,
+        "strategy_fits": ["microprice", "reward_eligible_candidate"],
+        "books": [
+            {"token_id": "yes", "best_bid": 0.002, "best_ask": 0.003, "bid_size": 1000, "ask_size": 2000, "depth_2c": 8000, "mid": 0.0025, "spread": 0.001},
+            {"token_id": "no", "best_bid": 0.997, "best_ask": 0.998, "bid_size": 2000, "ask_size": 1000, "depth_2c": 8000, "mid": 0.9975, "spread": 0.001},
+        ],
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["features"]["fee_reward_category"] == "explicit_gamma_reward_terms"
+    assert scored["features"]["has_explicit_reward_evidence"] is True
+    assert scored["features"]["volume_24h"] == 50000
+    assert scored["features"]["min_top_book_depth"] == 8000
+    assert scored["accidental_fill_risk_flags"] == [
+        "no_tail_price_accidental_fill_risk",
+        "yes_tail_price_accidental_fill_risk",
+    ]
 
 
 def test_accidental_fill_risk_flags_tail_and_thin_books() -> None:
@@ -50,12 +82,12 @@ def test_accidental_fill_risk_flags_tail_and_thin_books() -> None:
     ]
 
 
-def test_build_reward_manifest_sorts_candidates_and_declares_no_live_trading() -> None:
+def test_build_reward_manifest_accepts_candidates_key_and_declares_no_live_trading() -> None:
     scan = {
-        "metadata": {"timestamp_utc": "2026-05-04T06:01:34+00:00", "mode": SHADOW_MODE},
-        "top_candidates": [
+        "metadata": {"utc_timestamp": "2026-05-04T06:01:34+00:00", "mode": SHADOW_MODE},
+        "candidates": [
             _candidate(market_id="wide", yes_book={"ok": True, "best_bid": 0.45, "best_ask": 0.50, "best_bid_size": 100, "best_ask_size": 100, "mid": 0.475, "spread": 0.05}),
-            _candidate(market_id="tight"),
+            _candidate(market_id="tight", rewardsMinSize=100),
         ],
     }
 

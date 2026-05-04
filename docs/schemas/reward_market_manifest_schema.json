@@ -9,6 +9,8 @@
     "mode": {"const": "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"},
     "generated_at_utc": {"type": "string"},
     "source_scan_timestamp_utc": {"type": ["string", "null"]},
+    "source_scan_mode": {"type": ["string", "null", "boolean"]},
+    "source_artifacts": {"type": "object"},
     "input_scan_path": {"type": "string"},
     "safety": {
       "type": "object",
@@ -19,8 +21,10 @@
         "sign_orders": {"const": false},
         "requires_secrets": {"const": false},
         "intended_uses": {"type": "array", "items": {"type": "string"}}
-      }
+      },
+      "additionalProperties": true
     },
+    "scoring_rules": {"type": "object"},
     "candidates": {
       "type": "array",
       "items": {
@@ -28,16 +32,42 @@
         "required": ["market_id", "slug", "question", "reward_proxy_score", "eligible_for_backtest_queue", "features", "accidental_fill_risk_flags"],
         "properties": {
           "market_id": {"type": "string"},
+          "condition_id": {"type": ["string", "null"]},
           "slug": {"type": ["string", "null"]},
           "question": {"type": ["string", "null"]},
+          "source_url": {"type": ["string", "null"]},
           "clob_token_ids": {"type": "array"},
+          "outcomes": {"type": "array"},
+          "source_candidate_score": {"type": ["number", "null"]},
           "reward_proxy_score": {"type": "number"},
           "eligible_for_backtest_queue": {"type": "boolean"},
           "blockers": {"type": "array", "items": {"type": "string"}},
           "accidental_fill_risk_flags": {"type": "array", "items": {"type": "string"}},
-          "features": {"type": "object"}
-        }
+          "features": {
+            "type": "object",
+            "required": ["yes_spread", "no_spread", "avg_spread", "min_top_book_depth", "volume", "volume_24h", "liquidity", "fee_reward_category", "has_explicit_reward_evidence"],
+            "properties": {
+              "yes_spread": {"type": "number"},
+              "no_spread": {"type": "number"},
+              "avg_spread": {"type": "number"},
+              "min_top_book_depth": {"type": "number"},
+              "yes_top_book_depth": {"type": "number"},
+              "no_top_book_depth": {"type": "number"},
+              "volume": {"type": "number"},
+              "volume_24h": {"type": "number"},
+              "liquidity": {"type": "number"},
+              "days_to_end": {"type": ["number", "null"]},
+              "market_age_days": {"type": ["number", "null"]},
+              "volatility_proxy": {"type": "number"},
+              "fee_reward_category": {"type": "string"},
+              "has_explicit_reward_evidence": {"type": "boolean"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
       }
     }
-  }
+  },
+  "additionalProperties": true
 }

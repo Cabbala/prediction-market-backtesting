@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -32,9 +32,39 @@ def _parse_dt(value: Any) -> datetime | None:
     return dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
+def _first_present(candidate: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in candidate and candidate[key] not in (None, ""):
+            return candidate[key]
+    return None
+
+
+def _book_from_scan_books(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
+    books = candidate.get("books")
+    if not isinstance(books, Sequence) or isinstance(books, (str, bytes)):
+        return {}
+    idx = 0 if side == "yes" else 1
+    if len(books) <= idx or not isinstance(books[idx], Mapping):
+        return {}
+    raw = books[idx]
+    return {
+        "ok": True,
+        "best_bid": raw.get("best_bid"),
+        "best_ask": raw.get("best_ask"),
+        "best_bid_size": raw.get("best_bid_size", raw.get("bid_size")),
+        "best_ask_size": raw.get("best_ask_size", raw.get("ask_size")),
+        "depth_2c": raw.get("depth_2c"),
+        "mid": raw.get("mid"),
+        "spread": raw.get("spread"),
+        "token_id": raw.get("token_id"),
+    }
+
+
 def _book(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
     value = candidate.get(f"{side}_book")
-    return value if isinstance(value, Mapping) else {}
+    if isinstance(value, Mapping):
+        return value
+    return _book_from_scan_books(candidate, side)
 
 
 def _spread(candidate: Mapping[str, Any], side: str) -> float:
@@ -49,13 +79,54 @@ def _spread(candidate: Mapping[str, Any], side: str) -> float:
 
 def _depth(candidate: Mapping[str, Any], side: str) -> float:
     book = _book(candidate, side)
-    return _as_float(book.get("best_bid_size")) + _as_float(book.get("best_ask_size"))
+    top_depth = _as_float(book.get("best_bid_size")) + _as_float(book.get("best_ask_size"))
+    return max(top_depth, _as_float(book.get("depth_2c")))
 
 
 def _mid(candidate: Mapping[str, Any], side: str) -> float | None:
     book = _book(candidate, side)
     mid = _as_float(book.get("mid"), default=-1.0)
-    return mid if mid >= 0 else None
+    if mid >= 0:
+        return mid
+    prices = candidate.get("outcomePrices")
+    idx = 0 if side == "yes" else 1
+    if isinstance(prices, Sequence) and not isinstance(prices, (str, bytes)) and len(prices) > idx:
+        parsed = _as_float(prices[idx], default=-1.0)
+        return parsed if parsed >= 0 else None
+    return None
+
+
+def _has_explicit_reward_evidence(candidate: Mapping[str, Any]) -> bool:
+    if candidate.get("reward_hint"):
+        return True
+    for key in ("clobRewards", "rewards", "rewardsMinSize", "rewardsMaxSpread", "umaReward"):
+        value = candidate.get(key)
+        if value not in (None, "", [], {}, False):
+            return True
+    fits = candidate.get("strategy_fits") or []
+    return isinstance(fits, Sequence) and "reward_eligible_candidate" in fits
+
+
+def _reward_category(candidate: Mapping[str, Any]) -> str:
+    if candidate.get("clobRewards") not in (None, "", [], {}, False):
+        return "explicit_clob_rewards"
+    if candidate.get("rewardsMinSize") not in (None, "", [], {}, False) or candidate.get("rewardsMaxSpread") not in (None, "", [], {}, False):
+        return "explicit_gamma_reward_terms"
+    if candidate.get("umaReward") not in (None, "", [], {}, False):
+        return "explicit_uma_reward_hint"
+    if candidate.get("reward_hint"):
+        return "explicit_reward_hint"
+    return "public_proxy_only_reward_unverified"
+
+
+def _strategy_fits(candidate: Mapping[str, Any]) -> set[str]:
+    value = candidate.get("strategy_fits")
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return {str(v) for v in value}
+    fit_map = candidate.get("strategy_fit")
+    if isinstance(fit_map, Mapping):
+        return {str(k) for k, enabled in fit_map.items() if enabled}
+    return set()
 
 
 @dataclass(frozen=True)
@@ -73,6 +144,7 @@ class RewardScoreRules:
     min_depth: float = 5_000.0
     min_days_to_end: float = 3.0
     max_days_to_end: float = 365.0
+    min_market_age_hours: float = 1.0
     tail_price_threshold: float = 0.02
 
 
@@ -114,26 +186,34 @@ def score_candidate(
     yes_depth = _depth(candidate, "yes")
     no_depth = _depth(candidate, "no")
     liquidity = _as_float(candidate.get("liquidity"))
-    volume = _as_float(candidate.get("volume"))
-    end_dt = _parse_dt(candidate.get("end_date") or candidate.get("endDate"))
+    volume = _as_float(_first_present(candidate, "volume", "volumeNum"))
+    volume_24h = _as_float(_first_present(candidate, "volume24hr", "volume24h", "volume24hrClob"))
+    end_dt = _parse_dt(_first_present(candidate, "end_date", "endDate"))
+    created_dt = _parse_dt(_first_present(candidate, "createdAt", "created_at", "startDate", "start_date"))
     days_to_end = ((end_dt - generated_at).total_seconds() / 86400.0) if end_dt else None
+    market_age_days = ((generated_at - created_dt).total_seconds() / 86400.0) if created_dt else None
+    avg_spread = (yes_spread + no_spread) / 2.0
 
-    spread_component = max(0.0, 1.0 - ((yes_spread + no_spread) / 2.0) / rules.max_side_spread) * 30.0
-    tight_reward_component = max(0.0, 1.0 - abs(((yes_spread + no_spread) / 2.0) - rules.ideal_spread) / rules.max_side_spread) * 10.0
+    spread_component = max(0.0, 1.0 - avg_spread / rules.max_side_spread) * 30.0
+    tight_reward_component = max(0.0, 1.0 - abs(avg_spread - rules.ideal_spread) / rules.max_side_spread) * 10.0
     depth_component = min(20.0, math.log10(max(1.0, min(yes_depth, no_depth))) * 4.0)
     liquidity_component = min(15.0, math.log10(max(1.0, liquidity)) * 2.5)
-    volume_component = min(10.0, math.log10(max(1.0, volume)) * 1.5)
+    volume_component = min(10.0, math.log10(max(1.0, max(volume, volume_24h))) * 1.5)
     horizon_component = 0.0
     if days_to_end is not None:
         if rules.min_days_to_end <= days_to_end <= rules.max_days_to_end:
             horizon_component = 10.0
         elif days_to_end > 0:
             horizon_component = 4.0
-    volatility_proxy = 5.0 if (candidate.get("strategy_fit") or {}).get("volatility_spike_deep_limit_maker") else 0.0
-    reward_hint_component = 5.0 if bool(candidate.get("reward_hint")) else 0.0
+    age_component = 0.0
+    if market_age_days is None or market_age_days * 24.0 >= rules.min_market_age_hours:
+        age_component = 3.0
+    fits = _strategy_fits(candidate)
+    volatility_proxy = 5.0 if {"volatility_spike_deep_limit_maker", "deep_limit_maker"} & fits else 0.0
+    reward_hint_component = 8.0 if _has_explicit_reward_evidence(candidate) else 0.0
 
     risk_flags = accidental_fill_risk_flags(candidate, rules)
-    risk_penalty = min(15.0, 3.0 * len(risk_flags))
+    risk_penalty = min(18.0, 3.0 * len(risk_flags))
     score = (
         spread_component
         + tight_reward_component
@@ -141,23 +221,26 @@ def score_candidate(
         + liquidity_component
         + volume_component
         + horizon_component
+        + age_component
         + volatility_proxy
         + reward_hint_component
         - risk_penalty
     )
 
-    complete_books = bool(candidate.get("complete_books")) and _book(candidate, "yes").get("ok", True) and _book(candidate, "no").get("ok", True)
+    complete_books = bool(candidate.get("complete_books", True)) and bool(_book(candidate, "yes")) and bool(_book(candidate, "no"))
     blockers: list[str] = []
     if not complete_books:
         blockers.append("missing_complete_yes_no_clob_books")
     if liquidity < rules.min_liquidity:
         blockers.append("liquidity_below_proxy_threshold")
-    if volume < rules.min_volume:
+    if volume < rules.min_volume and volume_24h < rules.min_volume:
         blockers.append("volume_below_proxy_threshold")
     if yes_spread > rules.max_side_spread or no_spread > rules.max_side_spread:
         blockers.append("spread_too_wide_for_reward_proxy")
     if days_to_end is not None and days_to_end <= 0:
         blockers.append("expired_or_resolved")
+    if market_age_days is not None and market_age_days * 24.0 < rules.min_market_age_hours:
+        blockers.append("market_too_new_for_stable_backtest_queue")
 
     return {
         "reward_proxy_score": round(score, 6),
@@ -166,39 +249,54 @@ def score_candidate(
         "features": {
             "yes_spread": yes_spread,
             "no_spread": no_spread,
+            "avg_spread": avg_spread,
             "min_top_book_depth": min(yes_depth, no_depth),
             "yes_top_book_depth": yes_depth,
             "no_top_book_depth": no_depth,
             "volume": volume,
+            "volume_24h": volume_24h,
             "liquidity": liquidity,
             "days_to_end": None if days_to_end is None else round(days_to_end, 3),
-            "market_age_days": None,
+            "market_age_days": None if market_age_days is None else round(market_age_days, 3),
             "volatility_proxy": volatility_proxy,
-            "fee_reward_category": "gamma_reward_hint" if bool(candidate.get("reward_hint")) else "public_proxy_only_reward_unverified",
+            "fee_reward_category": _reward_category(candidate),
+            "has_explicit_reward_evidence": _has_explicit_reward_evidence(candidate),
         },
         "accidental_fill_risk_flags": risk_flags,
     }
 
 
+def _scan_candidates(scan: Mapping[str, Any]) -> Sequence[Any]:
+    for key in ("top_candidates", "candidates"):
+        value = scan.get(key)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return value
+    return []
+
+
+def _scan_timestamp(metadata: Mapping[str, Any]) -> Any:
+    return metadata.get("timestamp_utc") or metadata.get("utc_timestamp") or metadata.get("generated_at_utc")
+
+
 def build_reward_manifest(scan: Mapping[str, Any], *, limit: int = 25, rules: RewardScoreRules | None = None) -> dict[str, Any]:
     rules = rules or RewardScoreRules()
     metadata = scan.get("metadata") if isinstance(scan.get("metadata"), Mapping) else {}
-    generated_at = _parse_dt(metadata.get("timestamp_utc")) or datetime.now(UTC)
-    candidates = scan.get("top_candidates") if isinstance(scan.get("top_candidates"), Sequence) else []
+    generated_at = _parse_dt(_scan_timestamp(metadata)) or datetime.now(UTC)
     scored: list[dict[str, Any]] = []
-    for candidate in candidates:
+    for candidate in _scan_candidates(scan):
         if not isinstance(candidate, Mapping):
             continue
         score = score_candidate(candidate, generated_at=generated_at, rules=rules)
         scored.append(
             {
-                "market_id": str(candidate.get("market_id", "")),
-                "condition_id": candidate.get("condition_id"),
+                "market_id": str(_first_present(candidate, "market_id", "id") or ""),
+                "condition_id": _first_present(candidate, "condition_id", "conditionId"),
                 "slug": candidate.get("slug"),
                 "question": candidate.get("question"),
-                "clob_token_ids": candidate.get("clob_token_ids") or [],
+                "clob_token_ids": candidate.get("clob_token_ids") or [book.get("token_id") for book in candidate.get("books", []) if isinstance(book, Mapping)],
                 "outcomes": candidate.get("outcomes") or ["Yes", "No"],
-                "source_candidate_score": candidate.get("candidate_score"),
+                "source_candidate_score": _first_present(candidate, "candidate_score", "score"),
+                "source_url": candidate.get("url"),
                 **score,
             }
         )
@@ -207,9 +305,9 @@ def build_reward_manifest(scan: Mapping[str, Any], *, limit: int = 25, rules: Re
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "mode": SHADOW_MODE,
         "generated_at_utc": datetime.now(UTC).isoformat(),
-        "source_scan_timestamp_utc": metadata.get("timestamp_utc"),
-        "source_scan_mode": metadata.get("mode"),
-        "source_artifacts": metadata.get("sources", {}),
+        "source_scan_timestamp_utc": _scan_timestamp(metadata),
+        "source_scan_mode": metadata.get("mode") or metadata.get("safety", {}).get("mode"),
+        "source_artifacts": metadata.get("sources", metadata.get("data_sources", {})),
         "safety": {
             "live_trading": False,
             "submit_orders": False,
@@ -217,7 +315,7 @@ def build_reward_manifest(scan: Mapping[str, Any], *, limit: int = 25, rules: Re
             "requires_secrets": False,
             "intended_uses": ["PMBT_BACKTEST_QUEUE", "HOMERUN_SHADOW_FORWARD_LOGGING"],
         },
-        "scoring_rules": rules.__dict__,
+        "scoring_rules": asdict(rules),
         "candidates": scored[:limit],
     }
 
