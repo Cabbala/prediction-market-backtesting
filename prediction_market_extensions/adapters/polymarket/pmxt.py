@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -81,6 +82,19 @@ class PolymarketPMXTDataLoader(PolymarketDataLoader):
     _PMXT_BASE_URL = "https://r2v2.pmxt.dev"
     _PMXT_REMOTE_COLUMNS: ClassVar[list[str]] = ["market_id", "update_type", "data"]
     _PMXT_COLUMNS: ClassVar[list[str]] = ["update_type", "data"]
+    _PMXT_NORMALIZED_COLUMNS: ClassVar[list[str]] = [
+        "timestamp",
+        "market",
+        "event_type",
+        "asset_id",
+        "bids",
+        "asks",
+        "price",
+        "size",
+        "side",
+        "best_bid",
+        "best_ask",
+    ]
     _PMXT_CACHE_DIR_ENV = "PMXT_CACHE_DIR"
     _PMXT_DISABLE_CACHE_ENV = "PMXT_DISABLE_CACHE"
     _PMXT_LOCAL_ARCHIVE_DIR_ENV = "PMXT_LOCAL_ARCHIVE_DIR"
@@ -238,6 +252,23 @@ class PolymarketPMXTDataLoader(PolymarketDataLoader):
             | (ds.field("update_type") == "price_change")
         )
 
+    def _normalized_market_filter(self):
+        combined = (ds.field("event_type") == "book") | (ds.field("event_type") == "price_change")
+        if self.token_id is not None:
+            combined = combined & (ds.field("asset_id") == self.token_id)
+        if self.condition_id is not None:
+            combined = combined & (ds.field("market") == self.condition_id.encode())
+        return combined
+
+    @classmethod
+    def _raw_schema_kind(cls, schema: pa.Schema) -> str | None:
+        names = set(schema.names)
+        if set(cls._PMXT_REMOTE_COLUMNS).issubset(names):
+            return "json_payload"
+        if set(cls._PMXT_NORMALIZED_COLUMNS).issubset(names):
+            return "normalized"
+        return None
+
     @classmethod
     def _empty_market_table(cls) -> pa.Table:
         return pa.table(
@@ -317,6 +348,132 @@ class PolymarketPMXTDataLoader(PolymarketDataLoader):
         finally:
             tmp_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _json_dumps_compact(payload: dict[str, object]) -> str:
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _pmxt_value_to_str(value: object) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _pmxt_market_to_str(value: object) -> str:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).decode("utf-8")
+        return str(value)
+
+    @staticmethod
+    def _pmxt_timestamp_to_seconds(value: object) -> float:
+        return float(pd.Timestamp(value).timestamp())
+
+    @staticmethod
+    def _pmxt_levels_from_json(value: object) -> list[list[str]]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            decoded = json.loads(value)
+        else:
+            decoded = value
+        return [[str(price), str(size)] for price, size in decoded]
+
+    @classmethod
+    def _normalized_row_to_payload(cls, row: dict[str, object]) -> tuple[str, str] | None:
+        event_type = row.get("event_type")
+        market_id = cls._pmxt_market_to_str(row.get("market"))
+        token_id = cls._pmxt_value_to_str(row.get("asset_id"))
+        if token_id is None:
+            return None
+        timestamp = cls._pmxt_timestamp_to_seconds(row.get("timestamp"))
+        best_bid = cls._pmxt_value_to_str(row.get("best_bid"))
+        best_ask = cls._pmxt_value_to_str(row.get("best_ask"))
+        side = cls._pmxt_value_to_str(row.get("side")) or ""
+        if event_type == "book":
+            return (
+                "book_snapshot",
+                cls._json_dumps_compact(
+                    {
+                        "update_type": "book_snapshot",
+                        "market_id": market_id,
+                        "token_id": token_id,
+                        "side": side,
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
+                        "timestamp": timestamp,
+                        "bids": cls._pmxt_levels_from_json(row.get("bids")),
+                        "asks": cls._pmxt_levels_from_json(row.get("asks")),
+                    }
+                ),
+            )
+        if event_type == "price_change":
+            price = cls._pmxt_value_to_str(row.get("price"))
+            size = cls._pmxt_value_to_str(row.get("size"))
+            change_side = cls._pmxt_value_to_str(row.get("side"))
+            if price is None or size is None or change_side is None:
+                return None
+            return (
+                "price_change",
+                cls._json_dumps_compact(
+                    {
+                        "update_type": "price_change",
+                        "market_id": market_id,
+                        "token_id": token_id,
+                        "side": side,
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
+                        "timestamp": timestamp,
+                        "change_price": price,
+                        "change_size": size,
+                        "change_side": change_side,
+                    }
+                ),
+            )
+        return None
+
+    @classmethod
+    def _normalized_batch_to_market_batch(cls, batch: pa.RecordBatch) -> pa.RecordBatch:
+        update_types: list[str] = []
+        payloads: list[str] = []
+        for row in batch.to_pylist():
+            converted = cls._normalized_row_to_payload(row)
+            if converted is None:
+                continue
+            update_type, payload = converted
+            update_types.append(update_type)
+            payloads.append(payload)
+        return pa.record_batch(
+            [pa.array(update_types, type=pa.string()), pa.array(payloads, type=pa.string())],
+            names=cls._PMXT_COLUMNS,
+        )
+
+    def _scanner_for_raw_schema(
+        self, dataset: ds.Dataset, *, batch_size: int
+    ) -> tuple[ds.Scanner, str]:
+        schema_kind = self._raw_schema_kind(dataset.schema)
+        if schema_kind == "json_payload":
+            return (
+                dataset.scanner(
+                    columns=self._PMXT_REMOTE_COLUMNS,
+                    filter=self._market_filter(),
+                    batch_size=batch_size,
+                ),
+                schema_kind,
+            )
+        if schema_kind == "normalized":
+            return (
+                dataset.scanner(
+                    columns=self._PMXT_NORMALIZED_COLUMNS,
+                    filter=self._normalized_market_filter(),
+                    batch_size=batch_size,
+                ),
+                schema_kind,
+            )
+        raise ValueError(
+            "Unsupported PMXT parquet schema; expected either "
+            "market_id/update_type/data or normalized timestamp/market/event_type/asset_id columns."
+        )
+
     def _scan_raw_market_batches(
         self,
         dataset: ds.Dataset,
@@ -325,9 +482,7 @@ class PolymarketPMXTDataLoader(PolymarketDataLoader):
         source: str | None = None,
         total_bytes: int | None = None,
     ) -> list[pa.RecordBatch]:
-        scanner = dataset.scanner(
-            columns=self._PMXT_REMOTE_COLUMNS, filter=self._market_filter(), batch_size=batch_size
-        )
+        scanner, schema_kind = self._scanner_for_raw_schema(dataset, batch_size=batch_size)
         batches: list[pa.RecordBatch] = []
         scanned_batches = 0
         scanned_rows = 0
@@ -345,7 +500,10 @@ class PolymarketPMXTDataLoader(PolymarketDataLoader):
         for batch in scanner.to_batches():
             scanned_batches += 1
             scanned_rows += batch.num_rows
-            filtered_batch = self._filter_batch_to_token(batch)
+            if schema_kind == "normalized":
+                filtered_batch = self._normalized_batch_to_market_batch(batch)
+            else:
+                filtered_batch = self._filter_batch_to_token(batch)
             matched_rows += filtered_batch.num_rows
             if filtered_batch.num_rows:
                 batches.append(filtered_batch)

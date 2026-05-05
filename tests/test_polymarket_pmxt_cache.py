@@ -158,6 +158,73 @@ def test_scan_raw_market_batches_emits_scan_progress(tmp_path):
     assert events[-1] == (1, 2, 1, raw_path.stat().st_size, True)
 
 
+def test_scan_raw_market_batches_supports_normalized_pmxt_schema(tmp_path):
+    loader = _make_loader(tmp_path / "cache")
+    raw_path = tmp_path / "polymarket_orderbook_2026-03-16T13.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp_received": [
+                    pd.Timestamp("2026-03-16T13:00:00.010Z"),
+                    pd.Timestamp("2026-03-16T13:00:01.010Z"),
+                    pd.Timestamp("2026-03-16T13:00:02.010Z"),
+                    pd.Timestamp("2026-03-16T13:00:03.010Z"),
+                ],
+                "timestamp": [
+                    pd.Timestamp("2026-03-16T13:00:00.000Z"),
+                    pd.Timestamp("2026-03-16T13:00:01.000Z"),
+                    pd.Timestamp("2026-03-16T13:00:02.000Z"),
+                    pd.Timestamp("2026-03-16T13:00:03.000Z"),
+                ],
+                "market": [
+                    b"condition-123",
+                    b"condition-123",
+                    b"condition-123",
+                    b"other-condition",
+                ],
+                "event_type": ["book", "price_change", "last_trade_price", "price_change"],
+                "asset_id": [
+                    "token-yes-123",
+                    "token-yes-123",
+                    "token-yes-123",
+                    "token-yes-123",
+                ],
+                "bids": ['[["0.49","10"]]', None, None, None],
+                "asks": ['[["0.51","11"]]', None, None, None],
+                "price": [None, "0.52", "0.53", "0.54"],
+                "size": [None, "5", "6", "7"],
+                "side": [None, "SELL", "BUY", "BUY"],
+                "best_bid": [None, "0.50", None, "0.53"],
+                "best_ask": [None, "0.52", None, "0.55"],
+            }
+        ),
+        raw_path,
+    )
+
+    events: list[tuple[int, int, int, int | None, bool]] = []
+    loader._pmxt_scan_progress_callback = (
+        lambda _source, scanned_batches, scanned_rows, matched_rows, total_bytes, finished: (
+            events.append((scanned_batches, scanned_rows, matched_rows, total_bytes, finished))
+        )
+    )
+
+    dataset = ds.dataset(str(raw_path), format="parquet")
+    batches = loader._scan_raw_market_batches(
+        dataset, batch_size=1_000, source=str(raw_path), total_bytes=raw_path.stat().st_size
+    )
+
+    assert batches
+    assert sum(batch.num_rows for batch in batches) == 2
+    rows = pa.Table.from_batches(batches).to_pylist()
+    assert [row["update_type"] for row in rows] == ["book_snapshot", "price_change"]
+    assert '"market_id":"condition-123"' in rows[0]["data"]
+    assert '"token_id":"token-yes-123"' in rows[0]["data"]
+    assert '"bids":[["0.49","10"]]' in rows[0]["data"]
+    assert '"change_price":"0.52"' in rows[1]["data"]
+    assert '"change_side":"SELL"' in rows[1]["data"]
+    assert events[-1][:3] == (1, 2, 2)
+
+
 def test_cleanup_stale_temp_downloads_reaps_dead_process_roots(tmp_path, monkeypatch):
     loader = _make_loader(tmp_path)
     dead_root = loader._pmxt_temp_download_root / "pid-999999"
