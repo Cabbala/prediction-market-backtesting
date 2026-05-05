@@ -20,6 +20,7 @@ Scored features include:
 - strategy-fit volatility proxy
 - explicit reward evidence (`clobRewards`, `rewardsMinSize`, `rewardsMaxSpread`, `umaReward`) vs public proxy-only labels
 - accidental-fill risk flags for tail-price, wide-spread, thin-depth, and one-sided-depth markets
+- fail-closed token mapping checks: exactly two unique Yes/No CLOB token IDs are required for backtest queue eligibility
 
 Run locally in the PMBT worktree:
 

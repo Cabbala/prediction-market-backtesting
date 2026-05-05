@@ -60,7 +60,9 @@
               "market_age_days": {"type": ["number", "null"]},
               "volatility_proxy": {"type": "number"},
               "fee_reward_category": {"type": "string"},
-              "has_explicit_reward_evidence": {"type": "boolean"}
+              "has_explicit_reward_evidence": {"type": "boolean"},
+              "has_complete_clob_token_ids": {"type": "boolean"},
+              "has_yes_no_outcomes": {"type": "boolean"}
             },
             "additionalProperties": true
           }
