@@ -385,6 +385,13 @@ def build_reward_manifest(
             }
         )
     scored.sort(key=lambda row: row["reward_proxy_score"], reverse=True)
+    for rank, row in enumerate(scored, start=1):
+        row["rank"] = rank
+    eligible_count = sum(1 for row in scored if row["eligible_for_backtest_queue"])
+    explicit_reward_count = sum(
+        1 for row in scored if row.get("features", {}).get("has_explicit_reward_evidence")
+    )
+    blocked_count = len(scored) - eligible_count
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "mode": SHADOW_MODE,
@@ -392,6 +399,13 @@ def build_reward_manifest(
         "source_scan_timestamp_utc": _scan_timestamp(metadata),
         "source_scan_mode": metadata.get("mode") or metadata.get("safety", {}).get("mode"),
         "source_artifacts": metadata.get("sources", metadata.get("data_sources", {})),
+        "summary": {
+            "candidate_count": len(scored),
+            "manifest_candidate_count": len(scored[: max(0, limit)]),
+            "eligible_for_backtest_queue_count": eligible_count,
+            "blocked_count": blocked_count,
+            "explicit_reward_evidence_count": explicit_reward_count,
+        },
         "safety": {
             "live_trading": False,
             "submit_orders": False,
@@ -400,7 +414,7 @@ def build_reward_manifest(
             "intended_uses": ["PMBT_BACKTEST_QUEUE", "HOMERUN_SHADOW_FORWARD_LOGGING"],
         },
         "scoring_rules": asdict(rules),
-        "candidates": scored[:limit],
+        "candidates": scored[: max(0, limit)],
     }
 
 

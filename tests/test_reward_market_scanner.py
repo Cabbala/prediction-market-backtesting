@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
+
 from prediction_market_extensions.adapters.polymarket.reward_market_scanner import (
     SHADOW_MODE,
     accidental_fill_risk_flags,
     build_reward_manifest,
+    load_scan,
     score_candidate,
 )
+from scripts.build_reward_market_manifest import main as build_manifest_main
 
 
 def _candidate(**overrides):
@@ -222,3 +229,98 @@ def test_missing_malformed_or_non_binary_outcomes_block_backtest_queue() -> None
         assert scored["eligible_for_backtest_queue"] is False
         assert "invalid_yes_no_outcome_mapping" in scored["blockers"]
         assert "invalid_or_missing_yes_no_clob_token_ids" in scored["blockers"]
+
+
+def test_manifest_summary_and_rank_are_emitted() -> None:
+    scan = {
+        "metadata": {"utc_timestamp": "2026-05-05T00:00:00Z"},
+        "candidates": [
+            {
+                "id": "m1",
+                "conditionId": "c1",
+                "question": "Will test happen?",
+                "outcomes": ["Yes", "No"],
+                "clobTokenIds": ["1", "2"],
+                "volume": 100000,
+                "liquidity": 100000,
+                "endDate": "2026-06-05T00:00:00Z",
+                "yes_book": {
+                    "best_bid": 0.49,
+                    "best_ask": 0.50,
+                    "best_bid_size": 6000,
+                    "best_ask_size": 6000,
+                },
+                "no_book": {
+                    "best_bid": 0.50,
+                    "best_ask": 0.51,
+                    "best_bid_size": 6000,
+                    "best_ask_size": 6000,
+                },
+                "rewardsMinSize": 100,
+            }
+        ],
+    }
+    manifest = build_reward_manifest(scan)
+    assert manifest["summary"]["candidate_count"] == 1
+    assert manifest["summary"]["manifest_candidate_count"] == 1
+    assert manifest["summary"]["eligible_for_backtest_queue_count"] == 1
+    assert manifest["summary"]["explicit_reward_evidence_count"] == 1
+    assert manifest["candidates"][0]["rank"] == 1
+
+
+def test_negative_limit_returns_no_candidates_and_nonnegative_summary() -> None:
+    scan = {
+        "metadata": {"utc_timestamp": "2026-05-05T00:00:00Z"},
+        "candidates": [_candidate(market_id="1"), _candidate(market_id="2")],
+    }
+    manifest = build_reward_manifest(scan, limit=-1)
+    assert manifest["summary"]["candidate_count"] == 2
+    assert manifest["summary"]["manifest_candidate_count"] == 0
+    assert manifest["candidates"] == []
+
+
+def test_build_reward_manifest_main_writes_source_paths(tmp_path: Path) -> None:
+    scan_path = tmp_path / "scan.json"
+    report_path = tmp_path / "strategy.md"
+    output_dir = tmp_path / "out"
+    scan_path.write_text(
+        json.dumps(
+            {"metadata": {"utc_timestamp": "2026-05-05T00:00:00Z"}, "candidates": [_candidate()]}
+        ),
+        encoding="utf-8",
+    )
+    report_path.write_text("# strategy\n", encoding="utf-8")
+
+    assert (
+        build_manifest_main(
+            [
+                "--input",
+                str(scan_path),
+                "--strategy-report",
+                str(report_path),
+                "--output-dir",
+                str(output_dir),
+                "--limit",
+                "1",
+            ]
+        )
+        == 0
+    )
+    manifest_paths = sorted(output_dir.glob("reward_market_manifest_*.json"))
+    assert len(manifest_paths) == 1
+    manifest = load_scan(manifest_paths[0])
+    assert manifest["input_scan_path"] == str(scan_path)
+    assert manifest["input_strategy_report_path"] == str(report_path)
+    assert manifest["source_paths"] == {
+        "market_scan_json": str(scan_path),
+        "strategy_or_scan_report_md": str(report_path),
+    }
+
+
+def test_build_reward_manifest_main_rejects_negative_limit(tmp_path: Path) -> None:
+    scan_path = tmp_path / "scan.json"
+    scan_path.write_text(json.dumps({"metadata": {}, "candidates": []}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        build_manifest_main(
+            ["--input", str(scan_path), "--output-dir", str(tmp_path / "out"), "--limit", "-1"]
+        )

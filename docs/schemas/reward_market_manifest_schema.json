@@ -12,6 +12,26 @@
     "source_scan_mode": {"type": ["string", "null", "boolean"]},
     "source_artifacts": {"type": "object"},
     "input_scan_path": {"type": "string"},
+    "input_strategy_report_path": {"type": ["string", "null"]},
+    "source_paths": {
+      "type": "object",
+      "properties": {
+        "market_scan_json": {"type": "string"},
+        "strategy_or_scan_report_md": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "candidate_count": {"type": "integer", "minimum": 0},
+        "manifest_candidate_count": {"type": "integer", "minimum": 0},
+        "eligible_for_backtest_queue_count": {"type": "integer", "minimum": 0},
+        "blocked_count": {"type": "integer", "minimum": 0},
+        "explicit_reward_evidence_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
     "safety": {
       "type": "object",
       "required": ["live_trading", "submit_orders", "sign_orders", "requires_secrets", "intended_uses"],
@@ -31,6 +51,7 @@
         "type": "object",
         "required": ["market_id", "slug", "question", "reward_proxy_score", "eligible_for_backtest_queue", "features", "accidental_fill_risk_flags"],
         "properties": {
+          "rank": {"type": "integer", "minimum": 1},
           "market_id": {"type": "string"},
           "condition_id": {"type": ["string", "null"]},
           "slug": {"type": ["string", "null"]},
