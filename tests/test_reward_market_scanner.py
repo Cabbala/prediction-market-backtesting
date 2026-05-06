@@ -67,12 +67,32 @@ def test_book_token_ids_must_match_yes_no_tokens():
     assert manifest["skipped"][0]["skip_reason"] == "book_token_ids_must_match_yes_no_tokens"
 
 
+def test_flat_scan_best_bid_ask_fields_are_accepted_when_books_absent():
+    scanner = RewardMarketScanner(now=datetime(2026, 5, 6, tzinfo=timezone.utc))
+    candidate = _candidate(
+        books=[],
+        yes_best_bid=0.49,
+        yes_best_ask=0.50,
+        yes_bid_levels=3,
+        yes_ask_levels=4,
+        no_best_bid=0.50,
+        no_best_ask=0.51,
+        no_bid_levels=2,
+        no_ask_levels=5,
+    )
+    manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.json")
+    assert manifest["summary"]["eligible_count"] == 1
+    row = manifest["candidates"][0]
+    assert round(row["max_spread"], 6) == 0.01
+    assert "thin_two_sided_depth" in row["accidental_fill_risk_flags"]
+
+
 def test_level_arrays_do_not_crash_and_string_fields_are_lists():
     scanner = RewardMarketScanner(now=datetime(2026, 5, 6, tzinfo=timezone.utc))
     candidate = _candidate(
         strategy_fit="maker",
         source_tags="scanner",
-        reward_evidence={"umaReward": "5", "api_secret": "must-not-persist"},
+        reward_evidence={"umaReward": "5", "clobRewards_count": 1, "api_secret": "must-not-persist"},
         books=[
             {"token_id": "yes-token", "bid_levels": [[0.49, 100]], "ask_levels": [[0.50, 100]]},
             {"token_id": "no-token", "bid_levels": [[0.50, 100]], "ask_levels": [[0.51, 100]]},
@@ -82,5 +102,5 @@ def test_level_arrays_do_not_crash_and_string_fields_are_lists():
     row = manifest["candidates"][0]
     assert row["strategy_fits"] == ["maker"]
     assert row["source_tags"] == ["scanner"]
-    assert row["reward_evidence"] == {"umaReward": "5"}
+    assert row["reward_evidence"] == {"umaReward": "5", "clobRewards_count": 1}
     assert row["min_two_sided_depth_5c"] == 100

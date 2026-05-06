@@ -106,6 +106,8 @@ REWARD_FIELD_ALLOWLIST = {
     "rewardsMaxSpread",
     "umaReward",
     "clobRewards",
+    "clobRewards_count",
+    "clobRewards_daily_rate_total",
     "liquidityRewards",
     "text",
 }
@@ -131,6 +133,26 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(parsed, list):
         return [str(x) for x in parsed if str(x)]
     return [str(parsed)]
+
+
+def _books_from_flat_candidate(candidate: dict[str, Any], tokens: list[str]) -> list[dict[str, Any]]:
+    """Build minimal book rows from flattened scan fields when full books are absent."""
+    prefixes = (("yes", tokens[0]), ("no", tokens[1]))
+    books: list[dict[str, Any]] = []
+    for prefix, token in prefixes:
+        best_bid = candidate.get(f"{prefix}_best_bid")
+        best_ask = candidate.get(f"{prefix}_best_ask")
+        if best_bid in (None, "") or best_ask in (None, ""):
+            return []
+        books.append({
+            "token_id": token,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": candidate.get(f"{prefix}_spread"),
+            "bid_levels": candidate.get(f"{prefix}_bid_levels", 0),
+            "ask_levels": candidate.get(f"{prefix}_ask_levels", 0),
+        })
+    return books
 
 
 def canonical_yes_no_tokens(candidate: dict[str, Any]) -> tuple[list[str] | None, list[str], str | None]:
@@ -202,6 +224,8 @@ class RewardMarketScanner:
         if end and end <= self.now:
             return {"skip_reason": "expired_market", "question": candidate.get("question"), "slug": candidate.get("slug")}
         books = candidate.get("books") or []
+        if not books:
+            books = _books_from_flat_candidate(candidate, tokens)
         book_metrics = [_book_metrics(b) for b in books if isinstance(b, dict)]
         if len(book_metrics) != 2 or not all(b["ok"] for b in book_metrics):
             return {"skip_reason": "requires_complete_two_sided_books", "question": candidate.get("question"), "slug": candidate.get("slug")}
