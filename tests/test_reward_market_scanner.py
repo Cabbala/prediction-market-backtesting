@@ -85,6 +85,8 @@ def test_flat_scan_best_bid_ask_fields_are_accepted_when_books_absent():
     row = manifest["candidates"][0]
     assert round(row["max_spread"], 6) == 0.01
     assert "thin_two_sided_depth" in row["accidental_fill_risk_flags"]
+    assert "complete_two_sided_books_or_flat_top_of_book_for_both_tokens" in manifest["eligibility_rules"]
+    assert any("unknown-depth risk" in note for note in manifest["scoring_notes"])
 
 
 def test_level_arrays_do_not_crash_and_string_fields_are_lists():
