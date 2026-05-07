@@ -428,6 +428,97 @@ def test_flat_side_token_fields_provide_explicit_yes_no_mapping() -> None:
     assert scored["features"]["book_token_ids_match_yes_no_mapping"] is True
 
 
+def test_flat_side_token_fields_with_explicit_outcomes_but_no_clob_token_ids() -> None:
+    candidate = {
+        "id": "flat-side-token-outcomes",
+        "conditionId": "0xflat-side-token-outcomes",
+        "question": "Will side-scoped tokens plus outcomes be accepted?",
+        "outcomes": ["Yes", "No"],
+        "yes_token_id": "yes-side-token",
+        "no_token_id": "no-side-token",
+        "yes_best_bid": 0.49,
+        "yes_best_ask": 0.491,
+        "yes_best_bid_size": 6000,
+        "yes_best_ask_size": 7000,
+        "no_best_bid": 0.509,
+        "no_best_ask": 0.510,
+        "no_best_bid_size": 6000,
+        "no_best_ask_size": 7000,
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["eligible_for_backtest_queue"] is True
+    assert scored["features"]["has_complete_clob_token_ids"] is True
+    assert scored["features"]["has_yes_no_outcomes"] is True
+    assert scored["features"]["book_token_ids_match_yes_no_mapping"] is True
+
+
+def test_side_scoped_tokens_ignore_reversed_outcomes_without_raw_clob_ids() -> None:
+    candidate = {
+        "id": "side-token-reversed-outcomes",
+        "conditionId": "0xside-token-reversed-outcomes",
+        "question": "Will side-scoped tokens stay canonical?",
+        "outcomes": ["No", "Yes"],
+        "yes_token_id": "yes-side-token",
+        "no_token_id": "no-side-token",
+        "yes_best_bid": 0.49,
+        "yes_best_ask": 0.491,
+        "yes_best_bid_size": 6000,
+        "yes_best_ask_size": 7000,
+        "no_best_bid": 0.509,
+        "no_best_ask": 0.510,
+        "no_best_bid_size": 6000,
+        "no_best_ask_size": 7000,
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    manifest = build_reward_manifest({"metadata": {}, "candidates": [candidate]}, limit=1)
+    row = manifest["candidates"][0]
+
+    assert row["eligible_for_backtest_queue"] is True
+    assert row["clob_token_ids"] == ["yes-side-token", "no-side-token"]
+
+
+def test_positional_books_without_token_ids_do_not_use_side_token_fallback() -> None:
+    candidate = {
+        "id": "positional-books-with-side-tokens",
+        "conditionId": "0xpositional-books-with-side-tokens",
+        "question": "Are positional books without token IDs accepted?",
+        "outcomes": ["Yes", "No"],
+        "yes_token_id": "yes-side-token",
+        "no_token_id": "no-side-token",
+        "books": [
+            {
+                "best_bid": 0.49,
+                "best_ask": 0.491,
+                "best_bid_size": 6000,
+                "best_ask_size": 7000,
+            },
+            {
+                "best_bid": 0.509,
+                "best_ask": 0.510,
+                "best_bid_size": 6000,
+                "best_ask_size": 7000,
+            },
+        ],
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["eligible_for_backtest_queue"] is False
+    assert "invalid_or_missing_yes_no_clob_token_ids" in scored["blockers"]
+    assert scored["features"]["has_complete_clob_token_ids"] is False
+
+
 def test_token_only_side_fields_do_not_make_complete_books() -> None:
     candidate = {
         "id": "token-only",

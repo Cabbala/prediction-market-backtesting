@@ -179,6 +179,24 @@ def _reward_category(candidate: Mapping[str, Any]) -> str:
     return "public_proxy_only_reward_unverified"
 
 
+def _side_scoped_token_ids(candidate: Mapping[str, Any]) -> list[str]:
+    yes_book = candidate.get("yes_book")
+    no_book = candidate.get("no_book")
+    yes_token = candidate.get("yes_token_id") or (
+        yes_book.get("token_id") if isinstance(yes_book, Mapping) else None
+    )
+    no_token = candidate.get("no_token_id") or (
+        no_book.get("token_id") if isinstance(no_book, Mapping) else None
+    )
+    if (
+        yes_token not in (None, "")
+        and no_token not in (None, "")
+        and str(yes_token) != str(no_token)
+    ):
+        return [str(yes_token), str(no_token)]
+    return []
+
+
 def _outcomes(candidate: Mapping[str, Any]) -> list[str]:
     raw = candidate.get("outcomes")
     if isinstance(raw, str):
@@ -196,19 +214,7 @@ def _outcomes(candidate: Mapping[str, Any]) -> list[str]:
     # ids are present. This preserves fail-closed behavior for ambiguous
     # clobTokenIds-only artifacts and does not infer prices from the opposite
     # side.
-    yes_book = candidate.get("yes_book")
-    no_book = candidate.get("no_book")
-    yes_token = candidate.get("yes_token_id") or (
-        yes_book.get("token_id") if isinstance(yes_book, Mapping) else None
-    )
-    no_token = candidate.get("no_token_id") or (
-        no_book.get("token_id") if isinstance(no_book, Mapping) else None
-    )
-    if (
-        yes_token not in (None, "")
-        and no_token not in (None, "")
-        and str(yes_token) != str(no_token)
-    ):
+    if _side_scoped_token_ids(candidate):
         return ["Yes", "No"]
     return []
 
@@ -231,14 +237,16 @@ def _candidate_token_ids(candidate: Mapping[str, Any]) -> list[str]:
         return [str(token_id) for token_id in raw if token_id not in (None, "")]
     books = candidate.get("books")
     if isinstance(books, Sequence) and not isinstance(books, (str, bytes)):
-        return [
+        book_ids = [
             str(book.get("token_id"))
             for book in books
             if isinstance(book, Mapping) and book.get("token_id") not in (None, "")
         ]
-    yes_token = _book(candidate, "yes").get("token_id")
-    no_token = _book(candidate, "no").get("token_id")
-    return [str(token_id) for token_id in (yes_token, no_token) if token_id not in (None, "")]
+        if book_ids:
+            return book_ids
+        if len(books) > 0:
+            return []
+    return _side_scoped_token_ids(candidate)
 
 
 def _clob_token_ids(candidate: Mapping[str, Any]) -> list[str]:
@@ -246,6 +254,10 @@ def _clob_token_ids(candidate: Mapping[str, Any]) -> list[str]:
     outcomes = _outcomes(candidate)
     if len(ids) != 2 or len(set(ids)) != 2 or not _has_yes_no_outcomes(candidate):
         return []
+    raw = candidate.get("clob_token_ids") or candidate.get("clobTokenIds")
+    side_scoped_ids = _side_scoped_token_ids(candidate)
+    if raw in (None, "", []) and ids == side_scoped_ids:
+        return side_scoped_ids
     by_outcome = {
         outcome.casefold(): token_id for outcome, token_id in zip(outcomes, ids, strict=True)
     }
