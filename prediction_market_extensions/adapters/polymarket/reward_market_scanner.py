@@ -94,6 +94,11 @@ def _book(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
     return flat
 
 
+def _has_book_prices(candidate: Mapping[str, Any], side: str) -> bool:
+    book = _book(candidate, side)
+    return book.get("best_bid") not in (None, "") and book.get("best_ask") not in (None, "")
+
+
 def _spread(candidate: Mapping[str, Any], side: str) -> float:
     book = _book(candidate, side)
     spread = _as_float(book.get("spread"), default=-1.0)
@@ -139,7 +144,11 @@ def _has_explicit_reward_evidence(candidate: Mapping[str, Any]) -> bool:
         if value not in (None, "", [], {}, False):
             return True
     fits = candidate.get("strategy_fits") or []
-    return isinstance(fits, Sequence) and not isinstance(fits, (str, bytes)) and "reward_eligible_candidate" in fits
+    return (
+        isinstance(fits, Sequence)
+        and not isinstance(fits, (str, bytes))
+        and "reward_eligible_candidate" in fits
+    )
 
 
 def _reward_category(candidate: Mapping[str, Any]) -> str:
@@ -147,9 +156,13 @@ def _reward_category(candidate: Mapping[str, Any]) -> str:
     if isinstance(reward_evidence, Mapping):
         if reward_evidence.get("clobRewards") not in (None, "", [], {}, False):
             return "explicit_clob_rewards"
-        if reward_evidence.get("rewardsMinSize") not in (None, "", [], {}, False) or reward_evidence.get(
-            "rewardsMaxSpread"
-        ) not in (None, "", [], {}, False):
+        if reward_evidence.get("rewardsMinSize") not in (
+            None,
+            "",
+            [],
+            {},
+            False,
+        ) or reward_evidence.get("rewardsMaxSpread") not in (None, "", [], {}, False):
             return "explicit_gamma_reward_terms"
         if reward_evidence.get("umaReward") not in (None, "", [], {}, False):
             return "explicit_uma_reward_hint"
@@ -176,6 +189,27 @@ def _outcomes(candidate: Mapping[str, Any]) -> list[str]:
         raw = parsed
     if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
         return [str(outcome).strip() for outcome in raw if str(outcome).strip()]
+
+    # Current autonomous scan artifacts may omit the raw Gamma ``outcomes``
+    # field while persisting explicit side-scoped token ids. Treat the field
+    # names themselves as the Yes/No mapping, but only when both unique token
+    # ids are present. This preserves fail-closed behavior for ambiguous
+    # clobTokenIds-only artifacts and does not infer prices from the opposite
+    # side.
+    yes_book = candidate.get("yes_book")
+    no_book = candidate.get("no_book")
+    yes_token = candidate.get("yes_token_id") or (
+        yes_book.get("token_id") if isinstance(yes_book, Mapping) else None
+    )
+    no_token = candidate.get("no_token_id") or (
+        no_book.get("token_id") if isinstance(no_book, Mapping) else None
+    )
+    if (
+        yes_token not in (None, "")
+        and no_token not in (None, "")
+        and str(yes_token) != str(no_token)
+    ):
+        return ["Yes", "No"]
     return []
 
 
@@ -359,8 +393,8 @@ def score_candidate(
 
     complete_books = (
         bool(candidate.get("complete_books", True))
-        and bool(_book(candidate, "yes"))
-        and bool(_book(candidate, "no"))
+        and _has_book_prices(candidate, "yes")
+        and _has_book_prices(candidate, "no")
     )
     clob_token_ids = _clob_token_ids(candidate)
     has_yes_no_outcomes = _has_yes_no_outcomes(candidate)

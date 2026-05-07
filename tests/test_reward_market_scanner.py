@@ -400,12 +400,105 @@ def test_flat_top_of_book_fields_are_supported_without_fabricating_books() -> No
     assert scored["features"]["min_top_book_depth"] == 13_000
 
 
+def test_flat_side_token_fields_provide_explicit_yes_no_mapping() -> None:
+    candidate = {
+        "id": "flat-side-token-1",
+        "conditionId": "0xflat-side-token",
+        "question": "Will side-scoped tokens be accepted?",
+        "yes_token_id": "yes-side-token",
+        "no_token_id": "no-side-token",
+        "yes_best_bid": 0.49,
+        "yes_best_ask": 0.491,
+        "yes_best_bid_size": 6000,
+        "yes_best_ask_size": 7000,
+        "no_best_bid": 0.509,
+        "no_best_ask": 0.510,
+        "no_best_bid_size": 6000,
+        "no_best_ask_size": 7000,
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["eligible_for_backtest_queue"] is True
+    assert scored["features"]["has_complete_clob_token_ids"] is True
+    assert scored["features"]["has_yes_no_outcomes"] is True
+    assert scored["features"]["book_token_ids_match_yes_no_mapping"] is True
+
+
+def test_token_only_side_fields_do_not_make_complete_books() -> None:
+    candidate = {
+        "id": "token-only",
+        "conditionId": "0xtokenonly",
+        "question": "Do token-only side fields pass?",
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["eligible_for_backtest_queue"] is False
+    assert "missing_complete_yes_no_clob_books" in scored["blockers"]
+    assert scored["features"]["has_complete_clob_token_ids"] is True
+    assert scored["features"]["has_yes_no_outcomes"] is True
+
+
+def test_positional_books_without_outcomes_remain_fail_closed() -> None:
+    candidate = {
+        "id": "books-no-outcomes",
+        "conditionId": "0xbooks",
+        "question": "Are positional books ambiguous?",
+        "books": [
+            {
+                "token_id": "token-a",
+                "best_bid": 0.49,
+                "best_ask": 0.491,
+                "best_bid_size": 6000,
+                "best_ask_size": 7000,
+            },
+            {
+                "token_id": "token-b",
+                "best_bid": 0.509,
+                "best_ask": 0.510,
+                "best_bid_size": 6000,
+                "best_ask_size": 7000,
+            },
+        ],
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["eligible_for_backtest_queue"] is False
+    assert "invalid_or_missing_yes_no_clob_token_ids" in scored["blockers"]
+    assert "invalid_yes_no_outcome_mapping" in scored["blockers"]
+
+
 def test_book_token_mismatch_blocks_backtest_queue() -> None:
     scored = score_candidate(
         _candidate(
             clob_token_ids=["yes-token", "no-token"],
-            yes_book={"token_id": "no-token", "best_bid": 0.49, "best_ask": 0.491, "best_bid_size": 6000, "best_ask_size": 6000},
-            no_book={"token_id": "yes-token", "best_bid": 0.509, "best_ask": 0.510, "best_bid_size": 6000, "best_ask_size": 6000},
+            yes_book={
+                "token_id": "no-token",
+                "best_bid": 0.49,
+                "best_ask": 0.491,
+                "best_bid_size": 6000,
+                "best_ask_size": 6000,
+            },
+            no_book={
+                "token_id": "yes-token",
+                "best_bid": 0.509,
+                "best_ask": 0.510,
+                "best_bid_size": 6000,
+                "best_ask_size": 6000,
+            },
         )
     )
 
