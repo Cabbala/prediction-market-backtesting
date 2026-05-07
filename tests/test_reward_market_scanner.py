@@ -106,3 +106,69 @@ def test_level_arrays_do_not_crash_and_string_fields_are_lists():
     assert row["source_tags"] == ["scanner"]
     assert row["reward_evidence"] == {"umaReward": "5", "clobRewards_count": 1}
     assert row["min_two_sided_depth_5c"] == 100
+
+
+
+def test_latest_daily_scan_named_books_and_num_fields_are_supported():
+    scanner = RewardMarketScanner(now=datetime(2026, 5, 7, tzinfo=timezone.utc))
+    candidate = {
+        "id": "m2",
+        "conditionId": "0xdef",
+        "slug": "daily-scan-example",
+        "question": "Will daily scan example happen?",
+        "clobTokenIds_yes_no": ["yes-token", "no-token"],
+        "outcomes": ["Yes", "No"],
+        "endDate": "2026-07-20T00:00:00Z",
+        "volumeNum": 10985921.9,
+        "liquidityNum": 6909117.2,
+        "reward_evidence": {"rewardsMinSize": 100, "rewardsMaxSpread": 2.5, "enableOrderBook": True},
+        "yes_book": {
+            "token_id": "yes-token",
+            "best_bid": 0.002,
+            "best_ask": 0.003,
+            "bid_levels": 2,
+            "ask_levels": 58,
+            "depth_bid_2c": 1000,
+            "depth_ask_2c": 2000,
+        },
+        "no_book": {
+            "token_id": "no-token",
+            "best_bid": 0.997,
+            "best_ask": 0.998,
+            "bid_levels": 58,
+            "ask_levels": 2,
+            "depth_bid_2c": 3000,
+            "depth_ask_2c": 4000,
+        },
+    }
+    manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.json")
+    assert manifest["summary"]["eligible_count"] == 1
+    row = manifest["candidates"][0]
+    assert row["volume"] == 10985921.9
+    assert row["liquidity"] == 6909117.2
+    assert row["min_two_sided_depth_5c"] == 0
+    assert "thin_two_sided_depth" in row["accidental_fill_risk_flags"]
+    assert row["reward_evidence"] == {"rewardsMinSize": 100, "rewardsMaxSpread": 2.5}
+
+
+
+def test_clob_token_ids_yes_no_is_already_canonical_even_with_reversed_outcomes():
+    tokens, outcomes, error = canonical_yes_no_tokens(
+        _candidate(clobTokenIds_yes_no=["yes-canonical", "no-canonical"], outcomes=["No", "Yes"])
+    )
+    assert error is None
+    assert tokens == ["yes-canonical", "no-canonical"]
+
+
+
+def test_named_books_reject_conflicting_embedded_token_ids():
+    scanner = RewardMarketScanner(now=datetime(2026, 5, 7, tzinfo=timezone.utc))
+    candidate = _candidate(
+        clobTokenIds_yes_no=["yes-token", "no-token"],
+        books=[],
+        yes_book={"asset_id": "no-token", "best_bid": 0.10, "best_ask": 0.11},
+        no_book={"asset_id": "yes-token", "best_bid": 0.89, "best_ask": 0.90},
+    )
+    manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.json")
+    assert manifest["summary"]["eligible_count"] == 0
+    assert manifest["skipped"][0]["skip_reason"] == "requires_complete_two_sided_books"

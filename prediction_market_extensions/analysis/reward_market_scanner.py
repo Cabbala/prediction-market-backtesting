@@ -136,7 +136,20 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _books_from_flat_candidate(candidate: dict[str, Any], tokens: list[str]) -> list[dict[str, Any]]:
-    """Build minimal book rows from flattened scan fields when full books are absent."""
+    """Build minimal book rows from flattened/named scan fields when full books are absent."""
+    named_books = (candidate.get("yes_book"), candidate.get("no_book"))
+    if all(isinstance(book, dict) for book in named_books):
+        books = []
+        for book, token in zip(named_books, tokens, strict=True):
+            observed_ids = {str(book.get(key)) for key in ("token_id", "asset_id") if book.get(key)}
+            if observed_ids and observed_ids != {token}:
+                return []
+            row = dict(book)
+            row.setdefault("token_id", token)
+            row.setdefault("asset_id", token)
+            books.append(row)
+        return books
+
     prefixes = (("yes", tokens[0]), ("no", tokens[1]))
     books: list[dict[str, Any]] = []
     for prefix, token in prefixes:
@@ -151,19 +164,25 @@ def _books_from_flat_candidate(candidate: dict[str, Any], tokens: list[str]) -> 
             "spread": candidate.get(f"{prefix}_spread"),
             "bid_levels": candidate.get(f"{prefix}_bid_levels", 0),
             "ask_levels": candidate.get(f"{prefix}_ask_levels", 0),
+            "depth_bid_2c": candidate.get(f"{prefix}_depth_bid_2c"),
+            "depth_ask_2c": candidate.get(f"{prefix}_depth_ask_2c"),
         })
     return books
 
 
 def canonical_yes_no_tokens(candidate: dict[str, Any]) -> tuple[list[str] | None, list[str], str | None]:
-    tokens = _parse_jsonish(candidate.get("clobTokenIds") or candidate.get("clob_token_ids"), []) or []
+    canonical_tokens = _parse_jsonish(candidate.get("clobTokenIds_yes_no"), None)
+    raw_tokens = _parse_jsonish(candidate.get("clobTokenIds") or candidate.get("clob_token_ids"), []) or []
     outcomes = _parse_jsonish(candidate.get("outcomes") or candidate.get("outcome_names"), []) or []
-    tokens = [str(x) for x in tokens if str(x)]
     outcomes = [str(x).strip().lower() for x in outcomes]
+    tokens_source = canonical_tokens if canonical_tokens is not None else raw_tokens
+    tokens = [str(x) for x in (tokens_source or []) if str(x)]
     if len(tokens) != 2 or len(set(tokens)) != 2:
         return None, outcomes, "requires_exactly_two_unique_clob_token_ids"
     if len(outcomes) != 2 or set(outcomes) != {"yes", "no"}:
         return None, outcomes, "requires_explicit_binary_yes_no_outcomes"
+    if canonical_tokens is not None:
+        return tokens, outcomes, None
     yes_idx = outcomes.index("yes")
     no_idx = outcomes.index("no")
     return [tokens[yes_idx], tokens[no_idx]], outcomes, None
@@ -238,8 +257,8 @@ class RewardMarketScanner:
         avg_spread = _float(candidate.get("avg_spread"), sum(spreads) / len(spreads))
         max_spread = _float(candidate.get("max_spread"), max(spreads))
         min_depth = min(depths) if depths else 0.0
-        volume = _float(candidate.get("volume"))
-        liquidity = _float(candidate.get("liquidity"))
+        volume = _float(candidate.get("volume") or candidate.get("volumeNum"))
+        liquidity = _float(candidate.get("liquidity") or candidate.get("liquidityNum"))
         volume_24h = _float(candidate.get("volume24hr") or candidate.get("volume_24h"))
         yes_price = _float(candidate.get("yes_price")) or (book_metrics[0]["best_bid"] + book_metrics[0]["best_ask"]) / 2
         hours_to_end = ((end - self.now).total_seconds() / 3600.0) if end else None
