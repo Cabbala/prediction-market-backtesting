@@ -324,3 +324,90 @@ def test_build_reward_manifest_main_rejects_negative_limit(tmp_path: Path) -> No
         build_manifest_main(
             ["--input", str(scan_path), "--output-dir", str(tmp_path / "out"), "--limit", "-1"]
         )
+
+
+def test_latest_scan_shape_uses_liquidity_num_top10_depth_and_reward_evidence() -> None:
+    candidate = _candidate(
+        liquidity=None,
+        liquidityNum=250_000,
+        volume=None,
+        volumeNum=125_000,
+        reward_evidence={"rewardsMinSize": "100", "rewardsMaxSpread": "3.0"},
+        source_market_url="https://polymarket.com/event/demo/demo-market",
+        source_tags="reward_scan",
+        yes_book={
+            "token_id": "yes",
+            "best_bid": 0.003,
+            "best_ask": 0.004,
+            "spread": 0.001,
+            "mid": 0.0035,
+            "bid_levels": 3,
+            "ask_levels": 77,
+            "depth_bid_top10": 3_000_000,
+            "depth_ask_top10": 2_000_000,
+        },
+        no_book={
+            "token_id": "no",
+            "best_bid": 0.996,
+            "best_ask": 0.997,
+            "spread": 0.001,
+            "mid": 0.9965,
+            "bid_levels": 77,
+            "ask_levels": 3,
+            "depth_bid_top10": 2_000_000,
+            "depth_ask_top10": 3_000_000,
+        },
+    )
+
+    manifest = build_reward_manifest({"metadata": {}, "candidates": [candidate]}, limit=1)
+    row = manifest["candidates"][0]
+
+    assert row["source_url"] == "https://polymarket.com/event/demo/demo-market"
+    assert row["features"]["liquidity"] == 250_000
+    assert row["features"]["volume"] == 125_000
+    assert row["features"]["min_top_book_depth"] == 5_000_000
+    assert row["features"]["fee_reward_category"] == "explicit_gamma_reward_terms"
+    assert row["features"]["has_explicit_reward_evidence"] is True
+    assert row["features"]["book_token_ids_match_yes_no_mapping"] is True
+
+
+def test_flat_top_of_book_fields_are_supported_without_fabricating_books() -> None:
+    candidate = {
+        "id": "flat-1",
+        "conditionId": "0xflat",
+        "question": "Will flat happen?",
+        "outcomes": ["Yes", "No"],
+        "clobTokenIds": ["yes-flat", "no-flat"],
+        "yes_token_id": "yes-flat",
+        "no_token_id": "no-flat",
+        "yes_best_bid": 0.49,
+        "yes_best_ask": 0.491,
+        "yes_best_bid_size": 6000,
+        "yes_best_ask_size": 7000,
+        "no_best_bid": 0.509,
+        "no_best_ask": 0.510,
+        "no_best_bid_size": 6000,
+        "no_best_ask_size": 7000,
+        "liquidityNum": 50_000,
+        "volumeNum": 60_000,
+        "endDate": "2026-07-20T00:00:00Z",
+    }
+
+    scored = score_candidate(candidate)
+
+    assert scored["eligible_for_backtest_queue"] is True
+    assert scored["features"]["yes_spread"] == pytest.approx(0.001)
+    assert scored["features"]["min_top_book_depth"] == 13_000
+
+
+def test_book_token_mismatch_blocks_backtest_queue() -> None:
+    scored = score_candidate(
+        _candidate(
+            clob_token_ids=["yes-token", "no-token"],
+            yes_book={"token_id": "no-token", "best_bid": 0.49, "best_ask": 0.491, "best_bid_size": 6000, "best_ask_size": 6000},
+            no_book={"token_id": "yes-token", "best_bid": 0.509, "best_ask": 0.510, "best_bid_size": 6000, "best_ask_size": 6000},
+        )
+    )
+
+    assert scored["eligible_for_backtest_queue"] is False
+    assert "book_token_ids_do_not_match_yes_no_mapping" in scored["blockers"]

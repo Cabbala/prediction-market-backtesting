@@ -64,7 +64,34 @@ def _book(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
     value = candidate.get(f"{side}_book")
     if isinstance(value, Mapping):
         return value
-    return _book_from_scan_books(candidate, side)
+    from_books = _book_from_scan_books(candidate, side)
+    if from_books:
+        return from_books
+
+    # Some autonomous scan artifacts persist only flat top-of-book fields.
+    # Keep this read-only/fail-closed: use fields only when they are explicit
+    # and side-scoped; never infer missing prices from the opposite token.
+    prefix = f"{side}_"
+    flat_keys = (
+        "token_id",
+        "best_bid",
+        "best_ask",
+        "best_bid_size",
+        "best_ask_size",
+        "bid_size",
+        "ask_size",
+        "depth_2c",
+        "depth_bid_top10",
+        "depth_ask_top10",
+        "mid",
+        "spread",
+    )
+    flat = {
+        key: candidate.get(prefix + key)
+        for key in flat_keys
+        if candidate.get(prefix + key) not in (None, "")
+    }
+    return flat
 
 
 def _spread(candidate: Mapping[str, Any], side: str) -> float:
@@ -79,8 +106,11 @@ def _spread(candidate: Mapping[str, Any], side: str) -> float:
 
 def _depth(candidate: Mapping[str, Any], side: str) -> float:
     book = _book(candidate, side)
-    top_depth = _as_float(book.get("best_bid_size")) + _as_float(book.get("best_ask_size"))
-    return max(top_depth, _as_float(book.get("depth_2c")))
+    top_depth = _as_float(book.get("best_bid_size", book.get("bid_size"))) + _as_float(
+        book.get("best_ask_size", book.get("ask_size"))
+    )
+    top10_depth = _as_float(book.get("depth_bid_top10")) + _as_float(book.get("depth_ask_top10"))
+    return max(top_depth, top10_depth, _as_float(book.get("depth_2c")))
 
 
 def _mid(candidate: Mapping[str, Any], side: str) -> float | None:
@@ -97,6 +127,11 @@ def _mid(candidate: Mapping[str, Any], side: str) -> float | None:
 
 
 def _has_explicit_reward_evidence(candidate: Mapping[str, Any]) -> bool:
+    reward_evidence = candidate.get("reward_evidence")
+    if isinstance(reward_evidence, Mapping) and any(
+        value not in (None, "", [], {}, False) for value in reward_evidence.values()
+    ):
+        return True
     if candidate.get("reward_hint"):
         return True
     for key in ("clobRewards", "rewards", "rewardsMinSize", "rewardsMaxSpread", "umaReward"):
@@ -104,10 +139,20 @@ def _has_explicit_reward_evidence(candidate: Mapping[str, Any]) -> bool:
         if value not in (None, "", [], {}, False):
             return True
     fits = candidate.get("strategy_fits") or []
-    return isinstance(fits, Sequence) and "reward_eligible_candidate" in fits
+    return isinstance(fits, Sequence) and not isinstance(fits, (str, bytes)) and "reward_eligible_candidate" in fits
 
 
 def _reward_category(candidate: Mapping[str, Any]) -> str:
+    reward_evidence = candidate.get("reward_evidence")
+    if isinstance(reward_evidence, Mapping):
+        if reward_evidence.get("clobRewards") not in (None, "", [], {}, False):
+            return "explicit_clob_rewards"
+        if reward_evidence.get("rewardsMinSize") not in (None, "", [], {}, False) or reward_evidence.get(
+            "rewardsMaxSpread"
+        ) not in (None, "", [], {}, False):
+            return "explicit_gamma_reward_terms"
+        if reward_evidence.get("umaReward") not in (None, "", [], {}, False):
+            return "explicit_uma_reward_hint"
     if candidate.get("clobRewards") not in (None, "", [], {}, False):
         return "explicit_clob_rewards"
     if candidate.get("rewardsMinSize") not in (None, "", [], {}, False) or candidate.get(
@@ -175,12 +220,31 @@ def _clob_token_ids(candidate: Mapping[str, Any]) -> list[str]:
 
 def _strategy_fits(candidate: Mapping[str, Any]) -> set[str]:
     value = candidate.get("strategy_fits")
+    if isinstance(value, str):
+        return {value}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return {str(v) for v in value}
     fit_map = candidate.get("strategy_fit")
+    if isinstance(fit_map, str):
+        return {fit_map}
     if isinstance(fit_map, Mapping):
         return {str(k) for k, enabled in fit_map.items() if enabled}
+    source_tags = candidate.get("source_tags")
+    if isinstance(source_tags, str):
+        return {source_tags}
+    if isinstance(source_tags, Sequence) and not isinstance(source_tags, (str, bytes)):
+        return {str(v) for v in source_tags}
     return set()
+
+
+def _book_token_ids_match(candidate: Mapping[str, Any], clob_token_ids: Sequence[str]) -> bool:
+    if len(clob_token_ids) != 2:
+        return False
+    yes_token = _book(candidate, "yes").get("token_id") or candidate.get("yes_token_id")
+    no_token = _book(candidate, "no").get("token_id") or candidate.get("no_token_id")
+    if yes_token in (None, "") and no_token in (None, ""):
+        return True
+    return [str(yes_token), str(no_token)] == [str(clob_token_ids[0]), str(clob_token_ids[1])]
 
 
 @dataclass(frozen=True)
@@ -243,7 +307,7 @@ def score_candidate(
     no_spread = _spread(candidate, "no")
     yes_depth = _depth(candidate, "yes")
     no_depth = _depth(candidate, "no")
-    liquidity = _as_float(candidate.get("liquidity"))
+    liquidity = _as_float(_first_present(candidate, "liquidity", "liquidityNum"))
     volume = _as_float(_first_present(candidate, "volume", "volumeNum"))
     volume_24h = _as_float(_first_present(candidate, "volume24hr", "volume24h", "volume24hrClob"))
     end_dt = _parse_dt(_first_present(candidate, "end_date", "endDate"))
@@ -300,11 +364,14 @@ def score_candidate(
     )
     clob_token_ids = _clob_token_ids(candidate)
     has_yes_no_outcomes = _has_yes_no_outcomes(candidate)
+    book_token_ids_match = _book_token_ids_match(candidate, clob_token_ids)
     blockers: list[str] = []
     if not complete_books:
         blockers.append("missing_complete_yes_no_clob_books")
     if len(clob_token_ids) != 2:
         blockers.append("invalid_or_missing_yes_no_clob_token_ids")
+    if len(clob_token_ids) == 2 and not book_token_ids_match:
+        blockers.append("book_token_ids_do_not_match_yes_no_mapping")
     if not has_yes_no_outcomes:
         blockers.append("invalid_yes_no_outcome_mapping")
     if liquidity < rules.min_liquidity:
@@ -339,6 +406,7 @@ def score_candidate(
             "has_explicit_reward_evidence": _has_explicit_reward_evidence(candidate),
             "has_complete_clob_token_ids": len(clob_token_ids) == 2,
             "has_yes_no_outcomes": has_yes_no_outcomes,
+            "book_token_ids_match_yes_no_mapping": book_token_ids_match,
         },
         "accidental_fill_risk_flags": risk_flags,
     }
@@ -380,7 +448,7 @@ def build_reward_manifest(
                 "clob_token_ids": _clob_token_ids(candidate),
                 "outcomes": _outcomes(candidate),
                 "source_candidate_score": _first_present(candidate, "candidate_score", "score"),
-                "source_url": candidate.get("url"),
+                "source_url": _first_present(candidate, "url", "source_market_url"),
                 **score,
             }
         )
