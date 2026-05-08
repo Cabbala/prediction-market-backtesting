@@ -187,17 +187,23 @@ def _books_from_flat_candidate(candidate: dict[str, Any], tokens: list[str]) -> 
 
 def canonical_yes_no_tokens(candidate: dict[str, Any]) -> tuple[list[str] | None, list[str], str | None]:
     canonical_tokens = _parse_jsonish(candidate.get("clobTokenIds_yes_no"), None)
+    side_tokens = None
+    if candidate.get("yes_token_id") not in (None, "") or candidate.get("no_token_id") not in (None, ""):
+        side_tokens = [candidate.get("yes_token_id"), candidate.get("no_token_id")]
     raw_tokens = _parse_jsonish(candidate.get("clobTokenIds") or candidate.get("clob_token_ids"), []) or []
     outcomes = _parse_jsonish(candidate.get("outcomes") or candidate.get("outcome_names"), []) or []
     outcomes = [str(x).strip().lower() for x in outcomes]
-    tokens_source = canonical_tokens if canonical_tokens is not None else raw_tokens
+    tokens_source = canonical_tokens if canonical_tokens is not None else (side_tokens if side_tokens is not None else raw_tokens)
     tokens = [str(x) for x in (tokens_source or []) if str(x)]
     if len(tokens) != 2 or len(set(tokens)) != 2:
         return None, outcomes, "requires_exactly_two_unique_clob_token_ids"
+    if canonical_tokens is not None or side_tokens is not None:
+        # Side-scoped token fields are already explicit Yes/No evidence in the
+        # current autonomous scan schema. Keep fail-closed uniqueness checks, but
+        # do not require a redundant outcomes array for these canonical sources.
+        return tokens, outcomes or ["yes", "no"], None
     if len(outcomes) != 2 or set(outcomes) != {"yes", "no"}:
         return None, outcomes, "requires_explicit_binary_yes_no_outcomes"
-    if canonical_tokens is not None:
-        return tokens, outcomes, None
     yes_idx = outcomes.index("yes")
     no_idx = outcomes.index("no")
     return [tokens[yes_idx], tokens[no_idx]], outcomes, None

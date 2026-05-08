@@ -197,3 +197,32 @@ def test_public_scan_compact_named_books_with_top10_depth_are_supported():
     assert row["reward_category"] == "explicit_reward"
     assert "thin_two_sided_depth" not in row["accidental_fill_risk_flags"]
 
+
+def test_shadow_scan_side_token_fields_are_canonical_without_outcomes():
+    scanner = RewardMarketScanner(now=datetime(2026, 5, 8, tzinfo=timezone.utc))
+    candidate = {
+        "id": "m4",
+        "conditionId": "0xjkl",
+        "slug": "side-token-scan-example",
+        "question": "Will side-token scan example happen?",
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "endDate": "2026-07-20T00:00:00Z",
+        "volumeNum": 1000000,
+        "liquidityNum": 500000,
+        "volume24hr": 25000,
+        "reward_evidence": {"rewardsMinSize": 100, "rewardsMaxSpread": 2.5},
+        "yes_book": {"bid": 0.09, "ask": 0.091, "bid_levels": 76, "ask_levels": 214, "depth_bid_5c": 1163058.38, "depth_ask_5c": 902128.06},
+        "no_book": {"bid": 0.909, "ask": 0.91, "bid_levels": 214, "ask_levels": 76, "depth_bid_5c": 902128.06, "depth_ask_5c": 1163058.38},
+    }
+    tokens, outcomes, error = canonical_yes_no_tokens(candidate)
+    assert error is None
+    assert tokens == ["yes-token", "no-token"]
+    assert outcomes == ["yes", "no"]
+    manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.jsonl")
+    assert manifest["summary"]["eligible_count"] == 1
+    row = manifest["candidates"][0]
+    assert row["yes_token_id"] == "yes-token"
+    assert row["no_token_id"] == "no-token"
+    assert row["min_two_sided_depth_5c"] == 902128.06
+
