@@ -55,7 +55,7 @@ def _dt(value: Any) -> datetime | None:
 
 def _levels(book: dict[str, Any], side: str) -> list[dict[str, float]]:
     raw = book.get(side) or book.get(f"{side}s") or book.get(f"{side}_levels") or []
-    if isinstance(raw, int):
+    if isinstance(raw, (int, float)):
         return []
     out: list[dict[str, float]] = []
     for row in raw or []:
@@ -80,14 +80,30 @@ def _level_count(book: dict[str, Any], key: str, parsed_levels: list[dict[str, f
     return len(parsed_levels)
 
 
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
 def _book_metrics(book: dict[str, Any]) -> dict[str, Any]:
     bids = _levels(book, "bid")
     asks = _levels(book, "ask")
-    best_bid = _float(book.get("best_bid"), 0.0) or (max((x["price"] for x in bids), default=0.0))
-    best_ask = _float(book.get("best_ask"), 0.0) or (min((x["price"] for x in asks), default=0.0))
+    # Current public scan artifacts may store top-of-book as either
+    # best_bid/best_ask or compact bid/ask scalar fields. Accept both, but
+    # never infer a book when one side is missing.
+    best_bid = _float(_first_present(book, ("best_bid", "bid")), 0.0) or (max((x["price"] for x in bids), default=0.0))
+    best_ask = _float(_first_present(book, ("best_ask", "ask")), 0.0) or (min((x["price"] for x in asks), default=0.0))
     spread = _float(book.get("spread"), 0.0) or (best_ask - best_bid if best_ask and best_bid else 0.0)
     depth_5c_bid = sum(x["size"] for x in bids if best_bid and x["price"] >= max(0.0, best_bid - 0.05))
     depth_5c_ask = sum(x["size"] for x in asks if best_ask and x["price"] <= min(1.0, best_ask + 0.05))
+    # Some autonomous scans persist bounded depth aggregates rather than raw
+    # price levels. Prefer exact level-derived 5c depth when present, then use
+    # the conservative bounded aggregate as a depth proxy for scoring.
+    depth_5c_bid = depth_5c_bid or _float(_first_present(book, ("depth_bid_5c", "depth_bid_top10", "depth_bid_2c")), 0.0)
+    depth_5c_ask = depth_5c_ask or _float(_first_present(book, ("depth_ask_5c", "depth_ask_top10", "depth_ask_2c")), 0.0)
     return {
         "token_id": str(book.get("token_id") or book.get("asset_id") or ""),
         "best_bid": best_bid,
@@ -99,7 +115,6 @@ def _book_metrics(book: dict[str, Any]) -> dict[str, Any]:
         "depth_5c_ask": depth_5c_ask,
         "ok": bool(book.get("ok", True)) and best_bid > 0 and best_ask > 0 and best_ask > best_bid,
     }
-
 
 REWARD_FIELD_ALLOWLIST = {
     "rewardsMinSize",

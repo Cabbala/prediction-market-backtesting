@@ -146,8 +146,8 @@ def test_latest_daily_scan_named_books_and_num_fields_are_supported():
     row = manifest["candidates"][0]
     assert row["volume"] == 10985921.9
     assert row["liquidity"] == 6909117.2
-    assert row["min_two_sided_depth_5c"] == 0
-    assert "thin_two_sided_depth" in row["accidental_fill_risk_flags"]
+    assert row["min_two_sided_depth_5c"] == 1000
+    assert "thin_two_sided_depth" not in row["accidental_fill_risk_flags"]
     assert row["reward_evidence"] == {"rewardsMinSize": 100, "rewardsMaxSpread": 2.5}
 
 
@@ -172,3 +172,28 @@ def test_named_books_reject_conflicting_embedded_token_ids():
     manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.json")
     assert manifest["summary"]["eligible_count"] == 0
     assert manifest["skipped"][0]["skip_reason"] == "requires_complete_two_sided_books"
+
+def test_public_scan_compact_named_books_with_top10_depth_are_supported():
+    scanner = RewardMarketScanner(now=datetime(2026, 5, 8, tzinfo=timezone.utc))
+    candidate = {
+        "id": "m3",
+        "conditionId": "0xghi",
+        "slug": "public-scan-example",
+        "question": "Will public scan example happen?",
+        "clobTokenIds": ["yes-token", "no-token"],
+        "outcomes": ["Yes", "No"],
+        "endDate": "2026-07-20T00:00:00Z",
+        "volumeNum": 9912642.94,
+        "liquidityNum": 812766.38,
+        "reward_evidence": {"rewardsMinSize": 100, "rewardsMaxSpread": 2.5, "umaReward": "5"},
+        "yes_book": {"bid": 0.003, "ask": 0.004, "bid_levels": 3, "ask_levels": 49, "depth_bid_top10": 12055.77, "depth_ask_top10": 3089.58},
+        "no_book": {"bid": 0.996, "ask": 0.997, "bid_levels": 49, "ask_levels": 3, "depth_bid_top10": 740170.08, "depth_ask_top10": 6658620.81},
+    }
+    manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.json")
+    assert manifest["summary"]["eligible_count"] == 1
+    row = manifest["candidates"][0]
+    assert round(row["avg_spread"], 6) == 0.001
+    assert row["min_two_sided_depth_5c"] == 3089.58
+    assert row["reward_category"] == "explicit_reward"
+    assert "thin_two_sided_depth" not in row["accidental_fill_risk_flags"]
+
