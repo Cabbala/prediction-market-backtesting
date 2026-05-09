@@ -102,8 +102,8 @@ def _book_metrics(book: dict[str, Any]) -> dict[str, Any]:
     # Some autonomous scans persist bounded depth aggregates rather than raw
     # price levels. Prefer exact level-derived 5c depth when present, then use
     # the conservative bounded aggregate as a depth proxy for scoring.
-    depth_5c_bid = depth_5c_bid or _float(_first_present(book, ("depth_bid_5c", "depth_bid_top10", "depth_bid_2c")), 0.0)
-    depth_5c_ask = depth_5c_ask or _float(_first_present(book, ("depth_ask_5c", "depth_ask_top10", "depth_ask_2c")), 0.0)
+    depth_5c_bid = depth_5c_bid or _float(_first_present(book, ("depth_bid_5c", "depth_bid_top10", "depth_bid_2c", "bid_size")), 0.0)
+    depth_5c_ask = depth_5c_ask or _float(_first_present(book, ("depth_ask_5c", "depth_ask_top10", "depth_ask_2c", "ask_size")), 0.0)
     return {
         "token_id": str(book.get("token_id") or book.get("asset_id") or ""),
         "best_bid": best_bid,

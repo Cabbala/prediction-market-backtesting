@@ -226,3 +226,27 @@ def test_shadow_scan_side_token_fields_are_canonical_without_outcomes():
     assert row["no_token_id"] == "no-token"
     assert row["min_two_sided_depth_5c"] == 902128.06
 
+
+def test_public_scan_named_books_with_bid_ask_sizes_are_depth_proxy():
+    scanner = RewardMarketScanner(now=datetime(2026, 5, 9, tzinfo=timezone.utc))
+    candidate = {
+        "id": "m5",
+        "conditionId": "0xmno",
+        "slug": "size-proxy-scan-example",
+        "question": "Will size proxy example happen?",
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "endDate": "2026-07-20T00:00:00Z",
+        "volumeNum": 15000000,
+        "liquidityNum": 4000000,
+        "reward_evidence": {"rewardsMinSize": 100, "rewardsMaxSpread": 2.5},
+        "yes_book": {"bid": 0.010, "ask": 0.011, "bid_size": 8353098.97, "ask_size": 2681646.32, "spread": 0.001},
+        "no_book": {"bid": 0.989, "ask": 0.990, "bid_size": 2681646.32, "ask_size": 8353098.97, "spread": 0.001},
+    }
+    manifest = scanner.build_manifest({"candidates": [candidate]}, source_path="scan.json")
+    assert manifest["summary"]["eligible_count"] == 1
+    row = manifest["candidates"][0]
+    assert row["min_two_sided_depth_5c"] == 2681646.32
+    assert "thin_two_sided_depth" not in row["accidental_fill_risk_flags"]
+    assert "tail_price_gap_risk" in row["accidental_fill_risk_flags"]
+
