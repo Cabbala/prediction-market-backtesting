@@ -12,6 +12,7 @@ def _candidate(**overrides):
         "clobTokenIds": ["yes-token", "no-token"],
         "outcomes": ["Yes", "No"],
         "endDate": "2026-12-31T00:00:00Z",
+        "createdAt": "2026-05-01T00:00:00Z",
         "volume": 100000,
         "volume24hr": 12000,
         "liquidity": 5000,
@@ -40,11 +41,21 @@ def test_build_manifest_scores_and_flags_shadow_only():
     scanner = RewardMarketScanner(now=datetime(2026, 5, 6, tzinfo=timezone.utc))
     manifest = scanner.build_manifest({"candidates": [_candidate()]}, source_path="scan.json")
     assert manifest["safety_mode"] == "shadow_backtest_only_no_live_orders"
+    assert manifest["safety"] == {
+        "orders_submitted": False,
+        "orders_signed": False,
+        "orders_cancelled": False,
+        "credentials_required": False,
+        "live_trading_worker_started": False,
+        "data_sources": ["local_read_only_scan_artifact"],
+    }
+    assert manifest["metadata"]["source_scan_path"] == "scan.json"
     assert manifest["summary"]["eligible_count"] == 1
     row = manifest["candidates"][0]
     assert row["yes_token_id"] == "yes-token"
     assert row["no_token_id"] == "no-token"
     assert row["reward_category"] == "explicit_reward"
+    assert row["age_days_proxy"] == 5.0
     assert row["score"] > 0
 
 

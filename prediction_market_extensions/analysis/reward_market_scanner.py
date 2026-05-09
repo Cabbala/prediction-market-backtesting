@@ -283,6 +283,8 @@ class RewardMarketScanner:
         volume_24h = _float(candidate.get("volume24hr") or candidate.get("volume_24h"))
         yes_price = _float(candidate.get("yes_price")) or (book_metrics[0]["best_bid"] + book_metrics[0]["best_ask"]) / 2
         hours_to_end = ((end - self.now).total_seconds() / 3600.0) if end else None
+        created = _dt(candidate.get("createdAt") or candidate.get("created_at") or candidate.get("startDate") or candidate.get("start_date"))
+        age_days_proxy = ((self.now - created).total_seconds() / 86400.0) if created and created <= self.now else None
         rewards = _reward_fields(candidate)
         flags: list[str] = []
         if max_spread > 0.03:
@@ -311,7 +313,7 @@ class RewardMarketScanner:
             question=str(candidate.get("question") or candidate.get("title") or ""),
             yes_token_id=tokens[0], no_token_id=tokens[1],
             end_time_utc=end.isoformat().replace("+00:00", "Z") if end else None,
-            age_days_proxy=None,
+            age_days_proxy=round(age_days_proxy, 6) if age_days_proxy is not None else None,
             hours_to_end=hours_to_end,
             yes_price=yes_price,
             avg_spread=avg_spread,
@@ -346,6 +348,19 @@ class RewardMarketScanner:
             "generated_at_utc": self.now.isoformat().replace("+00:00", "Z"),
             "source_path": source_path,
             "safety_mode": "shadow_backtest_only_no_live_orders",
+            "safety": {
+                "orders_submitted": False,
+                "orders_signed": False,
+                "orders_cancelled": False,
+                "credentials_required": False,
+                "live_trading_worker_started": False,
+                "data_sources": ["local_read_only_scan_artifact"],
+            },
+            "metadata": {
+                "source_scan_path": source_path,
+                "candidate_source_shape": "candidates/top_candidates/markets/events_or_jsonl",
+                "depth_policy": "prefer_exact_5c_levels_else_label_bounded_depth_proxy_in_rules",
+            },
             "eligibility_rules": [
                 "exactly_two_unique_clob_token_ids",
                 "explicit_binary_yes_no_outcomes",
@@ -354,7 +369,7 @@ class RewardMarketScanner:
                 "explicit_reward_evidence_preferred_but_not_required_for_proxy_rows",
             ],
             "scoring_notes": [
-                "reward evidence, liquidity, 24h volume, and measured two-sided 5c depth increase score",
+                "reward evidence, liquidity, 24h volume, measured or proxy two-sided 5c depth, and market age/end-time context feed the score",
                 "wide spread, thin/unknown depth, near expiry, tail price, and missing reward evidence add risk flags and reduce score",
                 "flat top-of-book rows are accepted for candidate triage but carry unknown-depth risk until full books are available",
                 "manifest is for PMBT/backtest/shadow logging only",
