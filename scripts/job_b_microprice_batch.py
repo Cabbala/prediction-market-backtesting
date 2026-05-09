@@ -83,6 +83,26 @@ def _candidate_slug(raw: dict[str, Any]) -> str | None:
     return value.strip()
 
 
+def _strategy_key(value: Any) -> str:
+    if value is None:
+        return ""
+    key = "".join(ch for ch in str(value).lower() if ch.isalnum())
+    aliases = {
+        "micropriceoptimizer": "microprice",
+        "micropriceorderbookimbalance": "microprice",
+        "bookmicropriceimbalance": "microprice",
+    }
+    return aliases.get(key, key)
+
+
+def _strategy_matches(requested: str | None, actual: str | None) -> bool:
+    requested_key = _strategy_key(requested)
+    if not requested_key:
+        return True
+    actual_key = _strategy_key(actual)
+    return requested_key == actual_key
+
+
 def _normalize_candidate(raw: dict[str, Any], *, source_strategy: str) -> Candidate | None:
     slug = _candidate_slug(raw)
     if slug is None:
@@ -117,7 +137,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                 if not isinstance(batch, dict):
                     continue
                 source_strategy = str(batch.get("strategy") or "unknown")
-                if strategy and source_strategy != strategy:
+                if not _strategy_matches(strategy, source_strategy):
                     continue
                 markets = batch.get("markets")
                 if not isinstance(markets, list):
@@ -146,7 +166,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                     or payload.get("strategy")
                     or "reward_manifest"
                 )
-                if strategy and source_strategy != strategy:
+                if not _strategy_matches(strategy, source_strategy):
                     continue
                 coverage = raw.get("coverage")
                 if isinstance(coverage, dict):
