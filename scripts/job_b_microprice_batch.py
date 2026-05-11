@@ -388,23 +388,178 @@ def microprice_param_grid() -> list[dict[str, Any]]:
 def _safe_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
     if result is None:
         return None
-    safe: dict[str, Any] = {}
-    for key, value in result.items():
-        if key.lower() in {"private_key", "secret", "token", "api_key"}:
-            continue
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            safe[key] = value
-        elif isinstance(value, list):
-            safe[key] = value[:20]
-        elif isinstance(value, dict):
-            safe[key] = {
-                str(k): v
-                for k, v in list(value.items())[:50]
-                if isinstance(v, (str, int, float, bool)) or v is None
-            }
-        else:
-            safe[key] = repr(value)
-    return safe
+    return {
+        str(key): _safe_json_value(value)
+        for key, value in result.items()
+        if str(key).lower() not in {"private_key", "secret", "token", "api_key"}
+    }
+
+
+def _safe_json_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 6:
+        return repr(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_safe_json_value(item, depth=depth + 1) for item in value[:50]]
+    if isinstance(value, dict):
+        return {
+            str(k): _safe_json_value(v, depth=depth + 1)
+            for k, v in list(value.items())[:100]
+            if str(k).lower() not in {"private_key", "secret", "token", "api_key"}
+        }
+    return repr(value)
+
+
+def _safe_mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_count(value: Any) -> int:
+    parsed = _parse_int(value)
+    return parsed if parsed is not None else 0
+
+
+def _safe_nested_float(mapping: dict[str, Any], key: str) -> float | None:
+    return _parse_float(mapping.get(key))
+
+
+def _tick_cost_diagnostic(
+    *, scan_mid: float | None, scan_spread: float | None, observed_min_spread: float | None
+) -> dict[str, Any]:
+    effective_spread = scan_spread if scan_spread is not None else observed_min_spread
+    ratio = (
+        effective_spread / scan_mid
+        if scan_mid is not None and scan_mid > 0 and effective_spread is not None
+        else None
+    )
+    blocked = bool(ratio is not None and ratio >= 0.20)
+    return {
+        "blocked": blocked,
+        "scan_mid": scan_mid,
+        "scan_spread": scan_spread,
+        "observed_min_spread": observed_min_spread,
+        "effective_spread": effective_spread,
+        "spread_to_mid_ratio": ratio,
+        "threshold_ratio": 0.20,
+    }
+
+
+def _classify_no_order_diagnostics(
+    *,
+    status: str,
+    fills: float | None,
+    strategy_order_count: float | None,
+    scan_mid: float | None,
+    scan_spread: float | None,
+    params: dict[str, Any],
+    strategy_diagnostics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    diagnostics = strategy_diagnostics or {}
+    observed = _safe_mapping(diagnostics.get("observed"))
+    thresholds = _safe_mapping(diagnostics.get("thresholds"))
+    entry_block_counts = _safe_mapping(diagnostics.get("entry_block_counts"))
+    book_signal_count = _safe_count(diagnostics.get("book_signal_count"))
+    flat_evaluation_count = _safe_count(diagnostics.get("flat_evaluation_count"))
+    entry_signal_count = _safe_count(diagnostics.get("entry_signal_count"))
+    no_fill_completed = status == "completed" and (fills or 0.0) == 0.0
+    order_count = strategy_order_count if strategy_order_count is not None else 0.0
+
+    min_spread = _safe_nested_float(observed, "min_spread")
+    max_microprice_edge = _safe_nested_float(observed, "max_microprice_edge")
+    max_spread_threshold = _parse_float(thresholds.get("max_spread"))
+    min_edge_threshold = _parse_float(
+        thresholds.get("min_microprice_edge") or params.get("min_microprice_edge")
+    )
+    tick_cost = _tick_cost_diagnostic(
+        scan_mid=scan_mid, scan_spread=scan_spread, observed_min_spread=min_spread
+    )
+    spread_blocked = bool(
+        no_fill_completed
+        and entry_signal_count == 0
+        and (
+            _safe_count(entry_block_counts.get("spread")) > 0
+            or (
+                min_spread is not None
+                and max_spread_threshold is not None
+                and min_spread > max_spread_threshold
+            )
+        )
+    )
+    edge_blocked = bool(
+        no_fill_completed
+        and entry_signal_count == 0
+        and (
+            _safe_count(entry_block_counts.get("microprice_edge")) > 0
+            or (
+                max_microprice_edge is not None
+                and min_edge_threshold is not None
+                and max_microprice_edge < min_edge_threshold
+            )
+        )
+    )
+    queue_blocked = bool(no_fill_completed and (order_count > 0 or entry_signal_count > 0))
+    fill_opportunity_blocked = bool(no_fill_completed and entry_signal_count == 0)
+    causes: list[str] = []
+    if no_fill_completed and tick_cost["blocked"]:
+        causes.append("tick_cost_blocker")
+    if spread_blocked:
+        causes.append("spread_blocker")
+    if edge_blocked:
+        causes.append("edge_blocker")
+    if queue_blocked:
+        causes.append("queue_blocker")
+    if fill_opportunity_blocked:
+        causes.append("fill_opportunity_blocker")
+    if no_fill_completed and not causes:
+        causes.append("unexplained_no_order_or_fill")
+
+    primary_cause = None
+    for candidate_cause in (
+        "queue_blocker",
+        "edge_blocker",
+        "spread_blocker",
+        "fill_opportunity_blocker",
+        "tick_cost_blocker",
+        "unexplained_no_order_or_fill",
+    ):
+        if candidate_cause in causes:
+            primary_cause = candidate_cause
+            break
+
+    return {
+        "eligible": no_fill_completed,
+        "primary_cause": primary_cause,
+        "causes": causes,
+        "cause_counts": {cause: 1 for cause in causes},
+        "blockers": {
+            "tick_cost": tick_cost,
+            "spread": {
+                "blocked": spread_blocked,
+                "block_count": _safe_count(entry_block_counts.get("spread")),
+                "observed_min_spread": min_spread,
+                "threshold": max_spread_threshold,
+            },
+            "edge": {
+                "blocked": edge_blocked,
+                "block_count": _safe_count(entry_block_counts.get("microprice_edge")),
+                "observed_max_microprice_edge": max_microprice_edge,
+                "threshold": min_edge_threshold,
+            },
+            "queue": {
+                "blocked": queue_blocked,
+                "strategy_order_count": strategy_order_count,
+                "entry_signal_count": entry_signal_count,
+                "fills": fills,
+            },
+            "fill_opportunity": {
+                "blocked": fill_opportunity_blocked,
+                "book_signal_count": book_signal_count,
+                "flat_evaluation_count": flat_evaluation_count,
+                "entry_signal_count": entry_signal_count,
+            },
+        },
+    }
 
 
 def _diagnose_attempt(
@@ -456,6 +611,23 @@ def _diagnose_attempt(
         suspected_causes.append("needs_multi_window_multi_candidate_replay")
     if error:
         suspected_causes.append("runner_error")
+    strategy_diagnostics = (
+        result.get("strategy_diagnostics")
+        if result and isinstance(result.get("strategy_diagnostics"), dict)
+        else None
+    )
+    no_order = _classify_no_order_diagnostics(
+        status=status,
+        fills=fills,
+        strategy_order_count=strategy_order_count,
+        scan_mid=mid,
+        scan_spread=spread,
+        params=params,
+        strategy_diagnostics=strategy_diagnostics,
+    )
+    for cause in no_order.get("causes", []):
+        if cause not in suspected_causes:
+            suspected_causes.append(cause)
     return {
         "window": {"start_time": start_time, "end_time": end_time},
         "min_book_events": min_book_events,
@@ -469,6 +641,10 @@ def _diagnose_attempt(
         "pnl": pnl,
         "strategy_order_count": strategy_order_count,
         "params": params,
+        "strategy_diagnostics": strategy_diagnostics,
+        "no_order": no_order,
+        "no_order_primary_cause": no_order.get("primary_cause"),
+        "no_order_causes": no_order.get("causes", []),
         "suspected_causes": suspected_causes,
     }
 
@@ -477,13 +653,28 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
     completed = [a for a in attempts if a.status == "completed"]
     zero_fill = [a for a in completed if ((a.result or {}).get("fills") in {0, 0.0, None})]
     causes: dict[str, int] = {}
+    no_order_cause_counts: dict[str, int] = {}
+    no_order_primary_cause_counts: dict[str, int] = {}
     for attempt in attempts:
-        for cause in (attempt.diagnostics or {}).get("suspected_causes", []):
+        diagnostics = attempt.diagnostics or {}
+        for cause in diagnostics.get("suspected_causes", []):
             causes[cause] = causes.get(cause, 0) + 1
+        no_order = diagnostics.get("no_order")
+        if isinstance(no_order, dict):
+            for cause, count in (no_order.get("cause_counts") or {}).items():
+                no_order_cause_counts[str(cause)] = no_order_cause_counts.get(str(cause), 0) + int(
+                    count or 0
+                )
+            primary_cause = no_order.get("primary_cause")
+            if primary_cause:
+                key = str(primary_cause)
+                no_order_primary_cause_counts[key] = no_order_primary_cause_counts.get(key, 0) + 1
     return {
         "completed_attempts": len(completed),
         "zero_fill_completed_attempts": len(zero_fill),
         "suspected_cause_counts": causes,
+        "no_order_cause_counts": no_order_cause_counts,
+        "no_order_primary_cause_counts": no_order_primary_cause_counts,
         "profit_opportunity_demonstrated": any(
             ((a.result or {}).get("pnl") or 0) > 0 and ((a.result or {}).get("fills") or 0) > 0
             for a in attempts
@@ -666,6 +857,7 @@ async def run_attempt(
                 ),
             ),
         )
+        safe_result = _safe_result(result)
         return BacktestAttempt(
             slug=candidate.slug,
             question=candidate.question,
@@ -673,12 +865,12 @@ async def run_attempt(
             source_strategy=candidate.source_strategy,
             params=params,
             status="skipped_no_coverage" if result is None else "completed",
-            result=_safe_result(result),
+            result=safe_result,
             error=None,
             diagnostics=_diagnose_attempt(
                 candidate,
                 params,
-                _safe_result(result),
+                safe_result,
                 start_time=start_time,
                 end_time=end_time,
                 min_book_events=min_book_events,
@@ -806,6 +998,8 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
                 "fills",
                 "book_events",
                 "strategy_order_count",
+                "no_order_primary_cause",
+                "no_order_causes",
                 "diagnostics",
                 "error",
             ],
@@ -813,6 +1007,8 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         writer.writeheader()
         for attempt in attempts:
             result = attempt.get("result") or {}
+            diagnostics = attempt.get("diagnostics") or {}
+            no_order = diagnostics.get("no_order") or {}
             writer.writerow(
                 {
                     "slug": attempt.get("slug"),
@@ -823,13 +1019,14 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
                     "pnl": result.get("pnl"),
                     "fills": result.get("fills"),
                     "book_events": result.get("book_events"),
-                    "strategy_order_count": (attempt.get("diagnostics") or {}).get(
-                        "strategy_order_count"
-                    ),
-                    "diagnostics": json.dumps(attempt.get("diagnostics") or {}, sort_keys=True),
+                    "strategy_order_count": diagnostics.get("strategy_order_count"),
+                    "no_order_primary_cause": no_order.get("primary_cause"),
+                    "no_order_causes": json.dumps(no_order.get("causes", []), sort_keys=True),
+                    "diagnostics": json.dumps(diagnostics, sort_keys=True),
                     "error": attempt.get("error"),
                 }
             )
+    aggregate_diagnostics = summary.get("diagnostics", {})
     lines = [
         "# Job B Microprice / Orderbook Imbalance Batch",
         "",
@@ -850,26 +1047,39 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- completed: {summary['completed_count']}",
         f"- skipped_no_coverage: {summary['skipped_no_coverage_count']}",
         f"- errors: {summary['error_count']}",
-        f"- diagnostics: {json.dumps(summary.get('diagnostics', {}), sort_keys=True)}",
+        f"- no_order_cause_counts: {json.dumps(aggregate_diagnostics.get('no_order_cause_counts', {}), sort_keys=True)}",
+        f"- no_order_primary_cause_counts: {json.dumps(aggregate_diagnostics.get('no_order_primary_cause_counts', {}), sort_keys=True)}",
+        f"- diagnostics: {json.dumps(aggregate_diagnostics, sort_keys=True)}",
         "",
         "Safety: backtest/shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.",
         "",
         "## Attempts",
         "",
-        "| status | market | params | result/error |",
-        "|---|---|---|---|",
+        "| status | market | params | no-order diagnostics | result/error |",
+        "|---|---|---|---|---|",
     ]
     for attempt in attempts:
         result = attempt.get("result") or {}
         diagnostics = attempt.get("diagnostics") or {}
         causes = ",".join(diagnostics.get("suspected_causes", []))
         order_count = diagnostics.get("strategy_order_count")
+        no_order = diagnostics.get("no_order") or {}
+        blockers = no_order.get("blockers") or {}
+        blocker_summary = {
+            "primary": no_order.get("primary_cause"),
+            "causes": no_order.get("causes", []),
+            "tick_cost": (blockers.get("tick_cost") or {}).get("blocked"),
+            "spread": (blockers.get("spread") or {}).get("blocked"),
+            "edge": (blockers.get("edge") or {}).get("blocked"),
+            "queue": (blockers.get("queue") or {}).get("blocked"),
+            "fill_opportunity": (blockers.get("fill_opportunity") or {}).get("blocked"),
+        }
         detail = attempt.get("error") or (
             f"pnl={result.get('pnl')} fills={result.get('fills')} "
             f"book_events={result.get('book_events')} strategy_orders={order_count} causes={causes}"
         )
         lines.append(
-            f"| {attempt.get('status')} | {attempt.get('slug')} | `{json.dumps(attempt.get('params', {}), sort_keys=True)}` | {detail} |"
+            f"| {attempt.get('status')} | {attempt.get('slug')} | `{json.dumps(attempt.get('params', {}), sort_keys=True)}` | {json.dumps(blocker_summary, sort_keys=True)} | {detail} |"
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"json": str(json_path), "csv": str(csv_path), "markdown": str(md_path)}

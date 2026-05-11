@@ -118,6 +118,37 @@ def _serialize_engine_result_stats(engine_result: Any) -> dict[str, Any]:
     }
 
 
+def _json_safe_strategy_diagnostic(value: Any, *, depth: int = 0) -> Any:
+    if depth > 6:
+        return repr(value)
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_strategy_diagnostic(item, depth=depth + 1)
+            for key, item in list(value.items())[:100]
+            if str(key).lower() not in {"private_key", "secret", "token", "api_key"}
+        }
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_json_safe_strategy_diagnostic(item, depth=depth + 1) for item in list(value)[:100]]
+    return repr(value)
+
+
+def _strategy_diagnostic_snapshot(strategy: Strategy | None) -> dict[str, Any] | None:
+    if strategy is None:
+        return None
+    snapshot = getattr(strategy, "diagnostic_snapshot", None)
+    if not callable(snapshot):
+        return None
+    try:
+        diagnostics = snapshot()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(diagnostics, Mapping):
+        return None
+    return _json_safe_strategy_diagnostic(diagnostics)
+
+
 class PredictionMarketBacktest:
     def __init__(
         self,
@@ -208,9 +239,12 @@ class PredictionMarketBacktest:
                 engine.add_instrument(loaded_sim.instrument)
                 add_engine_data_by_type(engine, list(loaded_sim.records))
 
+            strategies_by_instrument_id: dict[str, Strategy] = {}
             if self.strategy_factory is not None:
                 for loaded_sim in loaded_sims:
-                    engine.add_strategy(self.strategy_factory(loaded_sim.instrument.id))
+                    strategy = self.strategy_factory(loaded_sim.instrument.id)
+                    strategies_by_instrument_id[str(loaded_sim.instrument.id)] = strategy
+                    engine.add_strategy(strategy)
             else:
                 for importable_config in self._build_importable_strategy_configs(loaded_sims):
                     engine.add_strategy(NautilusStrategyFactory.create(importable_config))
@@ -231,8 +265,9 @@ class PredictionMarketBacktest:
             joint_portfolio_artifacts = self._build_joint_portfolio_artifacts(
                 engine=engine, loaded_sims=loaded_sims
             )
-            results = [
-                self._build_result(
+            results = []
+            for result_index, loaded_sim in enumerate(loaded_sims):
+                result = self._build_result(
                     loaded_sim=loaded_sim,
                     fills_report=fills_report,
                     positions_report=positions_report,
@@ -250,8 +285,12 @@ class PredictionMarketBacktest:
                         requested_end_ns=loaded_sim.requested_window.end_ns,
                     ),
                 )
-                for result_index, loaded_sim in enumerate(loaded_sims)
-            ]
+                strategy_diagnostics = _strategy_diagnostic_snapshot(
+                    strategies_by_instrument_id.get(str(loaded_sim.instrument.id))
+                )
+                if strategy_diagnostics is not None:
+                    result["strategy_diagnostics"] = strategy_diagnostics
+                results.append(result)
             apply_joint_portfolio_settlement_pnl(results)
             if results:
                 results[0]["portfolio_stats"] = _serialize_engine_result_stats(engine_result)

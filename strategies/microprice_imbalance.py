@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.enums import BookType, OrderSide
@@ -54,6 +54,16 @@ class _MicropriceImbalanceConfig(Protocol):
 
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
+_ENTRY_BLOCK_REASONS = (
+    "pending_order",
+    "reentry_cooldown_updates",
+    "reentry_cooldown_seconds",
+    "price_cap",
+    "spread",
+    "imbalance",
+    "microprice_edge",
+    "expected_slippage",
+)
 
 
 class BookMicropriceImbalanceConfig(StrategyConfig, frozen=True):  # type: ignore[call-arg]
@@ -135,6 +145,78 @@ class BookMicropriceImbalanceStrategy(LongOnlyPredictionMarketStrategy):
         self._last_book_ts_ns: int | None = None
         self._entry_ts_ns: int | None = None
         self._flat_ts_ns: int | None = None
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self) -> None:
+        self._book_signal_count = 0
+        self._flat_evaluation_count = 0
+        self._entry_signal_count = 0
+        self._entry_block_counts = {reason: 0 for reason in _ENTRY_BLOCK_REASONS}
+        self._min_spread: float | None = None
+        self._max_spread_seen: float | None = None
+        self._max_imbalance: float | None = None
+        self._max_microprice_edge: float | None = None
+        self._min_expected_entry_price: float | None = None
+        self._max_expected_slippage: float | None = None
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "book_signal_count": self._book_signal_count,
+            "flat_evaluation_count": self._flat_evaluation_count,
+            "entry_signal_count": self._entry_signal_count,
+            "entry_block_counts": dict(self._entry_block_counts),
+            "observed": {
+                "min_spread": self._min_spread,
+                "max_spread": self._max_spread_seen,
+                "max_imbalance": self._max_imbalance,
+                "max_microprice_edge": self._max_microprice_edge,
+                "min_expected_entry_price": self._min_expected_entry_price,
+                "max_expected_slippage": self._max_expected_slippage,
+            },
+            "thresholds": {
+                "max_spread": float(self.config.max_spread),
+                "entry_imbalance": float(self.config.entry_imbalance),
+                "min_microprice_edge": float(self.config.min_microprice_edge),
+                "max_entry_price": float(self.config.max_entry_price),
+                "max_expected_slippage": float(self.config.max_expected_slippage),
+            },
+        }
+
+    def _record_entry_block(self, reason: str) -> None:
+        self._entry_block_counts[reason] = self._entry_block_counts.get(reason, 0) + 1
+
+    @staticmethod
+    def _min_seen(current: float | None, value: float | None) -> float | None:
+        if value is None:
+            return current
+        return value if current is None else min(current, value)
+
+    @staticmethod
+    def _max_seen(current: float | None, value: float | None) -> float | None:
+        if value is None:
+            return current
+        return value if current is None else max(current, value)
+
+    def _record_book_signal(
+        self,
+        *,
+        ask: float,
+        spread: float,
+        imbalance: float,
+        microprice_edge: float,
+        expected_entry_price: float | None,
+    ) -> None:
+        self._book_signal_count += 1
+        self._min_spread = self._min_seen(self._min_spread, spread)
+        self._max_spread_seen = self._max_seen(self._max_spread_seen, spread)
+        self._max_imbalance = self._max_seen(self._max_imbalance, imbalance)
+        self._max_microprice_edge = self._max_seen(self._max_microprice_edge, microprice_edge)
+        self._min_expected_entry_price = self._min_seen(
+            self._min_expected_entry_price, expected_entry_price
+        )
+        expected_slippage = None if expected_entry_price is None else expected_entry_price - ask
+        self._max_expected_slippage = self._max_seen(self._max_expected_slippage, expected_slippage)
 
     def _subscribe(self) -> None:
         self.subscribe_order_book_deltas(
@@ -221,28 +303,45 @@ class BookMicropriceImbalanceStrategy(LongOnlyPredictionMarketStrategy):
             entry_visible_size=entry_visible_size,
             exit_visible_size=exit_visible_size,
         )
+        self._record_book_signal(
+            ask=ask,
+            spread=spread,
+            imbalance=imbalance,
+            microprice_edge=microprice_edge,
+            expected_entry_price=expected_entry_price,
+        )
         if self._pending:
+            self._record_entry_block("pending_order")
             return
 
         if not self._in_position():
+            self._flat_evaluation_count += 1
             if self._reentry_cooldown_remaining > 0:
                 self._reentry_cooldown_remaining -= 1
+                self._record_entry_block("reentry_cooldown_updates")
                 return
             if not self._reentry_cooldown_elapsed(current_ts_ns):
+                self._record_entry_block("reentry_cooldown_seconds")
                 return
             if entry_reference_price > float(self.config.max_entry_price):
+                self._record_entry_block("price_cap")
                 return
             if spread > float(self.config.max_spread):
+                self._record_entry_block("spread")
                 return
             if imbalance < float(self.config.entry_imbalance):
+                self._record_entry_block("imbalance")
                 return
             if microprice_edge < float(self.config.min_microprice_edge):
+                self._record_entry_block("microprice_edge")
                 return
             if expected_entry_price is not None and expected_entry_price - ask > float(
                 self.config.max_expected_slippage
             ):
+                self._record_entry_block("expected_slippage")
                 return
 
+            self._entry_signal_count += 1
             self._submit_entry(
                 reference_price=entry_reference_price, visible_size=entry_visible_size
             )
@@ -319,3 +418,4 @@ class BookMicropriceImbalanceStrategy(LongOnlyPredictionMarketStrategy):
         self._last_book_ts_ns = None
         self._entry_ts_ns = None
         self._flat_ts_ns = None
+        self._reset_diagnostics()

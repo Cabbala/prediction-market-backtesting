@@ -189,9 +189,7 @@ def test_select_latest_non_empty_pass_manifest_skips_zero_candidate_files(tmp_pa
     assert records[1]["reason"] == "selected_newest_non_empty_pass_manifest"
 
 
-def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(
-    monkeypatch, tmp_path
-):
+def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(monkeypatch, tmp_path):
     manifest = tmp_path / "coverage_window.json"
     manifest.write_text(
         json.dumps(
@@ -286,6 +284,163 @@ def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(
     assert summary["safety"]["credentials_required"] is False
     assert summary["safety"]["worker_trading_started"] is False
     assert summary["safety"]["live_trading_worker_started"] is False
+
+
+def test_diagnose_attempt_distinguishes_no_order_blocker_buckets():
+    candidate = job_b_microprice_batch.Candidate(
+        slug="covered-window",
+        question="Covered market",
+        token_index=0,
+        condition_id=None,
+        scan_mid=0.0035,
+        scan_spread=0.001,
+        scan_imbalance5=None,
+        liquidity=1_000_000.0,
+        source_strategy="Microprice",
+        coverage_book_events=108,
+        coverage_min_book_events=50,
+    )
+    params = {
+        "depth_levels": 1,
+        "entry_imbalance": 0.55,
+        "exit_imbalance": 0.50,
+        "min_microprice_edge": 0.0005,
+        "quote_lifetime_seconds": 10.0,
+    }
+    result = {
+        "fills": 0,
+        "pnl": 0.0,
+        "book_events": 108,
+        "portfolio_stats": {"total_orders": 0},
+        "strategy_diagnostics": {
+            "book_signal_count": 108,
+            "flat_evaluation_count": 108,
+            "entry_signal_count": 0,
+            "entry_block_counts": {"microprice_edge": 108, "spread": 0},
+            "observed": {"min_spread": 0.001, "max_microprice_edge": 0.0},
+            "thresholds": {"max_spread": 0.05, "min_microprice_edge": 0.0005},
+        },
+    }
+
+    diagnostics = job_b_microprice_batch._diagnose_attempt(
+        candidate,
+        params,
+        result,
+        start_time="2026-05-10T08:00:00Z",
+        end_time="2026-05-10T09:00:00Z",
+        min_book_events=50,
+        status="completed",
+    )
+
+    blockers = diagnostics["no_order"]["blockers"]
+    assert blockers["tick_cost"]["blocked"] is True
+    assert blockers["edge"]["blocked"] is True
+    assert blockers["spread"]["blocked"] is False
+    assert blockers["queue"]["blocked"] is False
+    assert blockers["fill_opportunity"]["blocked"] is True
+    assert diagnostics["no_order_primary_cause"] == "edge_blocker"
+    assert "tick_cost_blocker" in diagnostics["no_order_causes"]
+
+
+def test_diagnose_attempt_distinguishes_spread_and_queue_blockers():
+    candidate = job_b_microprice_batch.Candidate(
+        slug="covered-window",
+        question="Covered market",
+        token_index=0,
+        condition_id=None,
+        scan_mid=0.5,
+        scan_spread=0.01,
+        scan_imbalance5=None,
+        liquidity=1_000_000.0,
+        source_strategy="Microprice",
+    )
+    params = {
+        "depth_levels": 1,
+        "entry_imbalance": 0.55,
+        "exit_imbalance": 0.50,
+        "min_microprice_edge": 0.0005,
+        "quote_lifetime_seconds": 10.0,
+    }
+    spread_result = {
+        "fills": 0,
+        "pnl": 0.0,
+        "book_events": 108,
+        "portfolio_stats": {"total_orders": 0},
+        "strategy_diagnostics": {
+            "book_signal_count": 108,
+            "flat_evaluation_count": 108,
+            "entry_signal_count": 0,
+            "entry_block_counts": {"spread": 108, "microprice_edge": 0},
+            "observed": {"min_spread": 0.06, "max_microprice_edge": 0.003},
+            "thresholds": {"max_spread": 0.05, "min_microprice_edge": 0.0005},
+        },
+    }
+    queue_result = {
+        "fills": 0,
+        "pnl": 0.0,
+        "book_events": 108,
+        "portfolio_stats": {"total_orders": 2},
+        "strategy_diagnostics": {
+            "book_signal_count": 108,
+            "flat_evaluation_count": 108,
+            "entry_signal_count": 2,
+            "entry_block_counts": {"spread": 0, "microprice_edge": 0},
+            "observed": {"min_spread": 0.01, "max_microprice_edge": 0.003},
+            "thresholds": {"max_spread": 0.05, "min_microprice_edge": 0.0005},
+        },
+    }
+
+    spread_diagnostics = job_b_microprice_batch._diagnose_attempt(
+        candidate,
+        params,
+        spread_result,
+        start_time="2026-05-10T08:00:00Z",
+        end_time="2026-05-10T09:00:00Z",
+        min_book_events=50,
+        status="completed",
+    )
+    queue_diagnostics = job_b_microprice_batch._diagnose_attempt(
+        candidate,
+        params,
+        queue_result,
+        start_time="2026-05-10T08:00:00Z",
+        end_time="2026-05-10T09:00:00Z",
+        min_book_events=50,
+        status="completed",
+    )
+    aggregate = job_b_microprice_batch._aggregate_diagnostics(
+        [
+            job_b_microprice_batch.BacktestAttempt(
+                slug="spread",
+                question="spread",
+                token_index=0,
+                source_strategy="Microprice",
+                params=params,
+                status="completed",
+                result=spread_result,
+                error=None,
+                diagnostics=spread_diagnostics,
+            ),
+            job_b_microprice_batch.BacktestAttempt(
+                slug="queue",
+                question="queue",
+                token_index=0,
+                source_strategy="Microprice",
+                params=params,
+                status="completed",
+                result=queue_result,
+                error=None,
+                diagnostics=queue_diagnostics,
+            ),
+        ]
+    )
+
+    assert spread_diagnostics["no_order"]["blockers"]["spread"]["blocked"] is True
+    assert spread_diagnostics["no_order"]["blockers"]["queue"]["blocked"] is False
+    assert queue_diagnostics["no_order"]["blockers"]["queue"]["blocked"] is True
+    assert queue_diagnostics["no_order"]["blockers"]["fill_opportunity"]["blocked"] is False
+    assert aggregate["no_order_cause_counts"]["spread_blocker"] == 1
+    assert aggregate["no_order_cause_counts"]["queue_blocker"] == 1
 
 
 def test_run_batch_fail_closes_on_exact_window_mismatch(monkeypatch, tmp_path):

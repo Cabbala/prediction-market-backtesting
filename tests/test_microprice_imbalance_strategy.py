@@ -113,6 +113,52 @@ def test_microprice_imbalance_rejects_wide_expected_slippage() -> None:
     assert strategy.entries == []
 
 
+def test_microprice_imbalance_records_no_order_gate_diagnostics() -> None:
+    strategy = _strategy()
+
+    strategy._on_book_signal(
+        bid=0.39,
+        ask=0.47,
+        spread=0.08,
+        imbalance=0.62,
+        microprice_edge=0.003,
+        expected_entry_price=0.47,
+        entry_visible_size=25.0,
+        exit_visible_size=10.0,
+    )
+    strategy._on_book_signal(
+        bid=0.39,
+        ask=0.41,
+        spread=0.02,
+        imbalance=0.62,
+        microprice_edge=0.0001,
+        expected_entry_price=0.41,
+        entry_visible_size=25.0,
+        exit_visible_size=10.0,
+    )
+    strategy._on_book_signal(
+        bid=0.39,
+        ask=0.41,
+        spread=0.02,
+        imbalance=0.62,
+        microprice_edge=0.003,
+        expected_entry_price=0.41,
+        entry_visible_size=25.0,
+        exit_visible_size=10.0,
+    )
+
+    diagnostics = strategy.diagnostic_snapshot()
+
+    assert strategy.entries == [(0.41, 25.0)]
+    assert diagnostics["book_signal_count"] == 3
+    assert diagnostics["flat_evaluation_count"] == 3
+    assert diagnostics["entry_signal_count"] == 1
+    assert diagnostics["entry_block_counts"]["spread"] == 1
+    assert diagnostics["entry_block_counts"]["microprice_edge"] == 1
+    assert diagnostics["observed"]["min_spread"] == pytest.approx(0.02)
+    assert diagnostics["observed"]["max_microprice_edge"] == pytest.approx(0.003)
+
+
 def test_microprice_imbalance_rejects_expected_entry_above_price_cap() -> None:
     strategy = _strategy(max_entry_price=0.42, max_expected_slippage=0.02)
 
