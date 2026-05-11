@@ -42,6 +42,17 @@ DEFAULT_PASS_MANIFEST_GLOB = (
 
 
 @dataclass(frozen=True)
+class ReplayWindow:
+    start_time: str
+    end_time: str
+    min_book_events: int | None = None
+    source: str | None = None
+    candidate_count: int | None = None
+    book_events: int | None = None
+    provenance: str = "manifest"
+
+
+@dataclass(frozen=True)
 class Candidate:
     slug: str
     question: str
@@ -58,6 +69,7 @@ class Candidate:
     coverage_min_book_events: int | None = None
     manifest_rank: int | None = None
     selection_policy: str = "non_extreme_tail_priority_then_liquidity"
+    replay_windows: tuple[ReplayWindow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,72 @@ def _first_present(raw: dict[str, Any], *keys: str) -> Any:
         if value not in (None, "", [], {}):
             return value
     return None
+
+
+def _replay_window_from_mapping(
+    raw: dict[str, Any],
+    *,
+    default_min_book_events: int | None = None,
+    provenance: str,
+) -> ReplayWindow | None:
+    start_time = raw.get("start_time")
+    end_time = raw.get("end_time")
+    if not isinstance(start_time, str) or not start_time.strip():
+        return None
+    if not isinstance(end_time, str) or not end_time.strip():
+        return None
+    min_book_events = _parse_int(raw.get("min_book_events"))
+    if min_book_events is None:
+        min_book_events = default_min_book_events
+    return ReplayWindow(
+        start_time=start_time.strip(),
+        end_time=end_time.strip(),
+        min_book_events=min_book_events,
+        source=raw.get("source") if isinstance(raw.get("source"), str) else None,
+        candidate_count=_parse_int(raw.get("candidate_count")),
+        book_events=_parse_int(raw.get("book_events")),
+        provenance=provenance,
+    )
+
+
+def _dedupe_replay_windows(windows: list[ReplayWindow]) -> tuple[ReplayWindow, ...]:
+    deduped: list[ReplayWindow] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    for window in windows:
+        key = (window.start_time, window.end_time, window.min_book_events)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(window)
+    return tuple(deduped)
+
+
+def _manifest_replay_windows(payload: dict[str, Any]) -> tuple[ReplayWindow, ...]:
+    default_min_book_events = _parse_int(payload.get("min_book_events"))
+    windows: list[ReplayWindow] = []
+    manifest_window = payload.get("window")
+    if isinstance(manifest_window, dict):
+        parsed = _replay_window_from_mapping(
+            manifest_window,
+            default_min_book_events=default_min_book_events,
+            provenance="manifest_window",
+        )
+        if parsed is not None:
+            windows.append(parsed)
+
+    guidance = payload.get("coverage_first_guidance")
+    if isinstance(guidance, dict):
+        for raw_window in _as_list(guidance.get("recommended_windows")):
+            if not isinstance(raw_window, dict):
+                continue
+            parsed = _replay_window_from_mapping(
+                raw_window,
+                default_min_book_events=default_min_book_events,
+                provenance="coverage_first_guidance",
+            )
+            if parsed is not None:
+                windows.append(parsed)
+    return _dedupe_replay_windows(windows)
 
 
 def _strategy_key(value: Any) -> str:
@@ -217,6 +295,7 @@ def _normalize_candidate(
     manifest_rank: int | None = None,
     default_coverage_window: dict[str, Any] | None = None,
     default_min_book_events: int | None = None,
+    default_replay_windows: tuple[ReplayWindow, ...] = (),
 ) -> Candidate | None:
     slug = _candidate_slug(raw)
     if slug is None:
@@ -227,13 +306,48 @@ def _normalize_candidate(
     except (TypeError, ValueError):
         token_index = 0
     coverage = raw.get("coverage") if isinstance(raw.get("coverage"), dict) else {}
-    coverage_window = coverage.get("window") if isinstance(coverage.get("window"), dict) else {}
-    if not coverage_window and default_coverage_window:
-        coverage_window = default_coverage_window
+    candidate_coverage_window = (
+        coverage.get("window") if isinstance(coverage.get("window"), dict) else {}
+    )
+    coverage_window = candidate_coverage_window
     coverage_book_events = _parse_int(coverage.get("book_events"))
     coverage_min_book_events = _parse_int(coverage.get("min_book_events"))
     if coverage_min_book_events is None:
         coverage_min_book_events = default_min_book_events
+    replay_windows: list[ReplayWindow] = []
+    coverage_windows = coverage.get("windows")
+    if isinstance(coverage_windows, list):
+        for raw_window in coverage_windows:
+            if not isinstance(raw_window, dict):
+                continue
+            parsed = _replay_window_from_mapping(
+                raw_window,
+                default_min_book_events=coverage_min_book_events,
+                provenance="candidate_coverage_windows",
+            )
+            if parsed is not None:
+                replay_windows.append(parsed)
+    if candidate_coverage_window:
+        parsed = _replay_window_from_mapping(
+            candidate_coverage_window,
+            default_min_book_events=coverage_min_book_events,
+            provenance="candidate_coverage_window",
+        )
+        if parsed is not None:
+            replay_windows.append(parsed)
+    if not replay_windows:
+        replay_windows.extend(default_replay_windows)
+    replay_window_tuple = _dedupe_replay_windows(replay_windows)
+    if not coverage_window and replay_window_tuple:
+        primary_window = replay_window_tuple[0]
+        coverage_window = {
+            "start_time": primary_window.start_time,
+            "end_time": primary_window.end_time,
+        }
+    if not coverage_window and default_coverage_window:
+        coverage_window = default_coverage_window
+    if coverage_min_book_events is None and replay_window_tuple:
+        coverage_min_book_events = replay_window_tuple[0].min_book_events
     scan_mid = _parse_float(_first_present(raw, "scan_mid", "yes_probability", "yes_mid"))
     if scan_mid is None:
         scan_mid = _side_book_mid(raw, "yes")
@@ -261,6 +375,7 @@ def _normalize_candidate(
         coverage_book_events=coverage_book_events,
         coverage_min_book_events=coverage_min_book_events,
         manifest_rank=manifest_rank,
+        replay_windows=replay_window_tuple,
     )
 
 
@@ -295,8 +410,22 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
     seen: set[tuple[str, int]] = set()
 
     if isinstance(payload, dict):
-        manifest_window = payload.get("window") if isinstance(payload.get("window"), dict) else None
-        manifest_min_book_events = _parse_int(payload.get("min_book_events"))
+        manifest_replay_windows = _manifest_replay_windows(payload)
+        manifest_window = (
+            {
+                "start_time": manifest_replay_windows[0].start_time,
+                "end_time": manifest_replay_windows[0].end_time,
+            }
+            if manifest_replay_windows
+            else payload.get("window")
+            if isinstance(payload.get("window"), dict)
+            else None
+        )
+        manifest_min_book_events = (
+            manifest_replay_windows[0].min_book_events
+            if manifest_replay_windows and manifest_replay_windows[0].min_book_events is not None
+            else _parse_int(payload.get("min_book_events"))
+        )
         batches = payload.get("batches")
         if isinstance(batches, list):
             for batch in batches:
@@ -317,6 +446,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                         manifest_rank=manifest_idx,
                         default_coverage_window=manifest_window,
                         default_min_book_events=manifest_min_book_events,
+                        default_replay_windows=manifest_replay_windows,
                     )
                     if cand is None:
                         continue
@@ -353,6 +483,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                     manifest_rank=manifest_idx,
                     default_coverage_window=manifest_window,
                     default_min_book_events=manifest_min_book_events,
+                    default_replay_windows=manifest_replay_windows,
                 )
                 if cand is None:
                     continue
@@ -734,10 +865,30 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
     causes: dict[str, int] = {}
     no_order_cause_counts: dict[str, int] = {}
     no_order_primary_cause_counts: dict[str, int] = {}
+    tail_bucket_counts: dict[str, int] = {}
+    tick_cost_bucket_counts: dict[str, int] = {}
+    total_fills = 0.0
+    total_strategy_orders = 0.0
+    completed_pnl = 0.0
+    completed_pnl_values: list[float] = []
     for attempt in attempts:
         diagnostics = attempt.diagnostics or {}
         for cause in diagnostics.get("suspected_causes", []):
             causes[cause] = causes.get(cause, 0) + 1
+        tail_bucket = diagnostics.get("tail_bucket")
+        if tail_bucket:
+            key = str(tail_bucket)
+            tail_bucket_counts[key] = tail_bucket_counts.get(key, 0) + 1
+        fills = _parse_float(diagnostics.get("fills"))
+        if fills is not None:
+            total_fills += fills
+        strategy_order_count = _parse_float(diagnostics.get("strategy_order_count"))
+        if strategy_order_count is not None:
+            total_strategy_orders += strategy_order_count
+        pnl = _parse_float(diagnostics.get("pnl"))
+        if attempt.status == "completed" and pnl is not None:
+            completed_pnl += pnl
+            completed_pnl_values.append(pnl)
         no_order = diagnostics.get("no_order")
         if isinstance(no_order, dict):
             for cause, count in (no_order.get("cause_counts") or {}).items():
@@ -748,12 +899,37 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
             if primary_cause:
                 key = str(primary_cause)
                 no_order_primary_cause_counts[key] = no_order_primary_cause_counts.get(key, 0) + 1
+            blockers = no_order.get("blockers")
+            tick_cost = blockers.get("tick_cost") if isinstance(blockers, dict) else None
+            if isinstance(tick_cost, dict):
+                if tick_cost.get("blocked") is True:
+                    bucket = "blocked_ge_threshold"
+                elif tick_cost.get("spread_to_mid_ratio") is None:
+                    bucket = "unknown"
+                else:
+                    bucket = "not_blocked"
+            else:
+                bucket = "unknown"
+            tick_cost_bucket_counts[bucket] = tick_cost_bucket_counts.get(bucket, 0) + 1
+        else:
+            tick_cost_bucket_counts["unknown"] = tick_cost_bucket_counts.get("unknown", 0) + 1
+    fills_orders_pnl = {
+        "total_fills": total_fills,
+        "total_strategy_orders": total_strategy_orders,
+        "completed_pnl_sum": completed_pnl,
+        "completed_positive_pnl_attempts": sum(1 for value in completed_pnl_values if value > 0),
+        "completed_negative_pnl_attempts": sum(1 for value in completed_pnl_values if value < 0),
+        "completed_zero_pnl_attempts": sum(1 for value in completed_pnl_values if value == 0),
+    }
     return {
         "completed_attempts": len(completed),
         "zero_fill_completed_attempts": len(zero_fill),
         "suspected_cause_counts": causes,
         "no_order_cause_counts": no_order_cause_counts,
         "no_order_primary_cause_counts": no_order_primary_cause_counts,
+        "tail_bucket_counts": tail_bucket_counts,
+        "tick_cost_bucket_counts": tick_cost_bucket_counts,
+        "fills_orders_pnl": fills_orders_pnl,
         "profit_opportunity_demonstrated": any(
             ((a.result or {}).get("pnl") or 0) > 0 and ((a.result or {}).get("fills") or 0) > 0
             for a in attempts
@@ -762,23 +938,65 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
     }
 
 
-def _candidate_replay_request(candidate: Candidate, args: argparse.Namespace) -> dict[str, Any]:
-    start_time = candidate.coverage_start_time or args.start_time
-    end_time = candidate.coverage_end_time or args.end_time
-    min_book_events = (
-        candidate.coverage_min_book_events
-        if candidate.coverage_min_book_events is not None
-        else args.min_book_events
+def _fallback_replay_window(candidate: Candidate, args: argparse.Namespace) -> ReplayWindow:
+    return ReplayWindow(
+        start_time=candidate.coverage_start_time or args.start_time,
+        end_time=candidate.coverage_end_time or args.end_time,
+        min_book_events=(
+            candidate.coverage_min_book_events
+            if candidate.coverage_min_book_events is not None
+            else args.min_book_events
+        ),
+        book_events=candidate.coverage_book_events,
+        provenance="candidate_or_cli_fallback",
     )
-    return {
-        "slug": candidate.slug,
-        "token_index": candidate.token_index,
-        "source_strategy": candidate.source_strategy,
-        "manifest_rank": candidate.manifest_rank,
-        "window": {"start_time": start_time, "end_time": end_time},
-        "min_book_events": min_book_events,
-        "coverage_book_events": candidate.coverage_book_events,
-    }
+
+
+def _candidate_replay_requests(
+    candidate: Candidate, args: argparse.Namespace
+) -> list[dict[str, Any]]:
+    window_policy = getattr(args, "window_policy", "candidate")
+    if window_policy == "all":
+        windows = candidate.replay_windows or (_fallback_replay_window(candidate, args),)
+    else:
+        windows = (
+            (candidate.replay_windows[0],)
+            if candidate.replay_windows
+            else (_fallback_replay_window(candidate, args),)
+        )
+
+    requests: list[dict[str, Any]] = []
+    for window_index, window in enumerate(windows):
+        min_book_events = (
+            window.min_book_events
+            if window.min_book_events is not None
+            else candidate.coverage_min_book_events
+            if candidate.coverage_min_book_events is not None
+            else args.min_book_events
+        )
+        requests.append(
+            {
+                "slug": candidate.slug,
+                "token_index": candidate.token_index,
+                "source_strategy": candidate.source_strategy,
+                "manifest_rank": candidate.manifest_rank,
+                "window_index": window_index,
+                "window_source": window.source,
+                "window_provenance": window.provenance,
+                "window": {"start_time": window.start_time, "end_time": window.end_time},
+                "min_book_events": min_book_events,
+                "coverage_book_events": (
+                    window.book_events
+                    if window.book_events is not None
+                    else candidate.coverage_book_events
+                ),
+            }
+        )
+    return requests
+
+
+def _candidate_replay_request(candidate: Candidate, args: argparse.Namespace) -> dict[str, Any]:
+    return _candidate_replay_requests(candidate, args)[0]
 
 
 def _unique_replay_windows(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -799,9 +1017,22 @@ def _unique_replay_windows(requests: list[dict[str, Any]]) -> list[dict[str, Any
                 },
                 "min_book_events": request.get("min_book_events"),
                 "candidate_count": 0,
+                "request_count": 0,
             },
         )
-        unique[key]["candidate_count"] += 1
+        unique[key]["request_count"] += 1
+        unique[key]["candidate_count"] = len(
+            {
+                (candidate.get("slug"), candidate.get("token_index"))
+                for candidate in requests
+                if (
+                    candidate["window"].get("start_time"),
+                    candidate["window"].get("end_time"),
+                    candidate.get("min_book_events"),
+                )
+                == key
+            }
+        )
     return list(unique.values())
 
 
@@ -835,20 +1066,20 @@ def _build_exact_window_metadata(
     if not replay_requests:
         status = "fail_closed_no_candidates"
         warnings.append("no_candidate_coverage_pass_manifest")
-    elif len(selected_windows) != 1:
-        status = "fail_closed"
-        warnings.append("exact_window_mismatch: multiple selected windows or min_book_events")
     else:
         selected = selected_windows[0]
         selected_window = dict(selected["window"])
         selected_min_book_events = _parse_int(selected.get("min_book_events"))
         root_window = dict(selected_window)
         root_min_book_events = selected_min_book_events
-        expected_key = (
-            selected_window.get("start_time"),
-            selected_window.get("end_time"),
-            selected_min_book_events,
-        )
+        expected_keys = {
+            (
+                window["window"].get("start_time"),
+                window["window"].get("end_time"),
+                _parse_int(window.get("min_book_events")),
+            )
+            for window in selected_windows
+        }
         mismatches = [
             {
                 "slug": attempt.slug,
@@ -857,7 +1088,7 @@ def _build_exact_window_metadata(
                 "attempt_min_book_events": (attempt.diagnostics or {}).get("min_book_events"),
             }
             for attempt in attempts
-            if _attempt_replay_key(attempt) != expected_key
+            if _attempt_replay_key(attempt) not in expected_keys
         ]
         if attempts and not mismatches:
             status = "verified"
@@ -979,27 +1210,70 @@ async def run_attempt(
         )
 
 
+async def _run_attempt_with_timeout(
+    candidate: Candidate,
+    params: dict[str, Any],
+    *,
+    replay_request: dict[str, Any],
+    timeout_seconds: int,
+) -> BacktestAttempt:
+    replay_window = replay_request["window"]
+    min_book_events = int(replay_request["min_book_events"])
+    try:
+        return await asyncio.wait_for(
+            run_attempt(
+                candidate,
+                params,
+                start_time=replay_window["start_time"],
+                end_time=replay_window["end_time"],
+                min_book_events=min_book_events,
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        error = f"TimeoutError: timed out after {timeout_seconds} seconds"
+        return BacktestAttempt(
+            slug=candidate.slug,
+            question=candidate.question,
+            token_index=candidate.token_index,
+            source_strategy=candidate.source_strategy,
+            params=params,
+            status="error",
+            result=None,
+            error=error,
+            diagnostics=_diagnose_attempt(
+                candidate,
+                params,
+                None,
+                start_time=replay_window["start_time"],
+                end_time=replay_window["end_time"],
+                min_book_events=min_book_events,
+                status="error",
+                error=error,
+            ),
+        )
+
+
 async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     candidates = load_candidates(
         args.manifest, strategy=args.strategy, max_candidates=args.max_candidates
     )
     selected_params = microprice_param_grid()[: args.max_param_sets]
     attempts: list[BacktestAttempt] = []
-    replay_requests = [_candidate_replay_request(candidate, args) for candidate in candidates]
-    for candidate in candidates:
-        replay_request = _candidate_replay_request(candidate, args)
-        replay_window = replay_request["window"]
+    candidate_requests = [
+        (candidate, replay_request)
+        for candidate in candidates
+        for replay_request in _candidate_replay_requests(candidate, args)
+    ]
+    replay_requests = [replay_request for _, replay_request in candidate_requests]
+    for candidate, replay_request in candidate_requests:
         for params in selected_params:
             attempts.append(
-                await asyncio.wait_for(
-                    run_attempt(
-                        candidate,
-                        params,
-                        start_time=replay_window["start_time"],
-                        end_time=replay_window["end_time"],
-                        min_book_events=int(replay_request["min_book_events"]),
-                    ),
-                    timeout=args.per_attempt_timeout_secs,
+                await _run_attempt_with_timeout(
+                    candidate,
+                    params,
+                    replay_request=replay_request,
+                    timeout_seconds=args.per_attempt_timeout_secs,
                 )
             )
     completed = sum(1 for attempt in attempts if attempt.status == "completed")
@@ -1012,6 +1286,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         replay_requests=replay_requests,
         attempts=attempts,
     )
+    aggregate_diagnostics = _aggregate_diagnostics(attempts)
     return {
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
@@ -1019,6 +1294,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
             "live_trading": False,
             "orders_submitted": False,
             "orders_signed": False,
+            "orders_cancelled": False,
             "credentials_required": False,
             "worker_trading_started": False,
             "live_trading_worker_started": False,
@@ -1045,14 +1321,21 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "completed_count": completed,
         "skipped_no_coverage_count": skipped,
         "error_count": errored,
+        "completed": completed,
+        "skipped_no_coverage": skipped,
+        "errors": errored,
+        "fills_orders_pnl": aggregate_diagnostics["fills_orders_pnl"],
+        "tail_bucket_counts": aggregate_diagnostics["tail_bucket_counts"],
+        "tick_cost_buckets": aggregate_diagnostics["tick_cost_bucket_counts"],
         "candidate_selection": {
             "policy": "non_extreme_tail_priority_then_liquidity",
             "preferred_yes_mid_range": [0.005, 0.25],
             "ultra_low_tail_retained_but_deprioritized": True,
+            "window_policy": getattr(args, "window_policy", "candidate"),
         },
         "candidate_replay_requests": replay_requests,
         "candidates": [asdict(candidate) for candidate in candidates],
-        "diagnostics": _aggregate_diagnostics(attempts),
+        "diagnostics": aggregate_diagnostics,
         "attempts": [asdict(attempt) for attempt in attempts],
     }
 
@@ -1062,7 +1345,10 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
     json_path = output_dir / f"job_B_microprice_batch_{timestamp}.json"
     csv_path = output_dir / f"job_B_microprice_batch_{timestamp}.csv"
     md_path = output_dir / f"job_B_microprice_batch_{timestamp}.md"
-    json_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    output_files = {"json": str(json_path), "csv": str(csv_path), "markdown": str(md_path)}
+    json_summary = dict(summary)
+    json_summary["output_files"] = output_files
+    json_path.write_text(json.dumps(json_summary, indent=2, sort_keys=True), encoding="utf-8")
     attempts = summary.get("attempts", [])
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
@@ -1072,11 +1358,15 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
                 "token_index",
                 "source_strategy",
                 "status",
+                "window",
+                "min_book_events",
                 "params",
                 "pnl",
                 "fills",
                 "book_events",
                 "strategy_order_count",
+                "tail_bucket",
+                "tick_cost_blocked",
                 "no_order_primary_cause",
                 "no_order_causes",
                 "diagnostics",
@@ -1094,11 +1384,17 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
                     "token_index": attempt.get("token_index"),
                     "source_strategy": attempt.get("source_strategy"),
                     "status": attempt.get("status"),
+                    "window": json.dumps(diagnostics.get("window"), sort_keys=True),
+                    "min_book_events": diagnostics.get("min_book_events"),
                     "params": json.dumps(attempt.get("params", {}), sort_keys=True),
                     "pnl": result.get("pnl"),
                     "fills": result.get("fills"),
                     "book_events": result.get("book_events"),
                     "strategy_order_count": diagnostics.get("strategy_order_count"),
+                    "tail_bucket": diagnostics.get("tail_bucket"),
+                    "tick_cost_blocked": (
+                        ((no_order.get("blockers") or {}).get("tick_cost") or {}).get("blocked")
+                    ),
                     "no_order_primary_cause": no_order.get("primary_cause"),
                     "no_order_causes": json.dumps(no_order.get("causes", []), sort_keys=True),
                     "diagnostics": json.dumps(diagnostics, sort_keys=True),
@@ -1121,11 +1417,15 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- exact_window_status: {summary.get('exact_window_status')}",
         f"- warnings: {json.dumps(summary.get('warnings', []), sort_keys=True)}",
         f"- candidates: {summary['candidate_count']}",
+        f"- window_policy: {summary.get('candidate_selection', {}).get('window_policy')}",
         f"- parameter_sets: {summary['parameter_set_count']}",
         f"- attempts: {summary['attempt_count']}",
-        f"- completed: {summary['completed_count']}",
-        f"- skipped_no_coverage: {summary['skipped_no_coverage_count']}",
-        f"- errors: {summary['error_count']}",
+        f"- completed: {summary.get('completed', summary['completed_count'])}",
+        f"- skipped_no_coverage: {summary.get('skipped_no_coverage', summary['skipped_no_coverage_count'])}",
+        f"- errors: {summary.get('errors', summary['error_count'])}",
+        f"- fills_orders_pnl: {json.dumps(summary.get('fills_orders_pnl', {}), sort_keys=True)}",
+        f"- tail_bucket_counts: {json.dumps(summary.get('tail_bucket_counts', {}), sort_keys=True)}",
+        f"- tick_cost_buckets: {json.dumps(summary.get('tick_cost_buckets', {}), sort_keys=True)}",
         f"- no_order_cause_counts: {json.dumps(aggregate_diagnostics.get('no_order_cause_counts', {}), sort_keys=True)}",
         f"- no_order_primary_cause_counts: {json.dumps(aggregate_diagnostics.get('no_order_primary_cause_counts', {}), sort_keys=True)}",
         f"- diagnostics: {json.dumps(aggregate_diagnostics, sort_keys=True)}",
@@ -1161,7 +1461,7 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
             f"| {attempt.get('status')} | {attempt.get('slug')} | `{json.dumps(attempt.get('params', {}), sort_keys=True)}` | {json.dumps(blocker_summary, sort_keys=True)} | {detail} |"
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return {"json": str(json_path), "csv": str(csv_path), "markdown": str(md_path)}
+    return output_files
 
 
 def main() -> int:
@@ -1183,6 +1483,15 @@ def main() -> int:
     parser.add_argument("--lookback-hours", type=int, default=1)
     parser.add_argument("--min-book-events", type=int, default=100)
     parser.add_argument("--per-attempt-timeout-secs", type=int, default=120)
+    parser.add_argument(
+        "--window-policy",
+        choices=("candidate", "all"),
+        default="candidate",
+        help=(
+            "candidate runs each candidate's primary explicit manifest/coverage window; "
+            "all runs every explicit manifest/coverage-first guidance window."
+        ),
+    )
     args = parser.parse_args()
 
     if args.max_candidates < 1 or args.max_param_sets < 1:

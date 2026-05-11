@@ -121,6 +121,7 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
     assert pass_manifest["mode"] == "shadow/backtest-only"
     assert pass_manifest["safety"]["orders_submitted"] is False
     assert pass_manifest["safety"]["orders_signed"] is False
+    assert pass_manifest["safety"]["orders_cancelled"] is False
     assert pass_manifest["safety"]["credentials_required"] is False
     assert pass_manifest["safety"]["worker_trading_started"] is False
     assert pass_manifest["safety"]["live_trading_worker_started"] is False

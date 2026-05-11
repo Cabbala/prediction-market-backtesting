@@ -132,6 +132,61 @@ def test_load_candidates_preserves_candidate_coverage_window(tmp_path):
     assert candidates[0].coverage_min_book_events == 50
 
 
+def test_load_candidates_preserves_manifest_recommended_windows(tmp_path):
+    manifest = tmp_path / "microprice_handoff.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "window": {
+                    "start_time": "2026-05-10T08:00:00Z",
+                    "end_time": "2026-05-10T09:00:00Z",
+                    "min_book_events": 50,
+                    "source": "known-pass-window",
+                    "book_events": 108,
+                },
+                "min_book_events": 500,
+                "coverage_first_guidance": {
+                    "recommended_windows": [
+                        {
+                            "start_time": "2026-05-10T08:00:00Z",
+                            "end_time": "2026-05-10T09:00:00Z",
+                            "min_book_events": 50,
+                        },
+                        {
+                            "start_time": "2026-05-11T14:00:00Z",
+                            "end_time": "2026-05-11T15:00:00Z",
+                            "min_book_events": 500,
+                        },
+                    ]
+                },
+                "candidates": [
+                    {
+                        "slug": "candidate-a",
+                        "source_strategy": "Microprice",
+                        "yes_mid": 0.02,
+                        "yes_spread": 0.001,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    candidates = load_candidates(manifest, strategy="microprice_optimizer", max_candidates=1)
+
+    assert candidates[0].coverage_start_time == "2026-05-10T08:00:00Z"
+    assert candidates[0].coverage_end_time == "2026-05-10T09:00:00Z"
+    assert candidates[0].coverage_min_book_events == 50
+    assert [
+        (window.start_time, window.end_time, window.min_book_events)
+        for window in candidates[0].replay_windows
+    ] == [
+        ("2026-05-10T08:00:00Z", "2026-05-10T09:00:00Z", 50),
+        ("2026-05-11T14:00:00Z", "2026-05-11T15:00:00Z", 500),
+    ]
+
+
 def test_load_candidates_accepts_market_scan_strategy_tags_and_compact_scalar_books(tmp_path):
     manifest = tmp_path / "market_scan.json"
     manifest.write_text(
@@ -326,6 +381,191 @@ def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(monkeypat
     assert summary["safety"]["credentials_required"] is False
     assert summary["safety"]["worker_trading_started"] is False
     assert summary["safety"]["live_trading_worker_started"] is False
+
+
+def test_run_batch_attempts_multiple_candidates_and_manifest_windows(monkeypatch, tmp_path):
+    manifest = tmp_path / "microprice_multi_window.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "window": {
+                    "start_time": "2026-05-10T08:00:00Z",
+                    "end_time": "2026-05-10T09:00:00Z",
+                    "min_book_events": 50,
+                },
+                "coverage_first_guidance": {
+                    "recommended_windows": [
+                        {
+                            "start_time": "2026-05-10T08:00:00Z",
+                            "end_time": "2026-05-10T09:00:00Z",
+                            "min_book_events": 50,
+                        },
+                        {
+                            "start_time": "2026-05-11T14:00:00Z",
+                            "end_time": "2026-05-11T15:00:00Z",
+                            "min_book_events": 500,
+                        },
+                    ]
+                },
+                "candidates": [
+                    {
+                        "slug": "candidate-a",
+                        "source_strategy": "Microprice",
+                        "yes_mid": 0.02,
+                        "yes_spread": 0.001,
+                    },
+                    {
+                        "slug": "candidate-b",
+                        "source_strategy": "Microprice",
+                        "yes_mid": 0.03,
+                        "yes_spread": 0.001,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def _fake_run_attempt(candidate, params, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((candidate.slug, kwargs))
+        return job_b_microprice_batch.BacktestAttempt(
+            slug=candidate.slug,
+            question=candidate.question,
+            token_index=candidate.token_index,
+            source_strategy=candidate.source_strategy,
+            params=params,
+            status="completed",
+            result={"fills": 0, "pnl": 0.0, "book_events": kwargs["min_book_events"]},
+            error=None,
+            diagnostics={
+                "window": {
+                    "start_time": kwargs["start_time"],
+                    "end_time": kwargs["end_time"],
+                },
+                "min_book_events": kwargs["min_book_events"],
+                "fills": 0,
+                "pnl": 0.0,
+                "strategy_order_count": 0,
+                "tail_bucket": "non_extreme_tail",
+                "no_order": {
+                    "primary_cause": "fill_opportunity_blocker",
+                    "causes": ["fill_opportunity_blocker"],
+                    "cause_counts": {"fill_opportunity_blocker": 1},
+                    "blockers": {
+                        "tick_cost": {
+                            "blocked": False,
+                            "spread_to_mid_ratio": 0.05,
+                        }
+                    },
+                },
+                "suspected_causes": ["zero_fills_with_coverage"],
+            },
+        )
+
+    monkeypatch.setattr(job_b_microprice_batch, "run_attempt", _fake_run_attempt)
+    args = Namespace(
+        manifest=manifest,
+        strategy="microprice_optimizer",
+        max_candidates=2,
+        max_param_sets=1,
+        start_time="2026-05-10T20:00:00Z",
+        end_time="2026-05-10T21:00:00Z",
+        min_book_events=999,
+        per_attempt_timeout_secs=5,
+        window_policy="all",
+    )
+
+    summary = asyncio.run(job_b_microprice_batch.run_batch(args))
+
+    assert len(calls) == 4
+    assert summary["candidate_count"] == 2
+    assert summary["attempt_count"] == 4
+    assert summary["completed"] == 4
+    assert summary["skipped_no_coverage"] == 0
+    assert summary["errors"] == 0
+    assert summary["exact_window_status"] == "verified"
+    assert [
+        (window["window"]["start_time"], window["window"]["end_time"], window["min_book_events"])
+        for window in summary["selected_windows"]
+    ] == [
+        ("2026-05-10T08:00:00Z", "2026-05-10T09:00:00Z", 50),
+        ("2026-05-11T14:00:00Z", "2026-05-11T15:00:00Z", 500),
+    ]
+    assert summary["tail_bucket_counts"] == {"non_extreme_tail": 4}
+    assert summary["tick_cost_buckets"] == {"not_blocked": 4}
+    assert summary["fills_orders_pnl"]["total_fills"] == 0
+    assert summary["fills_orders_pnl"]["total_strategy_orders"] == 0
+    assert summary["safety"]["orders_cancelled"] is False
+
+
+def test_run_batch_fail_closes_missing_pmxt_coverage(monkeypatch, tmp_path):
+    manifest = tmp_path / "microprice_no_coverage.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "window": {
+                    "start_time": "2026-05-10T08:00:00Z",
+                    "end_time": "2026-05-10T09:00:00Z",
+                    "min_book_events": 500,
+                },
+                "candidates": [
+                    {
+                        "slug": "candidate-no-coverage",
+                        "source_strategy": "Microprice",
+                        "yes_mid": 0.02,
+                        "yes_spread": 0.001,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def _fake_run_attempt(candidate, params, **kwargs):  # type: ignore[no-untyped-def]
+        diagnostics = job_b_microprice_batch._diagnose_attempt(
+            candidate,
+            params,
+            None,
+            start_time=kwargs["start_time"],
+            end_time=kwargs["end_time"],
+            min_book_events=kwargs["min_book_events"],
+            status="skipped_no_coverage",
+        )
+        return job_b_microprice_batch.BacktestAttempt(
+            slug=candidate.slug,
+            question=candidate.question,
+            token_index=candidate.token_index,
+            source_strategy=candidate.source_strategy,
+            params=params,
+            status="skipped_no_coverage",
+            result=None,
+            error=None,
+            diagnostics=diagnostics,
+        )
+
+    monkeypatch.setattr(job_b_microprice_batch, "run_attempt", _fake_run_attempt)
+    args = Namespace(
+        manifest=manifest,
+        strategy="microprice_optimizer",
+        max_candidates=1,
+        max_param_sets=1,
+        start_time="2026-05-10T20:00:00Z",
+        end_time="2026-05-10T21:00:00Z",
+        min_book_events=50,
+        per_attempt_timeout_secs=5,
+        window_policy="candidate",
+    )
+
+    summary = asyncio.run(job_b_microprice_batch.run_batch(args))
+
+    assert summary["completed"] == 0
+    assert summary["skipped_no_coverage"] == 1
+    assert summary["errors"] == 0
+    assert summary["attempts"][0]["diagnostics"]["suspected_causes"] == ["coverage_insufficient"]
+    assert summary["diagnostics"]["profit_opportunity_demonstrated"] is False
 
 
 def test_diagnose_attempt_distinguishes_no_order_blocker_buckets():
