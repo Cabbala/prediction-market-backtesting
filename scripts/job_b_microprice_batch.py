@@ -103,6 +103,24 @@ def _candidate_slug(raw: dict[str, Any]) -> str | None:
     return value.strip()
 
 
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _first_present(raw: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = raw.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
 def _strategy_key(value: Any) -> str:
     if value is None:
         return ""
@@ -121,6 +139,75 @@ def _strategy_matches(requested: str | None, actual: str | None) -> bool:
         return True
     actual_key = _strategy_key(actual)
     return requested_key == actual_key
+
+
+def _strategy_from_row(raw: dict[str, Any], payload: dict[str, Any], requested: str) -> str:
+    explicit = raw.get("source_strategy") or raw.get("strategy") or raw.get("strategy_name")
+    if explicit is not None:
+        return str(explicit)
+
+    tags = (
+        _as_list(raw.get("strategy_tags"))
+        + _as_list(raw.get("strategy_fits"))
+        + _as_list(raw.get("source_tags"))
+        + _as_list(raw.get("source_tag"))
+    )
+    for tag in tags:
+        if _strategy_matches(requested, str(tag)):
+            return str(tag)
+    if tags:
+        return str(tags[0])
+
+    payload_strategy = payload.get("strategy")
+    if payload_strategy is not None:
+        return str(payload_strategy)
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    if str(metadata.get("artifact_type") or "").startswith("job_B_microprice"):
+        return "Microprice"
+    return "reward_manifest"
+
+
+def _side_book_mid(raw: dict[str, Any], side: str) -> float | None:
+    book_value = raw.get(f"{side}_book")
+    if isinstance(book_value, dict):
+        mid = _parse_float(book_value.get("mid"))
+        if mid is not None:
+            return mid
+        bid = _parse_float(_first_present(book_value, "bid", "best_bid"))
+        ask = _parse_float(_first_present(book_value, "ask", "best_ask"))
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+    else:
+        compact_mid = _parse_float(book_value)
+        if compact_mid is not None:
+            return compact_mid
+
+    bid = _parse_float(_first_present(raw, f"{side}_bid", f"{side}_best_bid"))
+    ask = _parse_float(_first_present(raw, f"{side}_ask", f"{side}_best_ask"))
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    return None
+
+
+def _side_book_spread(raw: dict[str, Any], side: str) -> float | None:
+    book_value = raw.get(f"{side}_book")
+    if isinstance(book_value, dict):
+        spread = _parse_float(book_value.get("spread"))
+        if spread is not None:
+            return spread
+        bid = _parse_float(_first_present(book_value, "bid", "best_bid"))
+        ask = _parse_float(_first_present(book_value, "ask", "best_ask"))
+        if bid is not None and ask is not None:
+            return max(0.0, ask - bid)
+
+    spread = _parse_float(raw.get(f"{side}_spread"))
+    if spread is not None:
+        return spread
+    bid = _parse_float(_first_present(raw, f"{side}_bid", f"{side}_best_bid"))
+    ask = _parse_float(_first_present(raw, f"{side}_ask", f"{side}_best_ask"))
+    if bid is not None and ask is not None:
+        return max(0.0, ask - bid)
+    return None
 
 
 def _normalize_candidate(
@@ -147,19 +234,23 @@ def _normalize_candidate(
     coverage_min_book_events = _parse_int(coverage.get("min_book_events"))
     if coverage_min_book_events is None:
         coverage_min_book_events = default_min_book_events
+    scan_mid = _parse_float(_first_present(raw, "scan_mid", "yes_probability", "yes_mid"))
+    if scan_mid is None:
+        scan_mid = _side_book_mid(raw, "yes")
+    scan_spread = _parse_float(_first_present(raw, "scan_spread", "avg_spread", "spread"))
+    if scan_spread is None:
+        scan_spread = _side_book_spread(raw, "yes")
     return Candidate(
         slug=slug,
         question=str(raw.get("question") or slug),
         token_index=token_index,
         condition_id=raw.get("condition_id") if isinstance(raw.get("condition_id"), str) else None,
-        scan_mid=_parse_float(
-            raw.get("scan_mid") or raw.get("yes_probability") or raw.get("yes_mid")
-        ),
-        scan_spread=_parse_float(
-            raw.get("scan_spread") or raw.get("avg_spread") or raw.get("spread")
-        ),
+        scan_mid=scan_mid,
+        scan_spread=scan_spread,
         scan_imbalance5=_parse_float(raw.get("scan_imbalance5")),
-        liquidity=_parse_float(raw.get("scan_liquidity") or raw.get("liquidity")),
+        liquidity=_parse_float(
+            raw.get("scan_liquidity") or raw.get("liquidity") or raw.get("liquidityNum")
+        ),
         source_strategy=source_strategy,
         coverage_start_time=coverage_window.get("start_time")
         if isinstance(coverage_window.get("start_time"), str)
@@ -239,19 +330,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
             for manifest_idx, raw in enumerate(raw_candidates):
                 if not isinstance(raw, dict):
                     continue
-                source_strategy = str(
-                    raw.get("source_strategy")
-                    or raw.get("strategy")
-                    or raw.get("strategy_name")
-                    or payload.get("strategy")
-                    or (
-                        "Microprice"
-                        if str(
-                            (payload.get("metadata") or {}).get("artifact_type") or ""
-                        ).startswith("job_B_microprice")
-                        else "reward_manifest"
-                    )
-                )
+                source_strategy = _strategy_from_row(raw, payload, strategy)
                 if not _strategy_matches(strategy, source_strategy):
                     continue
                 coverage = raw.get("coverage")

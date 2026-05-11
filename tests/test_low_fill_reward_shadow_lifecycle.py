@@ -59,6 +59,63 @@ def test_select_candidates_normalizes_nested_reward_and_requires_double_sided_qu
     assert candidate.reward_max_spread == 0.025
     assert candidate.yes_book.bid == 0.003
     assert candidate.no_book.ask == 0.997
+    assert candidate.yes_token_id == "yes-token"
+    assert candidate.no_token_id == "no-token"
+
+
+def test_select_candidates_accepts_generic_tokens_flat_books_and_scalar_mids() -> None:
+    row = _candidate()
+    row.pop("yes_token_id")
+    row.pop("no_token_id")
+    row.pop("yes_mid")
+    row.pop("no_mid")
+    row["clobTokenIds"] = '["yes-generic", "no-generic"]'
+    row["outcomes"] = ["Yes", "No"]
+    row["yes_book"] = "0.0035"
+    row["no_book"] = 0.9965
+    row["yes_best_bid"] = 0.003
+    row["yes_best_ask"] = 0.004
+    row["no_best_bid"] = 0.996
+    row["no_best_ask"] = 0.997
+    row["reward_evidence"] = {
+        "rewardsMaxSpread": 2.5,
+        "rewardsMinSize": 100,
+        "unexpected": "drop",
+    }
+
+    candidates = select_candidates({"candidates": [row]}, max_candidates=1)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.yes_token_id == "yes-generic"
+    assert candidate.no_token_id == "no-generic"
+    assert candidate.yes_mid == 0.0035
+    assert candidate.no_mid == 0.9965
+    assert candidate.yes_book.bid == 0.003
+    assert candidate.no_book.ask == 0.997
+    assert candidate.reward_min_size == 100
+    assert candidate.reward_max_spread_raw == 2.5
+    assert candidate.source_blockers == ()
+
+
+def test_duplicate_side_tokens_block_lifecycle_report_without_dropping_candidate(tmp_path) -> None:
+    source = tmp_path / "source.json"
+    row = _candidate()
+    row["no_token_id"] = row["yes_token_id"]
+    source.write_text(json.dumps({"candidates": [row]}), encoding="utf-8")
+
+    report = build_report(
+        source,
+        duration_secs=0,
+        interval_secs=1,
+        max_candidates=1,
+        sleep=False,
+    )
+
+    assert report["candidate_count"] == 1
+    assert report["classification"] == "blocked"
+    assert "duplicate_yes_no_token_ids" in report["blocker_reasons"]
+    assert report["candidate_table"][0]["source_blockers"] == ["duplicate_yes_no_token_ids"]
 
 
 def test_build_report_scores_lifecycle_without_live_actions(tmp_path) -> None:

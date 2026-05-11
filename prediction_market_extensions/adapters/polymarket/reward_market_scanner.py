@@ -9,6 +9,13 @@ from typing import Any, Mapping, Sequence
 
 SHADOW_MODE = "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"
 MANIFEST_SCHEMA_VERSION = "polymarket.reward-market-manifest.v1"
+REWARD_EVIDENCE_KEYS = (
+    "clobRewards",
+    "rewards",
+    "rewardsMinSize",
+    "rewardsMaxSpread",
+    "umaReward",
+)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -37,6 +44,10 @@ def _first_present(candidate: Mapping[str, Any], *keys: str) -> Any:
         if key in candidate and candidate[key] not in (None, ""):
             return candidate[key]
     return None
+
+
+def _is_present(value: Any) -> bool:
+    return value not in (None, "", [], {}, False)
 
 
 def _book_from_scan_books(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
@@ -91,7 +102,54 @@ def _book(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
         for key in flat_keys
         if candidate.get(prefix + key) not in (None, "")
     }
+    if flat:
+        if "mid" not in flat and not isinstance(value, bool):
+            compact_mid = _as_float(value, default=-1.0)
+            if compact_mid >= 0:
+                flat["mid"] = compact_mid
+        return flat
+    if not isinstance(value, bool):
+        compact_mid = _as_float(value, default=-1.0)
+        if compact_mid >= 0:
+            return {"mid": compact_mid}
     return flat
+
+
+def _reward_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {}
+
+    def add_allowlisted(source: Mapping[str, Any]) -> None:
+        for key in REWARD_EVIDENCE_KEYS:
+            value = source.get(key)
+            if _is_present(value):
+                evidence[key] = value
+
+    raw = candidate.get("reward_evidence")
+    if isinstance(raw, Mapping):
+        add_allowlisted(raw)
+        nested = raw.get("reward_evidence")
+        if isinstance(nested, Mapping):
+            add_allowlisted(nested)
+    add_allowlisted(candidate)
+
+    rewards = evidence.get("clobRewards") or evidence.get("rewards")
+    if isinstance(rewards, Sequence) and not isinstance(rewards, (str, bytes, bytearray)):
+        for reward in rewards:
+            if not isinstance(reward, Mapping):
+                continue
+            if not _is_present(evidence.get("rewardsMinSize")):
+                min_size = reward.get("min_size") or reward.get("minSize")
+                if _is_present(min_size):
+                    evidence["rewardsMinSize"] = min_size
+            if not _is_present(evidence.get("rewardsMaxSpread")):
+                max_spread = reward.get("max_spread") or reward.get("maxSpread")
+                if _is_present(max_spread):
+                    evidence["rewardsMaxSpread"] = max_spread
+            if not _is_present(evidence.get("umaReward")):
+                reward_value = reward.get("reward") or reward.get("amount")
+                if _is_present(reward_value):
+                    evidence["umaReward"] = reward_value
+    return evidence
 
 
 def _has_book_prices(candidate: Mapping[str, Any], side: str) -> bool:
@@ -132,17 +190,10 @@ def _mid(candidate: Mapping[str, Any], side: str) -> float | None:
 
 
 def _has_explicit_reward_evidence(candidate: Mapping[str, Any]) -> bool:
-    reward_evidence = candidate.get("reward_evidence")
-    if isinstance(reward_evidence, Mapping) and any(
-        value not in (None, "", [], {}, False) for value in reward_evidence.values()
-    ):
+    if _reward_evidence(candidate):
         return True
     if candidate.get("reward_hint"):
         return True
-    for key in ("clobRewards", "rewards", "rewardsMinSize", "rewardsMaxSpread", "umaReward"):
-        value = candidate.get(key)
-        if value not in (None, "", [], {}, False):
-            return True
     fits = candidate.get("strategy_fits") or []
     return (
         isinstance(fits, Sequence)
@@ -152,27 +203,12 @@ def _has_explicit_reward_evidence(candidate: Mapping[str, Any]) -> bool:
 
 
 def _reward_category(candidate: Mapping[str, Any]) -> str:
-    reward_evidence = candidate.get("reward_evidence")
-    if isinstance(reward_evidence, Mapping):
-        if reward_evidence.get("clobRewards") not in (None, "", [], {}, False):
-            return "explicit_clob_rewards"
-        if reward_evidence.get("rewardsMinSize") not in (
-            None,
-            "",
-            [],
-            {},
-            False,
-        ) or reward_evidence.get("rewardsMaxSpread") not in (None, "", [], {}, False):
-            return "explicit_gamma_reward_terms"
-        if reward_evidence.get("umaReward") not in (None, "", [], {}, False):
-            return "explicit_uma_reward_hint"
-    if candidate.get("clobRewards") not in (None, "", [], {}, False):
+    evidence = _reward_evidence(candidate)
+    if _is_present(evidence.get("clobRewards")) or _is_present(evidence.get("rewards")):
         return "explicit_clob_rewards"
-    if candidate.get("rewardsMinSize") not in (None, "", [], {}, False) or candidate.get(
-        "rewardsMaxSpread"
-    ) not in (None, "", [], {}, False):
+    if _is_present(evidence.get("rewardsMinSize")) or _is_present(evidence.get("rewardsMaxSpread")):
         return "explicit_gamma_reward_terms"
-    if candidate.get("umaReward") not in (None, "", [], {}, False):
+    if _is_present(evidence.get("umaReward")):
         return "explicit_uma_reward_hint"
     if candidate.get("reward_hint"):
         return "explicit_reward_hint"
@@ -485,14 +521,18 @@ def build_reward_manifest(
         if not isinstance(candidate, Mapping):
             continue
         score = score_candidate(candidate, generated_at=generated_at, rules=rules)
+        clob_token_ids = _clob_token_ids(candidate)
         scored.append(
             {
                 "market_id": str(_first_present(candidate, "market_id", "id") or ""),
                 "condition_id": _first_present(candidate, "condition_id", "conditionId"),
                 "slug": candidate.get("slug"),
                 "question": candidate.get("question"),
-                "clob_token_ids": _clob_token_ids(candidate),
+                "clob_token_ids": clob_token_ids,
+                "yes_token_id": clob_token_ids[0] if len(clob_token_ids) == 2 else None,
+                "no_token_id": clob_token_ids[1] if len(clob_token_ids) == 2 else None,
                 "outcomes": _outcomes(candidate),
+                "reward_evidence": _reward_evidence(candidate),
                 "source_candidate_score": _first_present(candidate, "candidate_score", "score"),
                 "source_url": _first_present(candidate, "url", "source_market_url"),
                 **score,
@@ -525,6 +565,12 @@ def build_reward_manifest(
             "submit_orders": False,
             "sign_orders": False,
             "requires_secrets": False,
+            "orders_submitted": False,
+            "orders_signed": False,
+            "orders_cancelled": False,
+            "credentials_required": False,
+            "live_trading_worker_started": False,
+            "worker_trading_started": False,
             "intended_uses": ["PMBT_BACKTEST_QUEUE", "HOMERUN_SHADOW_FORWARD_LOGGING"],
         },
         "scoring_rules": asdict(rules),

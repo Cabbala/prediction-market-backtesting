@@ -25,6 +25,20 @@ DEFAULT_DURATION_SECS = 60.0
 DEFAULT_INTERVAL_SECS = 15.0
 DEFAULT_QUOTE_SIZE = 5.0
 DEFAULT_TICK_SIZE = 0.001
+REWARD_EVIDENCE_KEYS = (
+    "clobRewards",
+    "rewards",
+    "rewardsMinSize",
+    "rewardsMaxSpread",
+    "umaReward",
+)
+TOKEN_BLOCKERS = {
+    "duplicate_yes_no_token_ids",
+    "incomplete_side_scoped_yes_no_token_ids",
+    "invalid_or_duplicate_clob_token_ids",
+    "missing_yes_no_outcome_mapping_for_clob_token_ids",
+    "non_binary_outcome_mapping",
+}
 
 
 @dataclass(frozen=True)
@@ -123,6 +137,10 @@ def _first_present(row: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
+def _is_present(value: Any) -> bool:
+    return value not in (None, "", [], {}, False)
+
+
 def _strategy_tags(row: Mapping[str, Any]) -> tuple[str, ...]:
     value = row.get("strategy_fits") or row.get("source_tags") or row.get("source_tag")
     if isinstance(value, str):
@@ -136,26 +154,36 @@ def _blockers(row: Mapping[str, Any]) -> tuple[str, ...]:
 
 def _reward_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
+
+    def add_allowlisted(source: Mapping[str, Any]) -> None:
+        for key in REWARD_EVIDENCE_KEYS:
+            if _is_present(source.get(key)):
+                evidence[key] = source[key]
+
     raw = row.get("reward_evidence")
     if isinstance(raw, Mapping):
-        evidence.update(raw)
+        add_allowlisted(raw)
         nested = raw.get("reward_evidence")
         if isinstance(nested, Mapping):
-            evidence.update(nested)
-    for key in ("clobRewards", "rewards", "rewardsMinSize", "rewardsMaxSpread", "umaReward"):
-        if row.get(key) not in (None, "", [], {}):
-            evidence[key] = row[key]
+            add_allowlisted(nested)
+    add_allowlisted(row)
     rewards = evidence.get("clobRewards") or evidence.get("rewards")
     if isinstance(rewards, Sequence) and not isinstance(rewards, (str, bytes, bytearray)):
         for reward in rewards:
             if not isinstance(reward, Mapping):
                 continue
-            if evidence.get("rewardsMinSize") in (None, ""):
-                evidence["rewardsMinSize"] = reward.get("min_size") or reward.get("minSize")
-            if evidence.get("rewardsMaxSpread") in (None, ""):
-                evidence["rewardsMaxSpread"] = reward.get("max_spread") or reward.get("maxSpread")
-            if evidence.get("umaReward") in (None, ""):
-                evidence["umaReward"] = reward.get("reward") or reward.get("amount")
+            if not _is_present(evidence.get("rewardsMinSize")):
+                min_size = reward.get("min_size") or reward.get("minSize")
+                if _is_present(min_size):
+                    evidence["rewardsMinSize"] = min_size
+            if not _is_present(evidence.get("rewardsMaxSpread")):
+                max_spread = reward.get("max_spread") or reward.get("maxSpread")
+                if _is_present(max_spread):
+                    evidence["rewardsMaxSpread"] = max_spread
+            if not _is_present(evidence.get("umaReward")):
+                reward_value = reward.get("reward") or reward.get("amount")
+                if _is_present(reward_value):
+                    evidence["umaReward"] = reward_value
     return evidence
 
 
@@ -179,6 +207,13 @@ def _normalize_reward_spread(value: float | None) -> float | None:
 
 def _book_side(row: Mapping[str, Any], side: str) -> BookSide:
     raw = _as_mapping(row.get(f"{side}_book"))
+
+    def first_book_value(*keys: str) -> Any:
+        value = _first_present(raw, *keys)
+        if value not in (None, "", [], {}):
+            return value
+        return _first_present(row, *(f"{side}_{key}" for key in keys))
+
     token_id = _clean_string(
         raw.get("token_id")
         or raw.get("asset_id")
@@ -186,25 +221,15 @@ def _book_side(row: Mapping[str, Any], side: str) -> BookSide:
         or row.get(f"{side}_asset_id")
     )
     return BookSide(
-        bid=_parse_float(raw.get("bid") or raw.get("best_bid")),
-        ask=_parse_float(raw.get("ask") or raw.get("best_ask")),
-        bid_size=_parse_float(
-            raw.get("bid_size") or raw.get("best_bid_size") or raw.get("bid_size_proxy")
-        ),
-        ask_size=_parse_float(
-            raw.get("ask_size") or raw.get("best_ask_size") or raw.get("ask_size_proxy")
-        ),
+        bid=_parse_float(first_book_value("bid", "best_bid")),
+        ask=_parse_float(first_book_value("ask", "best_ask")),
+        bid_size=_parse_float(first_book_value("bid_size", "best_bid_size", "bid_size_proxy")),
+        ask_size=_parse_float(first_book_value("ask_size", "best_ask_size", "ask_size_proxy")),
         depth_bid=_parse_float(
-            raw.get("depth_bid_2c")
-            or raw.get("depth_bid_5c")
-            or raw.get("depth_bid_top10")
-            or raw.get("depth_bid")
+            first_book_value("depth_bid_2c", "depth_bid_5c", "depth_bid_top10", "depth_bid")
         ),
         depth_ask=_parse_float(
-            raw.get("depth_ask_2c")
-            or raw.get("depth_ask_5c")
-            or raw.get("depth_ask_top10")
-            or raw.get("depth_ask")
+            first_book_value("depth_ask_2c", "depth_ask_5c", "depth_ask_top10", "depth_ask")
         ),
         token_id=token_id,
     )
@@ -229,16 +254,79 @@ def _candidate_slug(row: Mapping[str, Any]) -> str:
     )
 
 
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return []
+        value = parsed
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return list(value)
+    return []
+
+
+def _outcomes(row: Mapping[str, Any]) -> list[str]:
+    return [str(item).strip() for item in _json_list(row.get("outcomes")) if str(item).strip()]
+
+
+def _raw_clob_token_ids(row: Mapping[str, Any]) -> list[str]:
+    raw = row.get("clob_token_ids") or row.get("clobTokenIds")
+    return [str(item).strip() for item in _json_list(raw) if str(item).strip()]
+
+
+def _compact_book_mid(row: Mapping[str, Any], side: str) -> float | None:
+    raw = row.get(f"{side}_book")
+    if isinstance(raw, Mapping):
+        return _parse_float(raw.get("mid"))
+    return _parse_float(raw)
+
+
+def _yes_no_token_ids(
+    row: Mapping[str, Any], yes_book: BookSide, no_book: BookSide
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    side_yes = _clean_string(_first_present(row, "yes_token_id", "yes_asset_id"))
+    side_no = _clean_string(_first_present(row, "no_token_id", "no_asset_id"))
+    yes_token = side_yes or yes_book.token_id
+    no_token = side_no or no_book.token_id
+    if yes_token is not None or no_token is not None:
+        if yes_token is None or no_token is None:
+            return yes_token, no_token, ("incomplete_side_scoped_yes_no_token_ids",)
+        if yes_token == no_token:
+            return yes_token, no_token, ("duplicate_yes_no_token_ids",)
+        return yes_token, no_token, ()
+
+    raw_ids = _raw_clob_token_ids(row)
+    if not raw_ids:
+        return None, None, ()
+    if len(raw_ids) != 2 or len(set(raw_ids)) != 2:
+        return None, None, ("invalid_or_duplicate_clob_token_ids",)
+
+    outcomes = _outcomes(row)
+    normalized = [outcome.casefold() for outcome in outcomes]
+    if not outcomes:
+        return None, None, ("missing_yes_no_outcome_mapping_for_clob_token_ids",)
+    if len(outcomes) != 2 or set(normalized) != {"yes", "no"}:
+        return None, None, ("non_binary_outcome_mapping",)
+    by_outcome = {outcome.casefold(): token_id for outcome, token_id in zip(outcomes, raw_ids)}
+    return by_outcome["yes"], by_outcome["no"], ()
+
+
 def normalize_candidate(row: Mapping[str, Any], *, source_path: str | None = None) -> Candidate:
     yes_book = _book_side(row, "yes")
     no_book = _book_side(row, "no")
+    yes_token_id, no_token_id, token_blockers = _yes_no_token_ids(row, yes_book, no_book)
     evidence = _reward_evidence(row)
     reward_max_spread_raw = _parse_float(evidence.get("rewardsMaxSpread"))
     reward_min_size = _parse_float(evidence.get("rewardsMinSize"))
     yes_mid = _parse_float(_first_present(row, "yes_mid", "yes_probability", "yes_price"))
     no_mid = _parse_float(_first_present(row, "no_mid", "no_probability", "no_price"))
     if yes_mid is None:
+        yes_mid = _compact_book_mid(row, "yes")
+    if yes_mid is None:
         yes_mid = _mid_from_book(yes_book)
+    if no_mid is None:
+        no_mid = _compact_book_mid(row, "no")
     if no_mid is None:
         no_mid = _mid_from_book(no_book)
     yes_spread = _parse_float(_first_present(row, "yes_spread", "spread", "avg_spread"))
@@ -254,8 +342,8 @@ def normalize_candidate(row: Mapping[str, Any], *, source_path: str | None = Non
         source_url=_clean_string(
             _first_present(row, "source_market_url", "source_url", "market_url")
         ),
-        yes_token_id=_clean_string(_first_present(row, "yes_token_id") or yes_book.token_id),
-        no_token_id=_clean_string(_first_present(row, "no_token_id") or no_book.token_id),
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
         yes_mid=yes_mid,
         no_mid=no_mid,
         yes_spread=yes_spread,
@@ -275,7 +363,7 @@ def normalize_candidate(row: Mapping[str, Any], *, source_path: str | None = Non
             row.get("source_path") or row.get("source_artifact") or source_path
         ),
         source_tags=_strategy_tags(row),
-        source_blockers=_blockers(row),
+        source_blockers=tuple(dict.fromkeys((*_blockers(row), *token_blockers))),
     )
 
 
@@ -793,6 +881,15 @@ def build_report(
         blocker_reasons.append("fewer_than_10_reward_candidates_selected")
     if not any(_has_book_snapshot(candidate) for candidate in candidates):
         blocker_reasons.append("selected_candidates_missing_top_of_book_snapshots")
+    token_blockers = sorted(
+        {
+            blocker
+            for candidate in candidates
+            for blocker in candidate.source_blockers
+            if blocker in TOKEN_BLOCKERS
+        }
+    )
+    blocker_reasons.extend(token_blockers)
     known_fill_count = sum(row["would_have_filled_known_count"] for row in candidate_table)
     classification = "diagnostic_only"
     if blocker_reasons:

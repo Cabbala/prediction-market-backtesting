@@ -3,87 +3,310 @@
   "$id": "https://cabbala.local/polymarket/reward-market-manifest.schema.json",
   "title": "Polymarket reward market scanner manifest",
   "type": "object",
-  "required": ["schema_version", "mode", "generated_at_utc", "safety", "scoring_rules", "candidates"],
+  "required": [
+    "schema_version",
+    "mode",
+    "generated_at_utc",
+    "safety",
+    "scoring_rules",
+    "candidates"
+  ],
   "properties": {
-    "schema_version": {"const": "polymarket.reward-market-manifest.v1"},
-    "mode": {"const": "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"},
-    "generated_at_utc": {"type": "string"},
-    "source_scan_timestamp_utc": {"type": ["string", "null"]},
-    "source_scan_mode": {"type": ["string", "null", "boolean"]},
-    "source_artifacts": {"type": "object"},
-    "input_scan_path": {"type": "string"},
-    "input_strategy_report_path": {"type": ["string", "null"]},
+    "schema_version": {
+      "const": "polymarket.reward-market-manifest.v1"
+    },
+    "mode": {
+      "const": "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"
+    },
+    "generated_at_utc": {
+      "type": "string"
+    },
+    "source_scan_timestamp_utc": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_scan_mode": {
+      "type": [
+        "string",
+        "null",
+        "boolean"
+      ]
+    },
+    "source_artifacts": {
+      "type": "object"
+    },
+    "input_scan_path": {
+      "type": "string"
+    },
+    "input_strategy_report_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "source_paths": {
       "type": "object",
       "properties": {
-        "market_scan_json": {"type": "string"},
-        "strategy_or_scan_report_md": {"type": ["string", "null"]}
+        "market_scan_json": {
+          "type": "string"
+        },
+        "strategy_or_scan_report_md": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       },
       "additionalProperties": true
     },
     "summary": {
       "type": "object",
       "properties": {
-        "candidate_count": {"type": "integer", "minimum": 0},
-        "manifest_candidate_count": {"type": "integer", "minimum": 0},
-        "eligible_for_backtest_queue_count": {"type": "integer", "minimum": 0},
-        "blocked_count": {"type": "integer", "minimum": 0},
-        "explicit_reward_evidence_count": {"type": "integer", "minimum": 0}
+        "candidate_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "manifest_candidate_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "eligible_for_backtest_queue_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "explicit_reward_evidence_count": {
+          "type": "integer",
+          "minimum": 0
+        }
       },
       "additionalProperties": true
     },
     "safety": {
       "type": "object",
-      "required": ["live_trading", "submit_orders", "sign_orders", "requires_secrets", "intended_uses"],
+      "required": [
+        "live_trading",
+        "submit_orders",
+        "sign_orders",
+        "requires_secrets",
+        "intended_uses"
+      ],
       "properties": {
-        "live_trading": {"const": false},
-        "submit_orders": {"const": false},
-        "sign_orders": {"const": false},
-        "requires_secrets": {"const": false},
-        "intended_uses": {"type": "array", "items": {"type": "string"}}
+        "live_trading": {
+          "const": false
+        },
+        "submit_orders": {
+          "const": false
+        },
+        "sign_orders": {
+          "const": false
+        },
+        "requires_secrets": {
+          "const": false
+        },
+        "intended_uses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "orders_submitted": {
+          "type": "boolean"
+        },
+        "orders_signed": {
+          "type": "boolean"
+        },
+        "orders_cancelled": {
+          "type": "boolean"
+        },
+        "credentials_required": {
+          "type": "boolean"
+        },
+        "live_trading_worker_started": {
+          "type": "boolean"
+        },
+        "worker_trading_started": {
+          "type": "boolean"
+        }
       },
       "additionalProperties": true
     },
-    "scoring_rules": {"type": "object"},
+    "scoring_rules": {
+      "type": "object"
+    },
     "candidates": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["market_id", "slug", "question", "reward_proxy_score", "eligible_for_backtest_queue", "features", "accidental_fill_risk_flags"],
+        "required": [
+          "market_id",
+          "slug",
+          "question",
+          "reward_proxy_score",
+          "eligible_for_backtest_queue",
+          "features",
+          "accidental_fill_risk_flags"
+        ],
         "properties": {
-          "rank": {"type": "integer", "minimum": 1},
-          "market_id": {"type": "string"},
-          "condition_id": {"type": ["string", "null"]},
-          "slug": {"type": ["string", "null"]},
-          "question": {"type": ["string", "null"]},
-          "source_url": {"type": ["string", "null"]},
-          "clob_token_ids": {"type": "array"},
-          "outcomes": {"type": "array"},
-          "source_candidate_score": {"type": ["number", "null"]},
-          "reward_proxy_score": {"type": "number"},
-          "eligible_for_backtest_queue": {"type": "boolean"},
-          "blockers": {"type": "array", "items": {"type": "string"}},
-          "accidental_fill_risk_flags": {"type": "array", "items": {"type": "string"}},
+          "rank": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "market_id": {
+            "type": "string"
+          },
+          "condition_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "question": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clob_token_ids": {
+            "type": "array"
+          },
+          "yes_token_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "no_token_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcomes": {
+            "type": "array"
+          },
+          "reward_evidence": {
+            "type": "object",
+            "propertyNames": {
+              "enum": [
+                "clobRewards",
+                "rewards",
+                "rewardsMinSize",
+                "rewardsMaxSpread",
+                "umaReward"
+              ]
+            },
+            "additionalProperties": true
+          },
+          "source_candidate_score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reward_proxy_score": {
+            "type": "number"
+          },
+          "eligible_for_backtest_queue": {
+            "type": "boolean"
+          },
+          "blockers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "accidental_fill_risk_flags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "features": {
             "type": "object",
-            "required": ["yes_spread", "no_spread", "avg_spread", "min_top_book_depth", "volume", "volume_24h", "liquidity", "fee_reward_category", "has_explicit_reward_evidence"],
+            "required": [
+              "yes_spread",
+              "no_spread",
+              "avg_spread",
+              "min_top_book_depth",
+              "volume",
+              "volume_24h",
+              "liquidity",
+              "fee_reward_category",
+              "has_explicit_reward_evidence"
+            ],
             "properties": {
-              "yes_spread": {"type": "number"},
-              "no_spread": {"type": "number"},
-              "avg_spread": {"type": "number"},
-              "min_top_book_depth": {"type": "number"},
-              "yes_top_book_depth": {"type": "number"},
-              "no_top_book_depth": {"type": "number"},
-              "volume": {"type": "number"},
-              "volume_24h": {"type": "number"},
-              "liquidity": {"type": "number"},
-              "days_to_end": {"type": ["number", "null"]},
-              "market_age_days": {"type": ["number", "null"]},
-              "volatility_proxy": {"type": "number"},
-              "fee_reward_category": {"type": "string"},
-              "has_explicit_reward_evidence": {"type": "boolean"},
-              "has_complete_clob_token_ids": {"type": "boolean"},
-              "has_yes_no_outcomes": {"type": "boolean"}
+              "yes_spread": {
+                "type": "number"
+              },
+              "no_spread": {
+                "type": "number"
+              },
+              "avg_spread": {
+                "type": "number"
+              },
+              "min_top_book_depth": {
+                "type": "number"
+              },
+              "yes_top_book_depth": {
+                "type": "number"
+              },
+              "no_top_book_depth": {
+                "type": "number"
+              },
+              "volume": {
+                "type": "number"
+              },
+              "volume_24h": {
+                "type": "number"
+              },
+              "liquidity": {
+                "type": "number"
+              },
+              "days_to_end": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "market_age_days": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "volatility_proxy": {
+                "type": "number"
+              },
+              "fee_reward_category": {
+                "type": "string"
+              },
+              "has_explicit_reward_evidence": {
+                "type": "boolean"
+              },
+              "has_complete_clob_token_ids": {
+                "type": "boolean"
+              },
+              "has_yes_no_outcomes": {
+                "type": "boolean"
+              }
             },
             "additionalProperties": true
           }

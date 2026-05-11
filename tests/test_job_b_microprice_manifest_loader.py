@@ -132,6 +132,48 @@ def test_load_candidates_preserves_candidate_coverage_window(tmp_path):
     assert candidates[0].coverage_min_book_events == 50
 
 
+def test_load_candidates_accepts_market_scan_strategy_tags_and_compact_scalar_books(tmp_path):
+    manifest = tmp_path / "market_scan.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "metadata": {"utc_timestamp": "2026-05-11T14:03:46Z"},
+                "candidates": [
+                    {
+                        "slug": "microprice-market",
+                        "question": "Microprice?",
+                        "strategy_fits": [
+                            "Microprice",
+                            "low-fill-probability liquidity-reward maker",
+                        ],
+                        "yes_token_id": "yes-token",
+                        "no_token_id": "no-token",
+                        "yes_book": "0.011",
+                        "no_book": 0.989,
+                        "liquidityNum": 1_000_000,
+                    },
+                    {
+                        "slug": "reward-only-market",
+                        "question": "Reward only?",
+                        "strategy_fits": ["low-fill-probability liquidity-reward maker"],
+                        "yes_token_id": "yes-token-2",
+                        "no_token_id": "no-token-2",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    candidates = load_candidates(manifest, strategy="microprice_optimizer", max_candidates=5)
+
+    assert len(candidates) == 1
+    assert candidates[0].slug == "microprice-market"
+    assert candidates[0].source_strategy == "Microprice"
+    assert candidates[0].scan_mid == 0.011
+    assert candidates[0].liquidity == 1_000_000
+
+
 def test_select_latest_non_empty_pass_manifest_skips_zero_candidate_files(tmp_path):
     newer_zero = tmp_path / "job_B_pmxt_l2_coverage_pass_20260511T083729Z.json"
     older_non_empty = tmp_path / "job_B_pmxt_l2_coverage_pass_20260511T004317Z.json"

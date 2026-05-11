@@ -170,6 +170,12 @@ def test_build_reward_manifest_accepts_candidates_key_and_declares_no_live_tradi
         "submit_orders": False,
         "sign_orders": False,
         "requires_secrets": False,
+        "orders_submitted": False,
+        "orders_signed": False,
+        "orders_cancelled": False,
+        "credentials_required": False,
+        "live_trading_worker_started": False,
+        "worker_trading_started": False,
         "intended_uses": ["PMBT_BACKTEST_QUEUE", "HOMERUN_SHADOW_FORWARD_LOGGING"],
     }
     assert [candidate["market_id"] for candidate in manifest["candidates"]] == ["tight", "wide"]
@@ -369,6 +375,7 @@ def test_latest_scan_shape_uses_liquidity_num_top10_depth_and_reward_evidence() 
     assert row["features"]["fee_reward_category"] == "explicit_gamma_reward_terms"
     assert row["features"]["has_explicit_reward_evidence"] is True
     assert row["features"]["book_token_ids_match_yes_no_mapping"] is True
+    assert row["reward_evidence"] == {"rewardsMinSize": "100", "rewardsMaxSpread": "3.0"}
 
 
 def test_flat_top_of_book_fields_are_supported_without_fabricating_books() -> None:
@@ -398,6 +405,48 @@ def test_flat_top_of_book_fields_are_supported_without_fabricating_books() -> No
     assert scored["eligible_for_backtest_queue"] is True
     assert scored["features"]["yes_spread"] == pytest.approx(0.001)
     assert scored["features"]["min_top_book_depth"] == 13_000
+
+
+def test_compact_scalar_books_keep_side_token_candidate_but_fail_closed_on_missing_book() -> None:
+    manifest = build_reward_manifest(
+        {
+            "metadata": {"utc_timestamp": "2026-05-04T06:01:34+00:00", "mode": SHADOW_MODE},
+            "candidates": [
+                {
+                    "id": "compact-book",
+                    "conditionId": "0xcompact",
+                    "slug": "compact-book-market",
+                    "question": "Will compact scalar books normalize?",
+                    "yes_token_id": "yes-compact-token",
+                    "no_token_id": "no-compact-token",
+                    "yes_book": "0.49",
+                    "no_book": 0.51,
+                    "liquidityNum": 50_000,
+                    "volumeNum": 60_000,
+                    "endDate": "2026-07-20T00:00:00Z",
+                    "reward_evidence": {
+                        "rewardsMinSize": "100",
+                        "rewardsMaxSpread": "2.5",
+                        "unexpected": "drop",
+                    },
+                }
+            ],
+        },
+        limit=1,
+    )
+
+    row = manifest["candidates"][0]
+    assert manifest["summary"]["candidate_count"] == 1
+    assert row["clob_token_ids"] == ["yes-compact-token", "no-compact-token"]
+    assert row["yes_token_id"] == "yes-compact-token"
+    assert row["no_token_id"] == "no-compact-token"
+    assert row["features"]["has_complete_clob_token_ids"] is True
+    assert row["features"]["has_yes_no_outcomes"] is True
+    assert row["features"]["yes_spread"] == 0.0
+    assert row["features"]["has_explicit_reward_evidence"] is True
+    assert row["reward_evidence"] == {"rewardsMinSize": "100", "rewardsMaxSpread": "2.5"}
+    assert row["eligible_for_backtest_queue"] is False
+    assert "missing_complete_yes_no_clob_books" in row["blockers"]
 
 
 def test_flat_side_token_fields_provide_explicit_yes_no_mapping() -> None:
@@ -570,6 +619,26 @@ def test_positional_books_without_outcomes_remain_fail_closed() -> None:
     assert scored["eligible_for_backtest_queue"] is False
     assert "invalid_or_missing_yes_no_clob_token_ids" in scored["blockers"]
     assert "invalid_yes_no_outcome_mapping" in scored["blockers"]
+
+
+def test_invalid_duplicate_and_non_binary_tokens_are_reported_not_truncated() -> None:
+    manifest = build_reward_manifest(
+        {
+            "metadata": {"utc_timestamp": "2026-05-04T06:01:34+00:00", "mode": SHADOW_MODE},
+            "candidates": [
+                _candidate(market_id="duplicate", clob_token_ids=["same", "same"]),
+                _candidate(market_id="non-binary", outcomes=["Red", "Blue"]),
+            ],
+        },
+        limit=2,
+    )
+
+    assert manifest["summary"]["candidate_count"] == 2
+    for row in manifest["candidates"]:
+        assert row["clob_token_ids"] == []
+        assert row["eligible_for_backtest_queue"] is False
+        assert "invalid_or_missing_yes_no_clob_token_ids" in row["blockers"]
+    assert "invalid_yes_no_outcome_mapping" in manifest["candidates"][1]["blockers"]
 
 
 def test_book_token_mismatch_blocks_backtest_queue() -> None:
