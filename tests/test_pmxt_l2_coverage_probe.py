@@ -119,6 +119,11 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
 
     pass_manifest = json.loads(Path(output_files["pass_manifest"]).read_text(encoding="utf-8"))
     assert pass_manifest["mode"] == "shadow/backtest-only"
+    assert pass_manifest["safety"]["orders_submitted"] is False
+    assert pass_manifest["safety"]["orders_signed"] is False
+    assert pass_manifest["safety"]["credentials_required"] is False
+    assert pass_manifest["safety"]["worker_trading_started"] is False
+    assert pass_manifest["safety"]["live_trading_worker_started"] is False
     assert pass_manifest["source_manifest"] == str(source_manifest)
     assert pass_manifest["min_book_events"] == 50
     assert [candidate["market_slug"] for candidate in pass_manifest["candidates"]] == [
@@ -407,6 +412,7 @@ def test_recent_window_count_probes_multiple_windows_and_keeps_candidate_window(
         "start_time": "2026-03-22T08:00:00Z",
         "end_time": "2026-03-22T09:00:00Z",
     }
+    assert pass_manifest["candidates"][0]["coverage"]["min_book_events"] == 50
 
 
 def test_pass_manifest_dedupes_multiple_pass_windows_for_same_market(tmp_path) -> None:

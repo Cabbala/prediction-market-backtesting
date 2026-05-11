@@ -5,9 +5,10 @@ import asyncio
 import csv
 import json
 import math
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from glob import glob
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,9 @@ DEFAULT_SOURCES = (
     "archive:r2v2.pmxt.dev",
     "archive:r2.pmxt.dev",
 )
+DEFAULT_PASS_MANIFEST_GLOB = (
+    "/opt/polymarket-lab/autoresearch/backtests/job_B_pmxt_l2_coverage_pass_*.json"
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class Candidate:
     coverage_start_time: str | None = None
     coverage_end_time: str | None = None
     coverage_book_events: int | None = None
+    coverage_min_book_events: int | None = None
     manifest_rank: int | None = None
     selection_policy: str = "non_extreme_tail_priority_then_liquidity"
 
@@ -82,6 +87,15 @@ def _parse_float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _parse_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _candidate_slug(raw: dict[str, Any]) -> str | None:
     value = raw.get("market_slug") or raw.get("slug")
     if not isinstance(value, str) or not value.strip():
@@ -110,7 +124,12 @@ def _strategy_matches(requested: str | None, actual: str | None) -> bool:
 
 
 def _normalize_candidate(
-    raw: dict[str, Any], *, source_strategy: str, manifest_rank: int | None = None
+    raw: dict[str, Any],
+    *,
+    source_strategy: str,
+    manifest_rank: int | None = None,
+    default_coverage_window: dict[str, Any] | None = None,
+    default_min_book_events: int | None = None,
 ) -> Candidate | None:
     slug = _candidate_slug(raw)
     if slug is None:
@@ -122,13 +141,12 @@ def _normalize_candidate(
         token_index = 0
     coverage = raw.get("coverage") if isinstance(raw.get("coverage"), dict) else {}
     coverage_window = coverage.get("window") if isinstance(coverage.get("window"), dict) else {}
-    coverage_book_events = coverage.get("book_events")
-    try:
-        coverage_book_events = (
-            int(coverage_book_events) if coverage_book_events is not None else None
-        )
-    except (TypeError, ValueError):
-        coverage_book_events = None
+    if not coverage_window and default_coverage_window:
+        coverage_window = default_coverage_window
+    coverage_book_events = _parse_int(coverage.get("book_events"))
+    coverage_min_book_events = _parse_int(coverage.get("min_book_events"))
+    if coverage_min_book_events is None:
+        coverage_min_book_events = default_min_book_events
     return Candidate(
         slug=slug,
         question=str(raw.get("question") or slug),
@@ -150,6 +168,7 @@ def _normalize_candidate(
         if isinstance(coverage_window.get("end_time"), str)
         else None,
         coverage_book_events=coverage_book_events,
+        coverage_min_book_events=coverage_min_book_events,
         manifest_rank=manifest_rank,
     )
 
@@ -185,6 +204,8 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
     seen: set[tuple[str, int]] = set()
 
     if isinstance(payload, dict):
+        manifest_window = payload.get("window") if isinstance(payload.get("window"), dict) else None
+        manifest_min_book_events = _parse_int(payload.get("min_book_events"))
         batches = payload.get("batches")
         if isinstance(batches, list):
             for batch in batches:
@@ -200,7 +221,11 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                     if not isinstance(raw, dict):
                         continue
                     cand = _normalize_candidate(
-                        raw, source_strategy=source_strategy, manifest_rank=manifest_idx
+                        raw,
+                        source_strategy=source_strategy,
+                        manifest_rank=manifest_idx,
+                        default_coverage_window=manifest_window,
+                        default_min_book_events=manifest_min_book_events,
                     )
                     if cand is None:
                         continue
@@ -244,7 +269,11 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                         except (TypeError, ValueError):
                             continue
                 cand = _normalize_candidate(
-                    raw, source_strategy=source_strategy, manifest_rank=manifest_idx
+                    raw,
+                    source_strategy=source_strategy,
+                    manifest_rank=manifest_idx,
+                    default_coverage_window=manifest_window,
+                    default_min_book_events=manifest_min_book_events,
                 )
                 if cand is None:
                     continue
@@ -269,6 +298,58 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
             candidates.append(cand)
     candidates.sort(key=_candidate_priority)
     return candidates[:max_candidates]
+
+
+def _declared_candidate_count(manifest_path: Path) -> int:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return 0
+    candidate_count = _parse_int(payload.get("candidate_count"))
+    if candidate_count is not None:
+        return candidate_count
+    candidates = payload.get("candidates")
+    return len(candidates) if isinstance(candidates, list) else 0
+
+
+def select_latest_non_empty_pass_manifest(
+    manifest_glob: str,
+    *,
+    strategy: str,
+) -> tuple[Path | None, list[dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    manifest_paths = [
+        Path(path)
+        for path in sorted(
+            glob(manifest_glob),
+            key=lambda value: Path(value).stat().st_mtime,
+            reverse=True,
+        )
+    ]
+    for path in manifest_paths:
+        record: dict[str, Any] = {"path": str(path), "selected": False}
+        try:
+            declared_count = _declared_candidate_count(path)
+            record["candidate_count"] = declared_count
+            if declared_count <= 0:
+                record["reason"] = "skipped_zero_candidates"
+                records.append(record)
+                continue
+            matching_candidates = load_candidates(path, strategy=strategy, max_candidates=1)
+            record["matching_candidate_count"] = len(matching_candidates)
+            if not matching_candidates:
+                record["reason"] = "skipped_no_matching_pass_candidates"
+                records.append(record)
+                continue
+        except Exception as exc:  # pass manifest discovery must fail closed
+            record["reason"] = "skipped_unreadable_or_invalid"
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            records.append(record)
+            continue
+        record["selected"] = True
+        record["reason"] = "selected_newest_non_empty_pass_manifest"
+        records.append(record)
+        return path, records
+    return None, records
 
 
 def microprice_param_grid() -> list[dict[str, Any]]:
@@ -411,6 +492,124 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
     }
 
 
+def _candidate_replay_request(candidate: Candidate, args: argparse.Namespace) -> dict[str, Any]:
+    start_time = candidate.coverage_start_time or args.start_time
+    end_time = candidate.coverage_end_time or args.end_time
+    min_book_events = (
+        candidate.coverage_min_book_events
+        if candidate.coverage_min_book_events is not None
+        else args.min_book_events
+    )
+    return {
+        "slug": candidate.slug,
+        "token_index": candidate.token_index,
+        "source_strategy": candidate.source_strategy,
+        "manifest_rank": candidate.manifest_rank,
+        "window": {"start_time": start_time, "end_time": end_time},
+        "min_book_events": min_book_events,
+        "coverage_book_events": candidate.coverage_book_events,
+    }
+
+
+def _unique_replay_windows(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[tuple[str | None, str | None, int | None], dict[str, Any]] = {}
+    for request in requests:
+        window = request["window"]
+        key = (
+            window.get("start_time"),
+            window.get("end_time"),
+            request.get("min_book_events"),
+        )
+        unique.setdefault(
+            key,
+            {
+                "window": {
+                    "start_time": window.get("start_time"),
+                    "end_time": window.get("end_time"),
+                },
+                "min_book_events": request.get("min_book_events"),
+                "candidate_count": 0,
+            },
+        )
+        unique[key]["candidate_count"] += 1
+    return list(unique.values())
+
+
+def _attempt_replay_key(
+    attempt: BacktestAttempt,
+) -> tuple[str | None, str | None, int | None]:
+    diagnostics = attempt.diagnostics or {}
+    window = diagnostics.get("window") if isinstance(diagnostics.get("window"), dict) else {}
+    return (
+        window.get("start_time"),
+        window.get("end_time"),
+        _parse_int(diagnostics.get("min_book_events")),
+    )
+
+
+def _build_exact_window_metadata(
+    *,
+    requested_window: dict[str, str],
+    requested_min_book_events: int,
+    replay_requests: list[dict[str, Any]],
+    attempts: list[BacktestAttempt],
+) -> dict[str, Any]:
+    selected_windows = _unique_replay_windows(replay_requests)
+    warnings: list[str] = []
+    selected_window: dict[str, str | None] | None = None
+    selected_min_book_events: int | None = None
+    root_window: dict[str, str | None] = dict(requested_window)
+    root_min_book_events: int | None = requested_min_book_events
+    status = "verified"
+
+    if not replay_requests:
+        status = "fail_closed_no_candidates"
+        warnings.append("no_candidate_coverage_pass_manifest")
+    elif len(selected_windows) != 1:
+        status = "fail_closed"
+        warnings.append("exact_window_mismatch: multiple selected windows or min_book_events")
+    else:
+        selected = selected_windows[0]
+        selected_window = dict(selected["window"])
+        selected_min_book_events = _parse_int(selected.get("min_book_events"))
+        root_window = dict(selected_window)
+        root_min_book_events = selected_min_book_events
+        expected_key = (
+            selected_window.get("start_time"),
+            selected_window.get("end_time"),
+            selected_min_book_events,
+        )
+        mismatches = [
+            {
+                "slug": attempt.slug,
+                "token_index": attempt.token_index,
+                "attempt_window": (attempt.diagnostics or {}).get("window"),
+                "attempt_min_book_events": (attempt.diagnostics or {}).get("min_book_events"),
+            }
+            for attempt in attempts
+            if _attempt_replay_key(attempt) != expected_key
+        ]
+        if attempts and not mismatches:
+            status = "verified"
+        else:
+            status = "fail_closed"
+            warnings.append("exact_window_mismatch")
+            if not attempts:
+                warnings.append("no_attempts_generated")
+
+    return {
+        "status": status,
+        "requested_window": requested_window,
+        "requested_min_book_events": requested_min_book_events,
+        "selected_window": selected_window,
+        "selected_min_book_events": selected_min_book_events,
+        "selected_windows": selected_windows,
+        "root_window": root_window,
+        "root_min_book_events": root_min_book_events,
+        "warnings": warnings,
+    }
+
+
 async def run_attempt(
     candidate: Candidate,
     params: dict[str, Any],
@@ -515,18 +714,19 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     )
     selected_params = microprice_param_grid()[: args.max_param_sets]
     attempts: list[BacktestAttempt] = []
+    replay_requests = [_candidate_replay_request(candidate, args) for candidate in candidates]
     for candidate in candidates:
-        candidate_start_time = candidate.coverage_start_time or args.start_time
-        candidate_end_time = candidate.coverage_end_time or args.end_time
+        replay_request = _candidate_replay_request(candidate, args)
+        replay_window = replay_request["window"]
         for params in selected_params:
             attempts.append(
                 await asyncio.wait_for(
                     run_attempt(
                         candidate,
                         params,
-                        start_time=candidate_start_time,
-                        end_time=candidate_end_time,
-                        min_book_events=args.min_book_events,
+                        start_time=replay_window["start_time"],
+                        end_time=replay_window["end_time"],
+                        min_book_events=int(replay_request["min_book_events"]),
                     ),
                     timeout=args.per_attempt_timeout_secs,
                 )
@@ -534,17 +734,40 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     completed = sum(1 for attempt in attempts if attempt.status == "completed")
     skipped = sum(1 for attempt in attempts if attempt.status == "skipped_no_coverage")
     errored = sum(1 for attempt in attempts if attempt.status == "error")
+    requested_window = {"start_time": args.start_time, "end_time": args.end_time}
+    exact_window = _build_exact_window_metadata(
+        requested_window=requested_window,
+        requested_min_book_events=args.min_book_events,
+        replay_requests=replay_requests,
+        attempts=attempts,
+    )
     return {
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
         "safety": {
             "live_trading": False,
             "orders_submitted": False,
+            "orders_signed": False,
             "credentials_required": False,
             "worker_trading_started": False,
+            "live_trading_worker_started": False,
         },
         "manifest": str(args.manifest),
-        "window": {"start_time": args.start_time, "end_time": args.end_time},
+        "manifest_selection": getattr(
+            args,
+            "manifest_selection",
+            [{"path": str(args.manifest), "selected": True, "reason": "explicit_manifest"}],
+        ),
+        "window": exact_window["root_window"],
+        "requested_window": requested_window,
+        "selected_window": exact_window["selected_window"],
+        "selected_windows": exact_window["selected_windows"],
+        "min_book_events": exact_window["root_min_book_events"],
+        "requested_min_book_events": args.min_book_events,
+        "selected_min_book_events": exact_window["selected_min_book_events"],
+        "exact_window_status": exact_window["status"],
+        "warnings": exact_window["warnings"],
+        "exact_window": exact_window,
         "candidate_count": len(candidates),
         "parameter_set_count": len(selected_params),
         "attempt_count": len(attempts),
@@ -556,6 +779,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
             "preferred_yes_mid_range": [0.005, 0.25],
             "ultra_low_tail_retained_but_deprioritized": True,
         },
+        "candidate_replay_requests": replay_requests,
         "candidates": [asdict(candidate) for candidate in candidates],
         "diagnostics": _aggregate_diagnostics(attempts),
         "attempts": [asdict(attempt) for attempt in attempts],
@@ -613,6 +837,13 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- mode: {summary['mode']}",
         f"- manifest: {summary['manifest']}",
         f"- window: {summary['window']['start_time']} -> {summary['window']['end_time']}",
+        f"- min_book_events: {summary.get('min_book_events')}",
+        f"- requested_window: {summary['requested_window']['start_time']} -> {summary['requested_window']['end_time']}",
+        f"- requested_min_book_events: {summary.get('requested_min_book_events')}",
+        f"- selected_window: {json.dumps(summary.get('selected_window'), sort_keys=True)}",
+        f"- selected_min_book_events: {summary.get('selected_min_book_events')}",
+        f"- exact_window_status: {summary.get('exact_window_status')}",
+        f"- warnings: {json.dumps(summary.get('warnings', []), sort_keys=True)}",
         f"- candidates: {summary['candidate_count']}",
         f"- parameter_sets: {summary['parameter_set_count']}",
         f"- attempts: {summary['attempt_count']}",
@@ -648,7 +879,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Job B bounded PMBT microprice batch runner (backtest-only)."
     )
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, default=None)
+    parser.add_argument(
+        "--manifest-glob",
+        default=DEFAULT_PASS_MANIFEST_GLOB,
+        help="Pass-manifest glob used when --manifest is omitted; zero-candidate files are skipped.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--strategy", default="microprice_optimizer")
     parser.add_argument("--max-candidates", type=int, default=3)
@@ -662,6 +898,30 @@ def main() -> int:
 
     if args.max_candidates < 1 or args.max_param_sets < 1:
         raise SystemExit("max-candidates and max-param-sets must be >= 1")
+    if args.manifest is None:
+        selected_manifest, selection_records = select_latest_non_empty_pass_manifest(
+            args.manifest_glob,
+            strategy=args.strategy,
+        )
+        args.manifest_selection = selection_records
+        if selected_manifest is None:
+            print(
+                json.dumps(
+                    {
+                        "error": "no_non_empty_pass_manifest",
+                        "manifest_glob": args.manifest_glob,
+                        "manifest_selection": selection_records,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
+        args.manifest = selected_manifest
+    else:
+        args.manifest_selection = [
+            {"path": str(args.manifest), "selected": True, "reason": "explicit_manifest"}
+        ]
     if args.end_time is None:
         end = _utc_now().replace(minute=0, second=0) - timedelta(hours=3)
         args.end_time = end.isoformat().replace("+00:00", "Z")

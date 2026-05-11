@@ -414,8 +414,10 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "safety": {
             "live_trading": False,
             "orders_submitted": False,
+            "orders_signed": False,
             "credentials_required": False,
             "worker_trading_started": False,
+            "live_trading_worker_started": False,
             "strategy_execution": False,
         },
         "strategy": args.strategy,
