@@ -76,6 +76,7 @@ Detailed guides have been filed away in the [docs index](https://evan-kolberg.gi
     - [Native Vendors](https://evan-kolberg.github.io/prediction-market-backtesting/backtests/#native-vendors)
     - [PMXT](https://evan-kolberg.github.io/prediction-market-backtesting/backtests/#pmxt)
     - [Telonex](https://evan-kolberg.github.io/prediction-market-backtesting/backtests/#telonex)
+- [Reward Market Scanner](https://evan-kolberg.github.io/prediction-market-backtesting/reward-market-scanner/)
 - [Polymarket Account Ledger Replay](https://evan-kolberg.github.io/prediction-market-backtesting/account-ledger-replay/)
   - [Runner And Notebook](https://evan-kolberg.github.io/prediction-market-backtesting/account-ledger-replay/#runner-and-notebook)
   - [What The Strategy Does](https://evan-kolberg.github.io/prediction-market-backtesting/account-ledger-replay/#what-the-strategy-does)

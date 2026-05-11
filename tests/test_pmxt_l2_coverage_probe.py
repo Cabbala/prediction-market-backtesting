@@ -92,6 +92,8 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
         min_book_events=50,
         sources=None,
         timeout_seconds=5,
+        recent_window_count=1,
+        window_step_hours=1,
     )
 
     summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
@@ -198,6 +200,8 @@ def test_gap_warning_prevents_pass_manifest_even_with_enough_events(monkeypatch,
         min_book_events=50,
         sources=None,
         timeout_seconds=5,
+        recent_window_count=1,
+        window_step_hours=1,
     )
 
     summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
@@ -245,7 +249,9 @@ def test_job_b_load_candidates_filters_top_level_strategy_mismatch(tmp_path) -> 
 
 def test_fail_on_no_pass_fails_even_with_zero_candidates(tmp_path) -> None:
     empty_manifest = tmp_path / "empty.json"
-    empty_manifest.write_text(json.dumps({"strategy": "microprice_optimizer", "candidates": []}), encoding="utf-8")
+    empty_manifest.write_text(
+        json.dumps({"strategy": "microprice_optimizer", "candidates": []}), encoding="utf-8"
+    )
     args = probe_pmxt_l2_coverage.parse_args(
         [
             "--manifest",
@@ -267,23 +273,26 @@ def test_fail_on_no_pass_fails_even_with_zero_candidates(tmp_path) -> None:
     assert summary["candidate_count"] == 0
     assert summary["pass_count"] == 0
     # Exercise the final exit policy through main, not only run_probe.
-    assert probe_pmxt_l2_coverage.main(
-        [
-            "--manifest",
-            str(empty_manifest),
-            "--start-time",
-            "2026-03-22T09:00:00Z",
-            "--end-time",
-            "2026-03-22T10:00:00Z",
-            "--output-dir",
-            str(tmp_path / "reports2"),
-            "--pass-manifest-dir",
-            str(tmp_path / "pass2"),
-            "--timestamp",
-            "20260504T000003Z",
-            "--fail-on-no-pass",
-        ]
-    ) == 3
+    assert (
+        probe_pmxt_l2_coverage.main(
+            [
+                "--manifest",
+                str(empty_manifest),
+                "--start-time",
+                "2026-03-22T09:00:00Z",
+                "--end-time",
+                "2026-03-22T10:00:00Z",
+                "--output-dir",
+                str(tmp_path / "reports2"),
+                "--pass-manifest-dir",
+                str(tmp_path / "pass2"),
+                "--timestamp",
+                "20260504T000003Z",
+                "--fail-on-no-pass",
+            ]
+        )
+        == 3
+    )
 
 
 def test_job_b_load_candidates_rejects_non_pass_coverage(tmp_path) -> None:
@@ -296,12 +305,21 @@ def test_job_b_load_candidates_rejects_non_pass_coverage(tmp_path) -> None:
                     {
                         "market_slug": "bad-coverage",
                         "source_strategy": "microprice_optimizer",
-                        "coverage": {"status": "no_coverage", "book_events": 100, "min_book_events": 50},
+                        "coverage": {
+                            "status": "no_coverage",
+                            "book_events": 100,
+                            "min_book_events": 50,
+                        },
                     },
                     {
                         "market_slug": "gap-coverage",
                         "source_strategy": "microprice_optimizer",
-                        "coverage": {"status": "pass", "book_events": 100, "min_book_events": 50, "gap_hours_missing": 1},
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 100,
+                            "min_book_events": 50,
+                            "gap_hours_missing": 1,
+                        },
                     },
                     {
                         "market_slug": "thin-coverage",
@@ -311,7 +329,12 @@ def test_job_b_load_candidates_rejects_non_pass_coverage(tmp_path) -> None:
                     {
                         "market_slug": "good-coverage",
                         "source_strategy": "microprice_optimizer",
-                        "coverage": {"status": "pass", "book_events": 50, "min_book_events": 50, "gap_hours_missing": 0},
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 50,
+                            "min_book_events": 50,
+                            "gap_hours_missing": 0,
+                        },
                     },
                 ],
             }
@@ -324,3 +347,107 @@ def test_job_b_load_candidates_rejects_non_pass_coverage(tmp_path) -> None:
         max_candidates=10,
     )
     assert [candidate.slug for candidate in candidates] == ["good-coverage"]
+
+
+def test_recent_window_count_probes_multiple_windows_and_keeps_candidate_window(
+    monkeypatch, tmp_path
+) -> None:
+    source_manifest = tmp_path / "source_manifest.json"
+    _write_source_manifest(source_manifest)
+
+    async def _fake_probe_candidate(candidate, **kwargs):  # type: ignore[no-untyped-def]
+        if candidate.slug == "covered-market" and kwargs["start_time"] == "2026-03-22T08:00:00Z":
+            return probe_pmxt_l2_coverage._result_from_candidate(
+                candidate,
+                status="pass",
+                book_events=80,
+                min_book_events=50,
+                window_start_time=kwargs["start_time"],
+                window_end_time=kwargs["end_time"],
+            )
+        return probe_pmxt_l2_coverage._result_from_candidate(
+            candidate,
+            status="no_coverage",
+            book_events=0,
+            min_book_events=50,
+            window_start_time=kwargs["start_time"],
+            window_end_time=kwargs["end_time"],
+        )
+
+    monkeypatch.setattr(probe_pmxt_l2_coverage, "probe_candidate", _fake_probe_candidate)
+    args = Namespace(
+        manifest=source_manifest,
+        output_dir=tmp_path / "reports",
+        pass_manifest_dir=tmp_path / "pass_manifests",
+        start_time="2026-03-22T09:00:00Z",
+        end_time="2026-03-22T10:00:00Z",
+        strategy="microprice_optimizer",
+        max_candidates=1,
+        min_book_events=50,
+        sources=None,
+        timeout_seconds=5,
+        recent_window_count=2,
+        window_step_hours=1,
+    )
+
+    summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
+    output_files = probe_pmxt_l2_coverage.write_outputs(
+        summary,
+        output_dir=args.output_dir,
+        pass_manifest_dir=args.pass_manifest_dir,
+        timestamp="20260504T000004Z",
+    )
+
+    assert summary["candidate_count"] == 1
+    assert summary["probe_window_count"] == 2
+    assert summary["probe_count"] == 2
+    assert summary["pass_count"] == 1
+    pass_manifest = json.loads(Path(output_files["pass_manifest"]).read_text(encoding="utf-8"))
+    assert pass_manifest["candidates"][0]["coverage"]["window"] == {
+        "start_time": "2026-03-22T08:00:00Z",
+        "end_time": "2026-03-22T09:00:00Z",
+    }
+
+
+def test_pass_manifest_dedupes_multiple_pass_windows_for_same_market(tmp_path) -> None:
+    summary = {
+        "generated_at_utc": "2026-03-22T00:00:00Z",
+        "manifest": "source.json",
+        "strategy": "Microprice",
+        "window": {"start_time": "2026-03-22T09:00:00Z", "end_time": "2026-03-22T10:00:00Z"},
+        "windows": [
+            {"start_time": "2026-03-22T09:00:00Z", "end_time": "2026-03-22T10:00:00Z"},
+            {"start_time": "2026-03-22T08:00:00Z", "end_time": "2026-03-22T09:00:00Z"},
+        ],
+        "min_book_events": 50,
+        "safety": {"live_trading": False},
+        "results": [
+            {
+                "status": "pass",
+                "slug": "same",
+                "market_slug": "same",
+                "question": "same?",
+                "source_strategy": "Microprice",
+                "token_index": 0,
+                "book_events": 60,
+                "min_book_events": 50,
+            },
+            {
+                "status": "pass",
+                "slug": "same",
+                "market_slug": "same",
+                "question": "same?",
+                "source_strategy": "Microprice",
+                "token_index": 0,
+                "book_events": 90,
+                "min_book_events": 50,
+            },
+        ],
+    }
+
+    manifest = probe_pmxt_l2_coverage._build_pass_manifest(summary)
+
+    assert manifest["candidate_count"] == 1
+    assert manifest["metadata"]["pass_window_count"] == 2
+    assert manifest["metadata"]["unique_pass_market_count"] == 1
+    assert manifest["candidates"][0]["coverage"]["book_events"] == 90

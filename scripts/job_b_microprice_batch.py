@@ -48,6 +48,11 @@ class Candidate:
     scan_imbalance5: float | None
     liquidity: float | None
     source_strategy: str
+    coverage_start_time: str | None = None
+    coverage_end_time: str | None = None
+    coverage_book_events: int | None = None
+    manifest_rank: int | None = None
+    selection_policy: str = "non_extreme_tail_priority_then_liquidity"
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,7 @@ class BacktestAttempt:
     status: str
     result: dict[str, Any] | None
     error: str | None
+    diagnostics: dict[str, Any] | None = None
 
 
 def _utc_now() -> datetime:
@@ -103,7 +109,9 @@ def _strategy_matches(requested: str | None, actual: str | None) -> bool:
     return requested_key == actual_key
 
 
-def _normalize_candidate(raw: dict[str, Any], *, source_strategy: str) -> Candidate | None:
+def _normalize_candidate(
+    raw: dict[str, Any], *, source_strategy: str, manifest_rank: int | None = None
+) -> Candidate | None:
     slug = _candidate_slug(raw)
     if slug is None:
         return None
@@ -112,17 +120,63 @@ def _normalize_candidate(raw: dict[str, Any], *, source_strategy: str) -> Candid
         token_index = int(token_index)
     except (TypeError, ValueError):
         token_index = 0
+    coverage = raw.get("coverage") if isinstance(raw.get("coverage"), dict) else {}
+    coverage_window = coverage.get("window") if isinstance(coverage.get("window"), dict) else {}
+    coverage_book_events = coverage.get("book_events")
+    try:
+        coverage_book_events = (
+            int(coverage_book_events) if coverage_book_events is not None else None
+        )
+    except (TypeError, ValueError):
+        coverage_book_events = None
     return Candidate(
         slug=slug,
         question=str(raw.get("question") or slug),
         token_index=token_index,
         condition_id=raw.get("condition_id") if isinstance(raw.get("condition_id"), str) else None,
-        scan_mid=_parse_float(raw.get("scan_mid") or raw.get("yes_probability")),
-        scan_spread=_parse_float(raw.get("scan_spread") or raw.get("avg_spread")),
+        scan_mid=_parse_float(
+            raw.get("scan_mid") or raw.get("yes_probability") or raw.get("yes_mid")
+        ),
+        scan_spread=_parse_float(
+            raw.get("scan_spread") or raw.get("avg_spread") or raw.get("spread")
+        ),
         scan_imbalance5=_parse_float(raw.get("scan_imbalance5")),
         liquidity=_parse_float(raw.get("scan_liquidity") or raw.get("liquidity")),
         source_strategy=source_strategy,
+        coverage_start_time=coverage_window.get("start_time")
+        if isinstance(coverage_window.get("start_time"), str)
+        else None,
+        coverage_end_time=coverage_window.get("end_time")
+        if isinstance(coverage_window.get("end_time"), str)
+        else None,
+        coverage_book_events=coverage_book_events,
+        manifest_rank=manifest_rank,
     )
+
+
+def _candidate_priority(candidate: Candidate) -> tuple[int, float, float]:
+    """Prefer non-extreme-tail candidates while preserving fail-closed filtering.
+
+    Ultra-low Yes mids around one tick can dominate liquidity/reward scans but are
+    poor first probes for microprice PnL/fill discovery. Keep them eligible, but
+    rank 0.005-0.25 mids first, then deeper liquidity and tighter spreads.
+    """
+    mid = candidate.scan_mid
+    if mid is None:
+        bucket = 2
+        mid_distance = 1.0
+    elif 0.005 <= mid <= 0.25:
+        bucket = 0
+        mid_distance = abs(mid - 0.03)
+    elif 0.003 <= mid < 0.005:
+        bucket = 1
+        mid_distance = 0.005 - mid
+    else:
+        bucket = 2
+        mid_distance = abs((mid or 0.0) - 0.03)
+    liquidity_score = -(candidate.liquidity or 0.0)
+    spread_score = candidate.scan_spread if candidate.scan_spread is not None else 999.0
+    return (bucket, mid_distance + spread_score, liquidity_score)
 
 
 def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) -> list[Candidate]:
@@ -142,10 +196,12 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                 markets = batch.get("markets")
                 if not isinstance(markets, list):
                     continue
-                for raw in markets:
+                for manifest_idx, raw in enumerate(markets):
                     if not isinstance(raw, dict):
                         continue
-                    cand = _normalize_candidate(raw, source_strategy=source_strategy)
+                    cand = _normalize_candidate(
+                        raw, source_strategy=source_strategy, manifest_rank=manifest_idx
+                    )
                     if cand is None:
                         continue
                     key = (cand.slug, cand.token_index)
@@ -153,18 +209,23 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                         continue
                     seen.add(key)
                     candidates.append(cand)
-                    if len(candidates) >= max_candidates:
-                        return candidates
         raw_candidates = payload.get("candidates")
         if isinstance(raw_candidates, list) and not candidates:
-            for raw in raw_candidates:
+            for manifest_idx, raw in enumerate(raw_candidates):
                 if not isinstance(raw, dict):
                     continue
                 source_strategy = str(
                     raw.get("source_strategy")
                     or raw.get("strategy")
+                    or raw.get("strategy_name")
                     or payload.get("strategy")
-                    or "reward_manifest"
+                    or (
+                        "Microprice"
+                        if str(
+                            (payload.get("metadata") or {}).get("artifact_type") or ""
+                        ).startswith("job_B_microprice")
+                        else "reward_manifest"
+                    )
                 )
                 if not _strategy_matches(strategy, source_strategy):
                     continue
@@ -182,7 +243,9 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                                 continue
                         except (TypeError, ValueError):
                             continue
-                cand = _normalize_candidate(raw, source_strategy=source_strategy)
+                cand = _normalize_candidate(
+                    raw, source_strategy=source_strategy, manifest_rank=manifest_idx
+                )
                 if cand is None:
                     continue
                 key = (cand.slug, cand.token_index)
@@ -190,13 +253,13 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                     continue
                 seen.add(key)
                 candidates.append(cand)
-                if len(candidates) >= max_candidates:
-                    return candidates
     elif isinstance(payload, list):
-        for raw in payload:
+        for manifest_idx, raw in enumerate(payload):
             if not isinstance(raw, dict):
                 continue
-            cand = _normalize_candidate(raw, source_strategy="list_manifest")
+            cand = _normalize_candidate(
+                raw, source_strategy="list_manifest", manifest_rank=manifest_idx
+            )
             if cand is None:
                 continue
             key = (cand.slug, cand.token_index)
@@ -204,17 +267,40 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                 continue
             seen.add(key)
             candidates.append(cand)
-            if len(candidates) >= max_candidates:
-                return candidates
-    return candidates
+    candidates.sort(key=_candidate_priority)
+    return candidates[:max_candidates]
 
 
 def microprice_param_grid() -> list[dict[str, Any]]:
     return [
-        {"depth_levels": 1, "entry_imbalance": 0.55, "exit_imbalance": 0.50, "min_microprice_edge": 0.0005, "quote_lifetime_seconds": 10.0},
-        {"depth_levels": 3, "entry_imbalance": 0.57, "exit_imbalance": 0.50, "min_microprice_edge": 0.0010, "quote_lifetime_seconds": 30.0},
-        {"depth_levels": 5, "entry_imbalance": 0.60, "exit_imbalance": 0.52, "min_microprice_edge": 0.0015, "quote_lifetime_seconds": 60.0},
-        {"depth_levels": 3, "entry_imbalance": 0.62, "exit_imbalance": 0.54, "min_microprice_edge": 0.0020, "quote_lifetime_seconds": 30.0},
+        {
+            "depth_levels": 1,
+            "entry_imbalance": 0.55,
+            "exit_imbalance": 0.50,
+            "min_microprice_edge": 0.0005,
+            "quote_lifetime_seconds": 10.0,
+        },
+        {
+            "depth_levels": 3,
+            "entry_imbalance": 0.57,
+            "exit_imbalance": 0.50,
+            "min_microprice_edge": 0.0010,
+            "quote_lifetime_seconds": 30.0,
+        },
+        {
+            "depth_levels": 5,
+            "entry_imbalance": 0.60,
+            "exit_imbalance": 0.52,
+            "min_microprice_edge": 0.0015,
+            "quote_lifetime_seconds": 60.0,
+        },
+        {
+            "depth_levels": 3,
+            "entry_imbalance": 0.62,
+            "exit_imbalance": 0.54,
+            "min_microprice_edge": 0.0020,
+            "quote_lifetime_seconds": 30.0,
+        },
     ]
 
 
@@ -230,13 +316,109 @@ def _safe_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
         elif isinstance(value, list):
             safe[key] = value[:20]
         elif isinstance(value, dict):
-            safe[key] = {str(k): v for k, v in list(value.items())[:50] if isinstance(v, (str, int, float, bool)) or v is None}
+            safe[key] = {
+                str(k): v
+                for k, v in list(value.items())[:50]
+                if isinstance(v, (str, int, float, bool)) or v is None
+            }
         else:
             safe[key] = repr(value)
     return safe
 
 
-async def run_attempt(candidate: Candidate, params: dict[str, Any], *, start_time: str, end_time: str, min_book_events: int) -> BacktestAttempt:
+def _diagnose_attempt(
+    candidate: Candidate,
+    params: dict[str, Any],
+    result: dict[str, Any] | None,
+    *,
+    start_time: str,
+    end_time: str,
+    min_book_events: int,
+    status: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    fills = _parse_float(result.get("fills") if result else None) if result else None
+    pnl = _parse_float(result.get("pnl") if result else None) if result else None
+    book_events = _parse_float(result.get("book_events") if result else None) if result else None
+    portfolio_stats = result.get("portfolio_stats") if result else None
+    if not isinstance(portfolio_stats, dict):
+        portfolio_stats = {}
+    strategy_order_count = _parse_float(portfolio_stats.get("total_orders"))
+    mid = candidate.scan_mid
+    spread = candidate.scan_spread
+    tail_bucket = (
+        "unknown"
+        if mid is None
+        else "ultra_low_tail"
+        if mid < 0.005
+        else "low_tail"
+        if mid < 0.01
+        else "non_extreme_tail"
+        if mid <= 0.25
+        else "high_probability"
+    )
+    suspected_causes: list[str] = []
+    if status == "skipped_no_coverage" or (
+        book_events is not None and book_events < min_book_events
+    ):
+        suspected_causes.append("coverage_insufficient")
+    if status == "completed" and (fills or 0) == 0:
+        suspected_causes.append("zero_fills_with_coverage")
+        if tail_bucket == "ultra_low_tail":
+            suspected_causes.append("one_tick_relative_cost_too_large")
+        if strategy_order_count == 0:
+            suspected_causes.append("strategy_generated_no_simulated_orders")
+        elif strategy_order_count is not None and strategy_order_count > 0:
+            suspected_causes.append("simulated_orders_not_filled_or_not_crossed")
+        else:
+            suspected_causes.append("order_intent_count_not_instrumented")
+        suspected_causes.append("needs_multi_window_multi_candidate_replay")
+    if error:
+        suspected_causes.append("runner_error")
+    return {
+        "window": {"start_time": start_time, "end_time": end_time},
+        "min_book_events": min_book_events,
+        "scan_mid": mid,
+        "scan_spread": spread,
+        "liquidity": candidate.liquidity,
+        "tail_bucket": tail_bucket,
+        "coverage_book_events": candidate.coverage_book_events,
+        "result_book_events": book_events,
+        "fills": fills,
+        "pnl": pnl,
+        "strategy_order_count": strategy_order_count,
+        "params": params,
+        "suspected_causes": suspected_causes,
+    }
+
+
+def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
+    completed = [a for a in attempts if a.status == "completed"]
+    zero_fill = [a for a in completed if ((a.result or {}).get("fills") in {0, 0.0, None})]
+    causes: dict[str, int] = {}
+    for attempt in attempts:
+        for cause in (attempt.diagnostics or {}).get("suspected_causes", []):
+            causes[cause] = causes.get(cause, 0) + 1
+    return {
+        "completed_attempts": len(completed),
+        "zero_fill_completed_attempts": len(zero_fill),
+        "suspected_cause_counts": causes,
+        "profit_opportunity_demonstrated": any(
+            ((a.result or {}).get("pnl") or 0) > 0 and ((a.result or {}).get("fills") or 0) > 0
+            for a in attempts
+            if a.status == "completed"
+        ),
+    }
+
+
+async def run_attempt(
+    candidate: Candidate,
+    params: dict[str, Any],
+    *,
+    start_time: str,
+    end_time: str,
+    min_book_events: int,
+) -> BacktestAttempt:
     def strategy_factory(instrument_id):  # type: ignore[no-untyped-def]
         return BookMicropriceImbalanceStrategy(
             BookMicropriceImbalanceConfig(
@@ -261,7 +443,9 @@ async def run_attempt(candidate: Candidate, params: dict[str, Any], *, start_tim
     try:
         result = await run_single_market_backtest(
             name="job_b_microprice_batch",
-            data=MarketDataConfig(platform=Polymarket, data_type=Book, vendor=PMXT, sources=DEFAULT_SOURCES),
+            data=MarketDataConfig(
+                platform=Polymarket, data_type=Book, vendor=PMXT, sources=DEFAULT_SOURCES
+            ),
             market_slug=candidate.slug,
             token_index=candidate.token_index,
             start_time=start_time,
@@ -292,6 +476,15 @@ async def run_attempt(candidate: Candidate, params: dict[str, Any], *, start_tim
             status="skipped_no_coverage" if result is None else "completed",
             result=_safe_result(result),
             error=None,
+            diagnostics=_diagnose_attempt(
+                candidate,
+                params,
+                _safe_result(result),
+                start_time=start_time,
+                end_time=end_time,
+                min_book_events=min_book_events,
+                status="skipped_no_coverage" if result is None else "completed",
+            ),
         )
     except Exception as exc:  # bounded research runner: record and continue to next candidate
         return BacktestAttempt(
@@ -303,22 +496,36 @@ async def run_attempt(candidate: Candidate, params: dict[str, Any], *, start_tim
             status="error",
             result=None,
             error=f"{type(exc).__name__}: {exc}",
+            diagnostics=_diagnose_attempt(
+                candidate,
+                params,
+                None,
+                start_time=start_time,
+                end_time=end_time,
+                min_book_events=min_book_events,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
         )
 
 
 async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
-    candidates = load_candidates(args.manifest, strategy=args.strategy, max_candidates=args.max_candidates)
+    candidates = load_candidates(
+        args.manifest, strategy=args.strategy, max_candidates=args.max_candidates
+    )
     selected_params = microprice_param_grid()[: args.max_param_sets]
     attempts: list[BacktestAttempt] = []
     for candidate in candidates:
+        candidate_start_time = candidate.coverage_start_time or args.start_time
+        candidate_end_time = candidate.coverage_end_time or args.end_time
         for params in selected_params:
             attempts.append(
                 await asyncio.wait_for(
                     run_attempt(
                         candidate,
                         params,
-                        start_time=args.start_time,
-                        end_time=args.end_time,
+                        start_time=candidate_start_time,
+                        end_time=candidate_end_time,
                         min_book_events=args.min_book_events,
                     ),
                     timeout=args.per_attempt_timeout_secs,
@@ -344,7 +551,13 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "completed_count": completed,
         "skipped_no_coverage_count": skipped,
         "error_count": errored,
+        "candidate_selection": {
+            "policy": "non_extreme_tail_priority_then_liquidity",
+            "preferred_yes_mid_range": [0.005, 0.25],
+            "ultra_low_tail_retained_but_deprioritized": True,
+        },
         "candidates": [asdict(candidate) for candidate in candidates],
+        "diagnostics": _aggregate_diagnostics(attempts),
         "attempts": [asdict(attempt) for attempt in attempts],
     }
 
@@ -359,7 +572,19 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
             fh,
-            fieldnames=["slug", "token_index", "source_strategy", "status", "params", "pnl", "fills", "quotes", "error"],
+            fieldnames=[
+                "slug",
+                "token_index",
+                "source_strategy",
+                "status",
+                "params",
+                "pnl",
+                "fills",
+                "book_events",
+                "strategy_order_count",
+                "diagnostics",
+                "error",
+            ],
         )
         writer.writeheader()
         for attempt in attempts:
@@ -373,7 +598,11 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
                     "params": json.dumps(attempt.get("params", {}), sort_keys=True),
                     "pnl": result.get("pnl"),
                     "fills": result.get("fills"),
-                    "quotes": result.get("quotes") or result.get("book_events"),
+                    "book_events": result.get("book_events"),
+                    "strategy_order_count": (attempt.get("diagnostics") or {}).get(
+                        "strategy_order_count"
+                    ),
+                    "diagnostics": json.dumps(attempt.get("diagnostics") or {}, sort_keys=True),
                     "error": attempt.get("error"),
                 }
             )
@@ -390,6 +619,7 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- completed: {summary['completed_count']}",
         f"- skipped_no_coverage: {summary['skipped_no_coverage_count']}",
         f"- errors: {summary['error_count']}",
+        f"- diagnostics: {json.dumps(summary.get('diagnostics', {}), sort_keys=True)}",
         "",
         "Safety: backtest/shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.",
         "",
@@ -400,7 +630,13 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
     ]
     for attempt in attempts:
         result = attempt.get("result") or {}
-        detail = attempt.get("error") or f"pnl={result.get('pnl')} fills={result.get('fills')} quotes={result.get('quotes') or result.get('book_events')}"
+        diagnostics = attempt.get("diagnostics") or {}
+        causes = ",".join(diagnostics.get("suspected_causes", []))
+        order_count = diagnostics.get("strategy_order_count")
+        detail = attempt.get("error") or (
+            f"pnl={result.get('pnl')} fills={result.get('fills')} "
+            f"book_events={result.get('book_events')} strategy_orders={order_count} causes={causes}"
+        )
         lines.append(
             f"| {attempt.get('status')} | {attempt.get('slug')} | `{json.dumps(attempt.get('params', {}), sort_keys=True)}` | {detail} |"
         )
@@ -409,7 +645,9 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Job B bounded PMBT microprice batch runner (backtest-only).")
+    parser = argparse.ArgumentParser(
+        description="Job B bounded PMBT microprice batch runner (backtest-only)."
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--strategy", default="microprice_optimizer")
