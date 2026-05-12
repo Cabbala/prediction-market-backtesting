@@ -18,7 +18,7 @@ from contextlib import contextmanager, suppress
 from decimal import Decimal
 from datetime import UTC
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 from urllib.request import Request, urlopen
 
 import msgspec
@@ -67,6 +67,80 @@ class _PMXTPriceChangePayload(msgspec.Struct, frozen=True):
 
 _PMXT_BOOK_SNAPSHOT_DECODER = msgspec.json.Decoder(type=_PMXTBookSnapshotPayload)
 _PMXT_PRICE_CHANGE_DECODER = msgspec.json.Decoder(type=_PMXTPriceChangePayload)
+_PMXT_NANOS_PER_HOUR = 3_600_000_000_000
+_PMXT_SOURCE_DAY_FORMAT = "%Y-%m-%d"
+PMXTWindowSemantics = Literal["half_open", "inclusive"]
+
+
+def _normalize_pmxt_window_timestamp(value: pd.Timestamp | str | None) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(UTC)
+    return ts.tz_convert(UTC)
+
+
+def _normalize_pmxt_window_semantics(semantics: str) -> PMXTWindowSemantics:
+    normalized = semantics.strip().replace("-", "_").casefold()
+    if normalized in {"half_open", "inclusive"}:
+        return normalized  # type: ignore[return-value]
+    raise ValueError("window semantics must be 'half_open' or 'inclusive'")
+
+
+def pmxt_source_days_for_window(
+    start: pd.Timestamp | str | None,
+    end: pd.Timestamp | str | None,
+    *,
+    semantics: str = "half_open",
+) -> tuple[str, ...]:
+    """UTC source-day labels touched by a replay window."""
+    start_ts = _normalize_pmxt_window_timestamp(start)
+    end_ts = _normalize_pmxt_window_timestamp(end)
+    if start_ts is None or end_ts is None:
+        return ()
+
+    normalized_semantics = _normalize_pmxt_window_semantics(semantics)
+    if normalized_semantics == "half_open":
+        if end_ts <= start_ts:
+            return ()
+        effective_end = end_ts - pd.Timedelta(nanoseconds=1)
+    else:
+        if end_ts < start_ts:
+            return ()
+        effective_end = end_ts
+
+    cursor = start_ts.floor("D")
+    final_day = effective_end.floor("D")
+    days: list[str] = []
+    while cursor <= final_day:
+        days.append(cursor.strftime(_PMXT_SOURCE_DAY_FORMAT))
+        cursor += pd.Timedelta(days=1)
+    return tuple(days)
+
+
+def pmxt_archive_hours_for_window(
+    start: pd.Timestamp | str | None,
+    end: pd.Timestamp | str | None,
+) -> tuple[pd.Timestamp, ...]:
+    """UTC PMXT archive hours needed for a replay window.
+
+    PMXT book replay starts one hour before the requested window so the loader
+    can seed book state from an earlier snapshot before applying in-window
+    price changes.
+    """
+    start_ts = _normalize_pmxt_window_timestamp(start)
+    end_ts = _normalize_pmxt_window_timestamp(end)
+    if start_ts is None or end_ts is None or end_ts <= start_ts:
+        return ()
+
+    cursor = start_ts.floor("h") - pd.Timedelta(nanoseconds=_PMXT_NANOS_PER_HOUR)
+    final_hour = end_ts.floor("h")
+    hours: list[pd.Timestamp] = []
+    while cursor <= final_hour:
+        hours.append(cursor)
+        cursor += pd.Timedelta(nanoseconds=_PMXT_NANOS_PER_HOUR)
+    return tuple(hours)
 
 
 class PolymarketPMXTDataLoader(PolymarketDataLoader):
@@ -131,22 +205,11 @@ class PolymarketPMXTDataLoader(PolymarketDataLoader):
 
     @staticmethod
     def _normalize_timestamp(value: pd.Timestamp | str | None) -> pd.Timestamp | None:
-        if value is None:
-            return None
-        ts = pd.Timestamp(value)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(UTC)
-        return ts.tz_convert(UTC)
+        return _normalize_pmxt_window_timestamp(value)
 
     @staticmethod
     def _archive_hours(start: pd.Timestamp, end: pd.Timestamp) -> list[pd.Timestamp]:
-        cursor = start.floor("h") - pd.Timedelta(hours=1)
-        final_hour = end.floor("h")
-        hours: list[pd.Timestamp] = []
-        while cursor <= final_hour:
-            hours.append(cursor)
-            cursor += pd.Timedelta(hours=1)
-        return hours
+        return list(pmxt_archive_hours_for_window(start, end))
 
     @classmethod
     def _archive_filename_for_hour(cls, hour: pd.Timestamp) -> str:

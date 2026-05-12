@@ -13,7 +13,11 @@ from urllib.request import Request, urlopen
 import pyarrow as pa
 import pyarrow.dataset as ds
 
-from prediction_market_extensions.adapters.polymarket.pmxt import PolymarketPMXTDataLoader
+from prediction_market_extensions.adapters.polymarket.pmxt import (
+    PolymarketPMXTDataLoader,
+    pmxt_archive_hours_for_window,
+    pmxt_source_days_for_window,
+)
 from prediction_market_extensions.backtesting.data_sources._common import (
     DISABLED_ENV_VALUES,
     env_value,
@@ -79,6 +83,16 @@ _CURRENT_PMXT_LOADER_CONFIG: ContextVar[PMXTLoaderConfig | None] = ContextVar(
 
 def _current_loader_config() -> PMXTLoaderConfig | None:
     return _CURRENT_PMXT_LOADER_CONFIG.get()
+
+
+def plan_pmxt_archive_hours(start: object, end: object) -> tuple[object, ...]:
+    return pmxt_archive_hours_for_window(start, end)
+
+
+def plan_pmxt_source_days(
+    start: object, end: object, *, semantics: str = "half_open"
+) -> tuple[str, ...]:
+    return pmxt_source_days_for_window(start, end, semantics=semantics)
 
 
 class RunnerPolymarketPMXTDataLoader(PolymarketPMXTDataLoader):

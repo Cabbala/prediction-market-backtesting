@@ -22,6 +22,8 @@ from prediction_market_extensions.backtesting.data_sources.pmxt import (
     PMXT_SOURCE_PRIORITY_ENV,
     RunnerPolymarketPMXTDataLoader,
     configured_pmxt_data_source,
+    plan_pmxt_archive_hours,
+    plan_pmxt_source_days,
 )
 
 
@@ -49,6 +51,64 @@ def _make_loader(
     loader._pmxt_disable_remote_archive = disable_remote_archive
     loader._pmxt_last_load_gap_hours = ()
     return loader
+
+
+def test_pmxt_source_day_planning_uses_half_open_windows_by_default() -> None:
+    assert plan_pmxt_source_days(
+        "2026-04-21T00:00:00Z",
+        "2026-04-28T00:00:00Z",
+    ) == (
+        "2026-04-21",
+        "2026-04-22",
+        "2026-04-23",
+        "2026-04-24",
+        "2026-04-25",
+        "2026-04-26",
+        "2026-04-27",
+    )
+    assert (
+        plan_pmxt_source_days(
+            "2026-04-21T00:00:00Z",
+            "2026-04-28T00:00:00Z",
+            semantics="inclusive",
+        )[-1]
+        == "2026-04-28"
+    )
+    assert (
+        plan_pmxt_source_days(
+            "2026-04-21T00:00:00Z",
+            "2026-04-21T00:00:00Z",
+        )
+        == ()
+    )
+
+
+def test_pmxt_archive_hour_planning_keeps_prior_snapshot_and_boundary_hours() -> None:
+    assert plan_pmxt_archive_hours(
+        "2026-04-21T09:15:00Z",
+        "2026-04-21T10:10:00Z",
+    ) == (
+        pd.Timestamp("2026-04-21T08:00:00Z"),
+        pd.Timestamp("2026-04-21T09:00:00Z"),
+        pd.Timestamp("2026-04-21T10:00:00Z"),
+    )
+    assert plan_pmxt_archive_hours(
+        "2026-04-21T09:00:00Z",
+        "2026-04-21T10:00:00Z",
+    ) == (
+        pd.Timestamp("2026-04-21T08:00:00Z"),
+        pd.Timestamp("2026-04-21T09:00:00Z"),
+        pd.Timestamp("2026-04-21T10:00:00Z"),
+    )
+
+
+def test_runner_loader_archive_hours_use_shared_pmxt_window_plan() -> None:
+    start = pd.Timestamp("2026-04-21T09:15:00Z")
+    end = pd.Timestamp("2026-04-21T10:10:00Z")
+
+    assert RunnerPolymarketPMXTDataLoader._archive_hours(start, end) == list(
+        plan_pmxt_archive_hours(start, end)
+    )
 
 
 def test_configured_pmxt_data_source_sets_raw_local_overrides(monkeypatch, tmp_path):
