@@ -28,6 +28,16 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return f if math.isfinite(f) else default
 
 
+def _as_optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
@@ -46,6 +56,14 @@ def _first_present(candidate: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
+def _first_book_value(book: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = book.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _is_present(value: Any) -> bool:
     return value not in (None, "", [], {}, False)
 
@@ -60,11 +78,19 @@ def _book_from_scan_books(candidate: Mapping[str, Any], side: str) -> Mapping[st
     raw = books[idx]
     return {
         "ok": True,
-        "best_bid": raw.get("best_bid"),
-        "best_ask": raw.get("best_ask"),
-        "best_bid_size": raw.get("best_bid_size", raw.get("bid_size")),
-        "best_ask_size": raw.get("best_ask_size", raw.get("ask_size")),
-        "depth_2c": raw.get("depth_2c"),
+        "best_bid": _first_book_value(raw, "best_bid", "bid"),
+        "best_ask": _first_book_value(raw, "best_ask", "ask"),
+        "best_bid_size": _first_book_value(raw, "best_bid_size", "bid_size"),
+        "best_ask_size": _first_book_value(raw, "best_ask_size", "ask_size"),
+        "depth_2c": _first_book_value(raw, "depth_2c", "depth"),
+        "depth_bid": _first_book_value(
+            raw, "depth_bid", "depth_bid_2c", "depth_bid_5c", "depth_bid_top10"
+        ),
+        "depth_ask": _first_book_value(
+            raw, "depth_ask", "depth_ask_2c", "depth_ask_5c", "depth_ask_top10"
+        ),
+        "depth_bid_top10": raw.get("depth_bid_top10"),
+        "depth_ask_top10": raw.get("depth_ask_top10"),
         "mid": raw.get("mid"),
         "spread": raw.get("spread"),
         "token_id": raw.get("token_id"),
@@ -74,7 +100,19 @@ def _book_from_scan_books(candidate: Mapping[str, Any], side: str) -> Mapping[st
 def _book(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
     value = candidate.get(f"{side}_book")
     if isinstance(value, Mapping):
-        return value
+        return {
+            **value,
+            "best_bid": _first_book_value(value, "best_bid", "bid"),
+            "best_ask": _first_book_value(value, "best_ask", "ask"),
+            "best_bid_size": _first_book_value(value, "best_bid_size", "bid_size"),
+            "best_ask_size": _first_book_value(value, "best_ask_size", "ask_size"),
+            "depth_bid": _first_book_value(
+                value, "depth_bid", "depth_bid_2c", "depth_bid_5c", "depth_bid_top10"
+            ),
+            "depth_ask": _first_book_value(
+                value, "depth_ask", "depth_ask_2c", "depth_ask_5c", "depth_ask_top10"
+            ),
+        }
     from_books = _book_from_scan_books(candidate, side)
     if from_books:
         return from_books
@@ -87,11 +125,19 @@ def _book(candidate: Mapping[str, Any], side: str) -> Mapping[str, Any]:
         "token_id",
         "best_bid",
         "best_ask",
+        "bid",
+        "ask",
         "best_bid_size",
         "best_ask_size",
         "bid_size",
         "ask_size",
         "depth_2c",
+        "depth_bid",
+        "depth_ask",
+        "depth_bid_2c",
+        "depth_ask_2c",
+        "depth_bid_5c",
+        "depth_ask_5c",
         "depth_bid_top10",
         "depth_ask_top10",
         "mid",
@@ -162,18 +208,24 @@ def _spread(candidate: Mapping[str, Any], side: str) -> float:
     spread = _as_float(book.get("spread"), default=-1.0)
     if spread >= 0:
         return spread
-    bid = _as_float(book.get("best_bid"), default=0.0)
-    ask = _as_float(book.get("best_ask"), default=0.0)
+    bid = _as_float(_first_book_value(book, "best_bid", "bid"), default=0.0)
+    ask = _as_float(_first_book_value(book, "best_ask", "ask"), default=0.0)
     return max(0.0, ask - bid) if ask and bid else 0.0
 
 
 def _depth(candidate: Mapping[str, Any], side: str) -> float:
     book = _book(candidate, side)
-    top_depth = _as_float(book.get("best_bid_size", book.get("bid_size"))) + _as_float(
-        book.get("best_ask_size", book.get("ask_size"))
+    top_depth = _as_float(_first_book_value(book, "best_bid_size", "bid_size")) + _as_float(
+        _first_book_value(book, "best_ask_size", "ask_size")
     )
-    top10_depth = _as_float(book.get("depth_bid_top10")) + _as_float(book.get("depth_ask_top10"))
-    return max(top_depth, top10_depth, _as_float(book.get("depth_2c")))
+    bid_depth = _as_float(
+        _first_book_value(book, "depth_bid", "depth_bid_2c", "depth_bid_5c", "depth_bid_top10")
+    )
+    ask_depth = _as_float(
+        _first_book_value(book, "depth_ask", "depth_ask_2c", "depth_ask_5c", "depth_ask_top10")
+    )
+    paired_depth = bid_depth + ask_depth
+    return max(top_depth, paired_depth, _as_float(book.get("depth_2c")))
 
 
 def _mid(candidate: Mapping[str, Any], side: str) -> float | None:
@@ -181,7 +233,7 @@ def _mid(candidate: Mapping[str, Any], side: str) -> float | None:
     mid = _as_float(book.get("mid"), default=-1.0)
     if mid >= 0:
         return mid
-    prices = candidate.get("outcomePrices")
+    prices = candidate.get("outcomePrices") or candidate.get("outcome_prices")
     idx = 0 if side == "yes" else 1
     if isinstance(prices, Sequence) and not isinstance(prices, (str, bytes)) and len(prices) > idx:
         parsed = _as_float(prices[idx], default=-1.0)
@@ -329,6 +381,91 @@ def _book_token_ids_match(candidate: Mapping[str, Any], clob_token_ids: Sequence
     return [str(yes_token), str(no_token)] == [str(clob_token_ids[0]), str(clob_token_ids[1])]
 
 
+def _canonical_book_side(
+    candidate: Mapping[str, Any], side: str, token_id: str | None
+) -> dict[str, Any]:
+    book = _book(candidate, side)
+    best_bid = _as_optional_float(_first_book_value(book, "best_bid", "bid"))
+    best_ask = _as_optional_float(_first_book_value(book, "best_ask", "ask"))
+    best_bid_size = _as_optional_float(_first_book_value(book, "best_bid_size", "bid_size"))
+    best_ask_size = _as_optional_float(_first_book_value(book, "best_ask_size", "ask_size"))
+    depth_bid = _as_optional_float(
+        _first_book_value(book, "depth_bid", "depth_bid_2c", "depth_bid_5c", "depth_bid_top10")
+    )
+    depth_ask = _as_optional_float(
+        _first_book_value(book, "depth_ask", "depth_ask_2c", "depth_ask_5c", "depth_ask_top10")
+    )
+    depth_2c = _as_optional_float(book.get("depth_2c"))
+    top_depth = (best_bid_size or 0.0) + (best_ask_size or 0.0)
+    paired_depth = (depth_bid or 0.0) + (depth_ask or 0.0)
+    depth_proxy = max(top_depth, paired_depth, depth_2c or 0.0)
+    mid = _as_optional_float(book.get("mid"))
+    if mid is None and best_bid is not None and best_ask is not None:
+        mid = (best_bid + best_ask) / 2.0
+    spread = _as_optional_float(book.get("spread"))
+    if spread is None and best_bid is not None and best_ask is not None:
+        spread = max(0.0, best_ask - best_bid)
+    resolved_token = (
+        str(token_id)
+        if token_id not in (None, "")
+        else str(book.get("token_id") or candidate.get(f"{side}_token_id") or "") or None
+    )
+    return {
+        "side": side,
+        "token_id": resolved_token,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "best_bid_size": best_bid_size,
+        "best_ask_size": best_ask_size,
+        "depth_bid": depth_bid,
+        "depth_ask": depth_ask,
+        "depth_2c": depth_2c,
+        "depth_proxy": depth_proxy if depth_proxy > 0 else None,
+        "mid": mid,
+        "spread": spread,
+        "present": bool(book),
+    }
+
+
+def _book_provenance(
+    candidate: Mapping[str, Any],
+    clob_token_ids: Sequence[str],
+    *,
+    source_artifact_path: str | None,
+    source_timestamp_utc: Any,
+) -> dict[str, Any]:
+    yes_token = str(clob_token_ids[0]) if len(clob_token_ids) == 2 else None
+    no_token = str(clob_token_ids[1]) if len(clob_token_ids) == 2 else None
+    sides = {
+        "yes": _canonical_book_side(candidate, "yes", yes_token),
+        "no": _canonical_book_side(candidate, "no", no_token),
+    }
+    fail_closed_reasons: list[str] = []
+    for side, side_book in sides.items():
+        for field in ("token_id", "best_bid", "best_ask"):
+            if side_book.get(field) in (None, ""):
+                fail_closed_reasons.append(f"missing_{side}_{field}")
+    if (
+        candidate.get("complete_books") is False
+        or candidate.get("complete_yes_no_clob_books") is False
+    ):
+        fail_closed_reasons.append("source_marked_incomplete_yes_no_clob_books")
+    if len(clob_token_ids) != 2:
+        fail_closed_reasons.append("missing_canonical_yes_no_clob_token_ids")
+    elif not _book_token_ids_match(candidate, clob_token_ids):
+        fail_closed_reasons.append("book_token_ids_do_not_match_yes_no_mapping")
+    fail_closed_reasons = sorted(set(fail_closed_reasons))
+    complete = not fail_closed_reasons
+    return {
+        "status": "complete" if complete else "incomplete_fail_closed",
+        "complete": complete,
+        "source_artifact_path": source_artifact_path,
+        "source_timestamp_utc": source_timestamp_utc,
+        "fail_closed_reasons": fail_closed_reasons,
+        "sides": sides,
+    }
+
+
 @dataclass(frozen=True)
 class RewardScoreRules:
     """Public-data proxy scoring rules for reward/backtest market selection.
@@ -440,7 +577,7 @@ def score_candidate(
     )
 
     complete_books = (
-        bool(candidate.get("complete_books", True))
+        bool(candidate.get("complete_books", candidate.get("complete_yes_no_clob_books", True)))
         and _has_book_prices(candidate, "yes")
         and _has_book_prices(candidate, "no")
     )
@@ -511,7 +648,11 @@ def _scan_timestamp(metadata: Mapping[str, Any]) -> Any:
 
 
 def build_reward_manifest(
-    scan: Mapping[str, Any], *, limit: int = 25, rules: RewardScoreRules | None = None
+    scan: Mapping[str, Any],
+    *,
+    limit: int = 25,
+    rules: RewardScoreRules | None = None,
+    source_artifact_path: str | None = None,
 ) -> dict[str, Any]:
     rules = rules or RewardScoreRules()
     metadata = scan.get("metadata") if isinstance(scan.get("metadata"), Mapping) else {}
@@ -522,6 +663,15 @@ def build_reward_manifest(
             continue
         score = score_candidate(candidate, generated_at=generated_at, rules=rules)
         clob_token_ids = _clob_token_ids(candidate)
+        provenance = _book_provenance(
+            candidate,
+            clob_token_ids,
+            source_artifact_path=(
+                source_artifact_path
+                or _first_present(candidate, "source_path", "source_artifact", "source_scan")
+            ),
+            source_timestamp_utc=_scan_timestamp(metadata),
+        )
         scored.append(
             {
                 "market_id": str(_first_present(candidate, "market_id", "id") or ""),
@@ -533,6 +683,9 @@ def build_reward_manifest(
                 "no_token_id": clob_token_ids[1] if len(clob_token_ids) == 2 else None,
                 "outcomes": _outcomes(candidate),
                 "reward_evidence": _reward_evidence(candidate),
+                "book_provenance": provenance,
+                "yes_book": provenance["sides"]["yes"],
+                "no_book": provenance["sides"]["no"],
                 "source_candidate_score": _first_present(candidate, "candidate_score", "score"),
                 "source_url": _first_present(candidate, "url", "source_market_url"),
                 **score,

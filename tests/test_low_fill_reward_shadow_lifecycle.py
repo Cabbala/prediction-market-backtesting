@@ -146,6 +146,9 @@ def test_build_report_scores_lifecycle_without_live_actions(tmp_path) -> None:
     assert row["double_sided_required"] is True
     assert row["time_in_band_secs"] == 2
     assert row["would_have_filled_status"] == "unknown_requires_trade_tape_or_l2_queue_position"
+    assert row["would_have_filled_probability"] is None
+    assert row["reward_ev_status"] == "not_computable_missing_inputs"
+    assert "would_have_filled_probability" in row["missing_reward_ev_inputs"]
     assert row["expected_reward_ev_minus_expected_loss_classification"] == (
         "unknown_missing_reward_amount_or_fill_loss_distribution"
     )
@@ -153,6 +156,36 @@ def test_build_report_scores_lifecycle_without_live_actions(tmp_path) -> None:
     assert first_snapshot["scoring_eligible_estimate"] is True
     assert first_snapshot["would_have_filled_estimate"]["known"] is False
     assert first_snapshot["safety"]["orders_submitted"] is False
+
+
+def test_build_report_marks_reward_ev_computable_only_with_would_fill_evidence(tmp_path) -> None:
+    source = tmp_path / "source.json"
+    row = _candidate()
+    row["yes_book"] = {
+        "bid": 0.005,
+        "ask": 0.004,
+        "bid_size": 10_000,
+        "ask_size": 5_000,
+        "depth_bid_2c": 20_000,
+        "depth_ask_2c": 10_000,
+    }
+    source.write_text(json.dumps({"candidates": [row]}), encoding="utf-8")
+
+    report = build_report(
+        source,
+        duration_secs=0,
+        interval_secs=1,
+        max_candidates=1,
+        sleep=False,
+    )
+    candidate = report["candidate_table"][0]
+
+    assert candidate["would_have_filled_status"] == "known"
+    assert candidate["would_have_filled_probability"] == 1.0
+    assert candidate["reward_ev_status"] == "computable_shadow_proxy_not_profit_claim"
+    assert candidate["expected_reward_ev_minus_loss"] is not None
+    assert candidate["missing_reward_ev_inputs"] == []
+    assert report["summary"]["reward_ev_computable_count"] == 1
 
 
 def test_missing_book_fails_closed_as_blocked_unknown(tmp_path) -> None:

@@ -9,6 +9,7 @@ from scripts.low_fill_reward_shadow_observation import (
     AGGREGATION_MODE,
     _observation,
     build_aggregation_report,
+    build_report,
     write_outputs,
 )
 
@@ -27,6 +28,11 @@ def test_nested_reward_evidence_sets_time_in_band_and_safety_flags() -> None:
     assert obs["reward_max_spread"] == 2.5
     assert obs["time_in_band_observed"] is True
     assert obs["would_have_filled"] == "unknown_requires_l2_or_shadow_quote_log"
+    assert obs["would_have_filled_status"] == "unknown_requires_l2_or_shadow_quote_log"
+    assert obs["would_have_filled_probability"] is None
+    assert obs["reward_ev_status"] == "not_computable_missing_inputs"
+    assert obs["expected_reward_ev_minus_loss"] is None
+    assert "would_have_filled_probability" in obs["missing_reward_ev_inputs"]
     assert obs["accidental_fill_risk"] == "normal_requires_l2_fill_model"
     assert obs["exit_risk"] == "liquidity_proxy_ok_needs_l2"
     assert obs["orders_submitted"] is False
@@ -141,6 +147,9 @@ def test_multi_snapshot_aggregation_accepts_current_observation_artifacts(tmp_pa
         "basis": "discrete_shadow_snapshots_not_continuous_l2_replay",
     }
     assert row["would_have_filled"]["status"] == "unknown_no_l2_or_shadow_quote_fill_log"
+    assert row["would_have_filled_status"] == "unknown_no_l2_or_shadow_quote_fill_log"
+    assert row["would_have_filled_probability"] is None
+    assert row["reward_ev_status"] == "not_computable_missing_inputs"
     assert row["accidental_fill_risk"]["status"] == "measured_from_shadow_snapshots"
     assert row["exit_risk"]["status"] == "measured_from_shadow_snapshots"
     assert row["orders_submitted"] is False
@@ -227,3 +236,122 @@ def test_aggregation_markdown_writes_explicit_safety_fields(tmp_path: Path) -> N
     assert "- credentials_required=false" in md
     assert "- live_trading_worker_started=false" in md
     assert "No reward or profit claim" in md
+
+
+def test_aggregation_uses_shadow_evidence_for_fill_probability_and_reward_ev(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "low_fill_reward_shadow_observation_1.json"
+    _write_snapshot(
+        snapshot,
+        generated_at="2026-05-11T00:00:00Z",
+        observations=[
+            {
+                "slug": "reward-market",
+                "time_in_band_observed": True,
+                "spread": 0.001,
+                "yes_mid": 0.02,
+                "reward_max_spread": 0.002,
+                "reward_evidence": {"umaReward": "5"},
+                "has_reward_evidence": True,
+                "would_have_filled": "unknown_requires_l2_or_shadow_quote_log",
+                "accidental_fill_risk": "normal_requires_l2_fill_model",
+                "exit_risk": "liquidity_proxy_ok_needs_l2",
+            }
+        ],
+    )
+    evidence = tmp_path / "shadow_evidence.jsonl"
+    evidence.write_text(
+        json.dumps(
+            {
+                "slug": "reward-market",
+                "generated_at_utc": "2026-05-11T00:00:30Z",
+                "reward_evidence": {"umaReward": "5"},
+                "shadow_quote": {"would_have_filled": True},
+                "exit_loss_proxy": {"expected_exit_loss_proxy": 0.25},
+                "safety": {
+                    "live_trading": False,
+                    "orders_submitted": False,
+                    "orders_signed": False,
+                    "orders_cancelled": False,
+                    "credentials_required": False,
+                    "worker_trading_started": False,
+                    "live_trading_worker_started": False,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = build_aggregation_report([snapshot], limit=10, evidence_paths=[evidence])
+    row = report["observations"][0]
+
+    assert report["summary"]["evidence_file_count"] == 1
+    assert row["would_have_filled_status"] == "measured_from_shadow_quote_log"
+    assert row["would_have_filled_probability"] == 1.0
+    assert row["reward_ev_status"] == "computable_shadow_proxy_not_profit_claim"
+    assert row["expected_reward_ev_minus_loss"] == 4.75
+    assert row["missing_reward_ev_inputs"] == []
+    assert any(source["path"] == str(evidence) for source in row["evidence_sources"])
+
+
+def test_manifest_observation_reads_book_provenance_and_keeps_ev_unknown(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "safety": {
+                    "live_trading": False,
+                    "orders_submitted": False,
+                    "orders_signed": False,
+                    "orders_cancelled": False,
+                    "credentials_required": False,
+                    "live_trading_worker_started": False,
+                },
+                "candidates": [
+                    {
+                        "slug": "reward-market",
+                        "question": "Reward?",
+                        "liquidity": 10_000,
+                        "reward_evidence": {"rewardsMaxSpread": 0.002, "umaReward": "5"},
+                        "book_provenance": {
+                            "complete": True,
+                            "status": "complete",
+                            "source_artifact_path": "scan.json",
+                            "source_timestamp_utc": "2026-05-12T00:00:00Z",
+                            "fail_closed_reasons": [],
+                            "sides": {
+                                "yes": {
+                                    "side": "yes",
+                                    "token_id": "yes",
+                                    "mid": 0.02,
+                                    "spread": 0.001,
+                                    "best_bid": 0.0195,
+                                    "best_ask": 0.0205,
+                                },
+                                "no": {
+                                    "side": "no",
+                                    "token_id": "no",
+                                    "mid": 0.98,
+                                    "spread": 0.001,
+                                    "best_bid": 0.9795,
+                                    "best_ask": 0.9805,
+                                },
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_report(manifest, limit=1)
+    row = report["observations"][0]
+
+    assert row["yes_mid"] == 0.02
+    assert row["spread"] == 0.001
+    assert row["evidence_sources"][0]["type"] == "book_provenance"
+    assert row["reward_ev_status"] == "not_computable_missing_inputs"
+    assert "would_have_filled_probability" in row["missing_reward_ev_inputs"]

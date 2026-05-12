@@ -502,6 +502,71 @@ def _risk_label(score: float | None) -> str:
     return "low"
 
 
+def _candidate_evidence_sources(candidate: Candidate) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    if candidate.source_path:
+        sources.append({"type": "source_manifest", "path": candidate.source_path})
+    if _has_book_snapshot(candidate):
+        sources.append(
+            {
+                "type": "top_of_book_snapshot",
+                "path": candidate.source_path,
+                "status": "complete",
+                "yes_token_id": candidate.yes_token_id,
+                "no_token_id": candidate.no_token_id,
+            }
+        )
+    else:
+        sources.append(
+            {
+                "type": "top_of_book_snapshot",
+                "path": candidate.source_path,
+                "status": "incomplete_fail_closed",
+                "fail_closed_reasons": [
+                    blocker
+                    for blocker in candidate.source_blockers
+                    if "book" in blocker or "token" in blocker
+                ],
+            }
+        )
+    if candidate.reward_min_size is not None or candidate.reward_max_spread_raw is not None:
+        sources.append({"type": "reward_terms", "path": candidate.source_path})
+    return sources
+
+
+def _reward_value(candidate: Candidate) -> float | None:
+    return _parse_float(candidate.reward_value_raw)
+
+
+def _reward_ev_fields(
+    candidate: Candidate,
+    *,
+    would_have_filled_probability: float | None,
+    exit_loss_proxy: float | None,
+) -> dict[str, Any]:
+    reward_value = _reward_value(candidate)
+    missing: list[str] = []
+    if would_have_filled_probability is None:
+        missing.append("would_have_filled_probability")
+    if reward_value is None:
+        missing.append("reward_amount")
+    if exit_loss_proxy is None:
+        missing.append("exit_loss_proxy")
+    if missing:
+        return {
+            "reward_ev_status": "not_computable_missing_inputs",
+            "expected_reward_ev_minus_loss": None,
+            "missing_reward_ev_inputs": missing,
+        }
+    return {
+        "reward_ev_status": "computable_shadow_proxy_not_profit_claim",
+        "expected_reward_ev_minus_loss": _round(
+            would_have_filled_probability * reward_value - exit_loss_proxy
+        ),
+        "missing_reward_ev_inputs": [],
+    }
+
+
 def build_quote(
     candidate: Candidate,
     side: str,
@@ -616,6 +681,7 @@ def build_quote(
         "required_size_met": required_size_met,
         "hypothetical_quote_touch_cross_status": touch_cross_status,
         "would_have_filled_estimate": would_have_filled,
+        "would_have_filled_probability": 1.0 if known_fill else None,
         "cancel_or_reprice_reason": cancel_or_reprice_reason,
         "scoring_eligible_estimate": scoring_eligible,
         "reward_score_proxy": _round(reward_score_proxy),
@@ -665,10 +731,12 @@ def evaluate_snapshot(
         (float(quote["adverse_selection_risk_proxy"]["score"] or 0.0) for quote in quotes),
         default=0.0,
     )
-    max_exit_slippage = max(
-        (float(quote["exit_slippage_proxy"]["half_spread_over_mid"] or 0.0) for quote in quotes),
-        default=0.0,
-    )
+    exit_slippage_values = [
+        float(quote["exit_slippage_proxy"]["half_spread_over_mid"])
+        for quote in quotes
+        if quote["exit_slippage_proxy"]["half_spread_over_mid"] is not None
+    ]
+    max_exit_slippage = max(exit_slippage_values) if exit_slippage_values else None
     return {
         "snapshot_index": snapshot_index,
         "snapshot_at_utc": snapshot_at_utc,
@@ -676,6 +744,7 @@ def evaluate_snapshot(
         "question": candidate.question,
         "condition_id": candidate.condition_id,
         "source_url": candidate.source_url,
+        "evidence_sources": _candidate_evidence_sources(candidate),
         "snapshot_source": "source_manifest_top_of_book_snapshot",
         "trade_snapshot_status": "not_available_in_source_artifact",
         "double_sided_required": double_sided_required,
@@ -694,6 +763,7 @@ def evaluate_snapshot(
                 "current_book_cross" if fill_known else "requires_trade_tape_or_l2_queue_position"
             ),
         },
+        "would_have_filled_probability": 1.0 if fill_known and fill_estimate else None,
         "cancel_or_reprice_reason": cancel_reason,
         "time_in_band_contribution_secs": _round(snapshot_weight_secs if scoring_eligible else 0.0),
         "reward_score_proxy": _round(reward_score_proxy),
@@ -795,15 +865,22 @@ def aggregate_candidates(
             ),
             default=0.0,
         )
-        max_exit = max(
-            (
-                float(
-                    _as_mapping(snapshot.get("exit_slippage_proxy")).get("half_spread_over_mid")
-                    or 0.0
-                )
-                for snapshot in candidate_snapshots
-            ),
-            default=0.0,
+        exit_loss_values = [
+            float(_as_mapping(snapshot.get("exit_slippage_proxy")).get("half_spread_over_mid"))
+            for snapshot in candidate_snapshots
+            if _as_mapping(snapshot.get("exit_slippage_proxy")).get("half_spread_over_mid")
+            is not None
+        ]
+        max_exit = max(exit_loss_values) if exit_loss_values else None
+        would_have_filled_probability = (
+            _round(_safe_div(float(estimated_fill_count), float(known_fill_count)))
+            if known_fill_count
+            else None
+        )
+        ev_fields = _reward_ev_fields(
+            candidate,
+            would_have_filled_probability=would_have_filled_probability,
+            exit_loss_proxy=max_exit,
         )
         raw.append(
             {
@@ -811,6 +888,7 @@ def aggregate_candidates(
                 "question": candidate.question,
                 "condition_id": candidate.condition_id,
                 "source_url": candidate.source_url,
+                "evidence_sources": _candidate_evidence_sources(candidate),
                 "yes_mid": _round(candidate.yes_mid),
                 "no_mid": _round(candidate.no_mid),
                 "reward_min_size": _round(candidate.reward_min_size),
@@ -828,6 +906,7 @@ def aggregate_candidates(
                     if known_fill_count
                     else "unknown_requires_trade_tape_or_l2_queue_position"
                 ),
+                "would_have_filled_probability": would_have_filled_probability,
                 "adverse_selection_risk": {
                     "score": _round(max_adverse),
                     "label": _risk_label(max_adverse),
@@ -837,9 +916,21 @@ def aggregate_candidates(
                     "label": _risk_label(max_exit),
                 },
                 "reward_score_proxy": _round(reward_score_proxy),
+                "exit_loss_proxy": {
+                    "status": (
+                        "proxy_from_shadow_lifecycle"
+                        if max_exit is not None
+                        else "unknown_missing_exit_proxy"
+                    ),
+                    "expected_exit_loss_proxy": _round(max_exit),
+                    "basis": "worst_observed_half_spread_over_mid_proxy",
+                },
                 "expected_reward_ev_minus_expected_loss_classification": (
-                    "unknown_missing_reward_amount_or_fill_loss_distribution"
+                    "computable_shadow_proxy_not_profit_claim"
+                    if ev_fields["reward_ev_status"] == "computable_shadow_proxy_not_profit_claim"
+                    else "unknown_missing_reward_amount_or_fill_loss_distribution"
                 ),
+                **ev_fields,
                 "source_blockers": list(candidate.source_blockers),
                 "safety": safety_object(),
             }
@@ -917,6 +1008,11 @@ def build_report(
             ),
             "would_have_filled_known_count": known_fill_count,
             "would_have_filled_unknown_count": max(0, len(candidate_table) - known_fill_count),
+            "reward_ev_computable_count": sum(
+                1
+                for row in candidate_table
+                if row["reward_ev_status"] == "computable_shadow_proxy_not_profit_claim"
+            ),
             "expected_reward_ev_minus_expected_loss": (
                 "unknown_missing_reward_amount_or_fill_loss_distribution"
             ),
@@ -945,6 +1041,7 @@ def _csv_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "time_in_band_secs": candidate.get("time_in_band_secs"),
                 "time_in_band_ratio": candidate.get("time_in_band_ratio"),
                 "would_have_filled_status": candidate.get("would_have_filled_status"),
+                "would_have_filled_probability": candidate.get("would_have_filled_probability"),
                 "reward_score_proxy": candidate.get("reward_score_proxy"),
                 "estimated_reward_score_share_proxy": candidate.get(
                     "estimated_reward_score_share_proxy"
@@ -957,6 +1054,11 @@ def _csv_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "expected_reward_ev_minus_expected_loss_classification": candidate.get(
                     "expected_reward_ev_minus_expected_loss_classification"
+                ),
+                "reward_ev_status": candidate.get("reward_ev_status"),
+                "expected_reward_ev_minus_loss": candidate.get("expected_reward_ev_minus_loss"),
+                "missing_reward_ev_inputs": json.dumps(
+                    candidate.get("missing_reward_ev_inputs") or []
                 ),
                 "orders_submitted": False,
                 "orders_signed": False,
@@ -1002,8 +1104,8 @@ def _markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "## Candidate Table",
         "",
-        "| slug | yes_mid | double_sided | eligible_snapshots | time_in_band_secs | fill_status | reward_share_proxy | adverse_risk | exit_slippage |",
-        "|---|---:|---|---:|---:|---|---:|---|---|",
+        "| slug | yes_mid | double_sided | eligible_snapshots | time_in_band_secs | fill_status | reward_ev_status | reward_share_proxy | adverse_risk | exit_slippage |",
+        "|---|---:|---|---:|---:|---|---|---:|---|---|",
     ]
     for row in _as_list(report.get("candidate_table")):
         if not isinstance(row, Mapping):
@@ -1018,6 +1120,7 @@ def _markdown_report(report: Mapping[str, Any]) -> str:
             f"{row.get('scoring_eligible_snapshot_count')} | "
             f"{row.get('time_in_band_secs')} | "
             f"{row.get('would_have_filled_status')} | "
+            f"{row.get('reward_ev_status')} | "
             f"{row.get('estimated_reward_score_share_proxy')} | "
             f"{adverse.get('label')} | "
             f"{exit_slippage.get('label')} |"

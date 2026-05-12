@@ -378,6 +378,54 @@ def test_latest_scan_shape_uses_liquidity_num_top10_depth_and_reward_evidence() 
     assert row["reward_evidence"] == {"rewardsMinSize": "100", "rewardsMaxSpread": "3.0"}
 
 
+def test_current_scan_bid_ask_books_emit_complete_book_provenance() -> None:
+    candidate = _candidate(
+        liquidity=None,
+        liquidityNum=250_000,
+        volume=None,
+        volumeNum=125_000,
+        complete_yes_no_clob_books=True,
+        reward_evidence={"rewardsMinSize": "100", "rewardsMaxSpread": "3.0"},
+        yes_book={
+            "token_id": "yes",
+            "bid": 0.003,
+            "ask": 0.004,
+            "bid_size": 3_000_000,
+            "ask_size": 2_000_000,
+            "mid": 0.0035,
+            "spread": 0.001,
+            "present": True,
+        },
+        no_book={
+            "token_id": "no",
+            "bid": 0.996,
+            "ask": 0.997,
+            "bid_size": 2_000_000,
+            "ask_size": 3_000_000,
+            "mid": 0.9965,
+            "spread": 0.001,
+            "present": True,
+        },
+    )
+
+    manifest = build_reward_manifest(
+        {"metadata": {"utc_timestamp": "2026-05-12T06:02:46Z"}, "candidates": [candidate]},
+        limit=1,
+        source_artifact_path="/tmp/current-scan.json",
+    )
+    row = manifest["candidates"][0]
+
+    assert row["eligible_for_backtest_queue"] is True
+    assert row["blockers"] == []
+    assert row["book_provenance"]["complete"] is True
+    assert row["book_provenance"]["source_artifact_path"] == "/tmp/current-scan.json"
+    assert row["book_provenance"]["source_timestamp_utc"] == "2026-05-12T06:02:46Z"
+    assert row["book_provenance"]["sides"]["yes"]["side"] == "yes"
+    assert row["book_provenance"]["sides"]["yes"]["best_bid"] == 0.003
+    assert row["book_provenance"]["sides"]["yes"]["best_ask"] == 0.004
+    assert row["book_provenance"]["sides"]["yes"]["depth_proxy"] == 5_000_000
+
+
 def test_flat_top_of_book_fields_are_supported_without_fabricating_books() -> None:
     candidate = {
         "id": "flat-1",
@@ -447,6 +495,9 @@ def test_compact_scalar_books_keep_side_token_candidate_but_fail_closed_on_missi
     assert row["reward_evidence"] == {"rewardsMinSize": "100", "rewardsMaxSpread": "2.5"}
     assert row["eligible_for_backtest_queue"] is False
     assert "missing_complete_yes_no_clob_books" in row["blockers"]
+    assert row["book_provenance"]["complete"] is False
+    assert "missing_yes_best_bid" in row["book_provenance"]["fail_closed_reasons"]
+    assert "missing_no_best_ask" in row["book_provenance"]["fail_closed_reasons"]
 
 
 def test_flat_side_token_fields_provide_explicit_yes_no_mapping() -> None:

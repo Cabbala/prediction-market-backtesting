@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from prediction_market_extensions.adapters.polymarket.reward_market_scanner import (
+from prediction_market_extensions.adapters.polymarket.reward_market_scanner import (  # noqa: E402
     build_reward_manifest,
     load_scan,
     write_manifest,
@@ -66,7 +66,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     scan_path = args.input or latest_scan()
     report_path = args.strategy_report or latest_report()
-    manifest = build_reward_manifest(load_scan(scan_path), limit=args.limit)
+    manifest = build_reward_manifest(
+        load_scan(scan_path), limit=args.limit, source_artifact_path=str(scan_path)
+    )
     manifest["input_scan_path"] = str(scan_path)
     manifest["input_strategy_report_path"] = str(report_path) if report_path else None
     manifest["source_paths"] = {
