@@ -187,6 +187,66 @@ def test_load_candidates_preserves_manifest_recommended_windows(tmp_path):
     ]
 
 
+def test_load_candidates_preserves_manifest_recommended_pmxt_windows(tmp_path):
+    manifest = tmp_path / "microprice_pmxt_handoff.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "window": {
+                    "start_time": "2026-05-11T23:04:20Z",
+                    "end_time": "2026-05-12T00:04:20Z",
+                    "label": "last_1h_minus_30m",
+                },
+                "min_book_events": 200,
+                "coverage_first_guidance": {
+                    "recommended_pmxt_windows": [
+                        {
+                            "start_time": "2026-05-11T23:04:20Z",
+                            "end_time": "2026-05-12T00:04:20Z",
+                            "label": "last_1h_minus_30m",
+                        },
+                        {
+                            "start_time": "2026-05-11T21:04:20Z",
+                            "end_time": "2026-05-12T00:04:20Z",
+                            "label": "last_3h_minus_30m",
+                        },
+                    ]
+                },
+                "candidates": [
+                    {
+                        "slug": "candidate-a",
+                        "source_strategy": "Microprice",
+                        "yes_mid": 0.02,
+                        "yes_spread": 0.001,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    candidates = load_candidates(manifest, strategy="microprice_optimizer", max_candidates=1)
+
+    assert [
+        (window.start_time, window.end_time, window.min_book_events, window.source)
+        for window in candidates[0].replay_windows
+    ] == [
+        (
+            "2026-05-11T23:04:20Z",
+            "2026-05-12T00:04:20Z",
+            200,
+            "last_1h_minus_30m",
+        ),
+        (
+            "2026-05-11T21:04:20Z",
+            "2026-05-12T00:04:20Z",
+            200,
+            "last_3h_minus_30m",
+        ),
+    ]
+
+
 def test_load_candidates_accepts_market_scan_strategy_tags_and_compact_scalar_books(tmp_path):
     manifest = tmp_path / "market_scan.json"
     manifest.write_text(

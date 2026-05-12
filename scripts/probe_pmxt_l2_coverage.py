@@ -7,8 +7,9 @@ import json
 import math
 import warnings
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
+from glob import glob
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,14 @@ from scripts.job_b_microprice_batch import (  # noqa: E402
 DEFAULT_OUTPUT_DIR = Path("/opt/polymarket-lab/reports/backtests/pmxt-coverage")
 DEFAULT_PASS_MANIFEST_DIR = Path("/opt/polymarket-lab/autoresearch/backtests")
 DEFAULT_SOURCES = JOB_B_DEFAULT_SOURCES
+REQUIRED_SAFETY_FIELDS = (
+    "orders_submitted",
+    "orders_signed",
+    "orders_cancelled",
+    "credentials_required",
+    "live_trading_worker_started",
+    "worker_trading_started",
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,24 @@ class CoverageProbeResult:
     candidate: dict[str, Any] | None = None
     window_start_time: str | None = None
     window_end_time: str | None = None
+    diagnostic_category: str = "unknown"
+    selection_phase: str = "primary_exact"
+    source_manifest: str | None = None
+    manifest_rank: int | None = None
+    window_source: str | None = None
+    window_provenance: str | None = None
+
+
+@dataclass(frozen=True)
+class ProbeTarget:
+    candidate: Candidate
+    start_time: str
+    end_time: str
+    min_book_events: int
+    source_manifest: str
+    selection_phase: str
+    window_source: str | None = None
+    window_provenance: str | None = None
 
 
 def _utc_now() -> datetime:
@@ -84,6 +111,81 @@ def _finite_prices(prices: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(float(price) for price in prices if math.isfinite(float(price)))
 
 
+def _safety_fields(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    safety = {
+        "live_trading": False,
+        "strategy_execution": False,
+        **{field: False for field in REQUIRED_SAFETY_FIELDS},
+    }
+    if extra:
+        safety.update(extra)
+        for field in REQUIRED_SAFETY_FIELDS:
+            safety[field] = False
+    return safety
+
+
+def _looks_like_pmxt_raw_download_failure(message: str | None) -> bool:
+    if not message:
+        return False
+    text = message.lower()
+    source_hint = any(
+        hint in text
+        for hint in (
+            "pmxt",
+            "r2.pmxt",
+            "r2v2.pmxt",
+            "archive.pmxt",
+            "parquet",
+            "raw",
+        )
+    )
+    failure_hint = any(
+        hint in text
+        for hint in (
+            "download",
+            "http",
+            "urlopen",
+            "connection",
+            "connectionreset",
+            "connection refused",
+            "temporary failure",
+            "timed out",
+            "timeout",
+            "403",
+            "404",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+    )
+    return source_hint and failure_hint
+
+
+def _diagnostic_category(
+    *,
+    status: str,
+    book_events: int,
+    min_book_events: int,
+    message: str | None,
+    gap_hours_missing: int,
+) -> str:
+    if status == "pass":
+        return "successful_pass_count"
+    if _looks_like_pmxt_raw_download_failure(message):
+        return "pmxt_raw_download_failure"
+    if gap_hours_missing:
+        return "pmxt_missing_hour_gap"
+    if status == "no_coverage" and book_events <= 0:
+        return "no_pmxt_l2_book_data"
+    if status == "no_coverage" and book_events < min_book_events:
+        return "min_book_events_not_met"
+    if status == "error":
+        return "probe_error"
+    return "unknown"
+
+
 def _candidate_payload(candidate: Candidate) -> dict[str, Any]:
     return {
         "slug": candidate.slug,
@@ -96,6 +198,7 @@ def _candidate_payload(candidate: Candidate) -> dict[str, Any]:
         "scan_imbalance5": candidate.scan_imbalance5,
         "liquidity": candidate.liquidity,
         "source_strategy": candidate.source_strategy,
+        "manifest_rank": candidate.manifest_rank,
     }
 
 
@@ -129,10 +232,22 @@ def _result_from_candidate(
     gap_warning: str | None = None,
     window_start_time: str | None = None,
     window_end_time: str | None = None,
+    diagnostic_category: str | None = None,
+    selection_phase: str = "primary_exact",
+    source_manifest: str | None = None,
+    window_source: str | None = None,
+    window_provenance: str | None = None,
 ) -> CoverageProbeResult:
     finite_prices = _finite_prices(prices)
     price_min = min(finite_prices) if finite_prices else None
     price_max = max(finite_prices) if finite_prices else None
+    category = diagnostic_category or _diagnostic_category(
+        status=status,
+        book_events=int(book_events),
+        min_book_events=int(min_book_events),
+        message=message,
+        gap_hours_missing=int(gap_hours_missing),
+    )
     return CoverageProbeResult(
         slug=candidate.slug,
         market_slug=candidate.slug,
@@ -156,6 +271,12 @@ def _result_from_candidate(
         candidate=_candidate_payload(candidate),
         window_start_time=window_start_time,
         window_end_time=window_end_time,
+        diagnostic_category=category,
+        selection_phase=selection_phase,
+        source_manifest=source_manifest,
+        manifest_rank=candidate.manifest_rank,
+        window_source=window_source,
+        window_provenance=window_provenance,
     )
 
 
@@ -258,9 +379,13 @@ async def _probe_with_timeout(
     min_book_events: int,
     sources: tuple[str, ...],
     timeout_seconds: int,
+    selection_phase: str = "primary_exact",
+    source_manifest: str | None = None,
+    window_source: str | None = None,
+    window_provenance: str | None = None,
 ) -> CoverageProbeResult:
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             probe_candidate(
                 candidate,
                 start_time=start_time,
@@ -270,6 +395,27 @@ async def _probe_with_timeout(
             ),
             timeout=timeout_seconds,
         )
+        return replace(
+            result,
+            window_start_time=result.window_start_time or start_time,
+            window_end_time=result.window_end_time or end_time,
+            selection_phase=selection_phase,
+            source_manifest=source_manifest,
+            manifest_rank=candidate.manifest_rank,
+            window_source=window_source,
+            window_provenance=window_provenance,
+            diagnostic_category=(
+                result.diagnostic_category
+                if result.diagnostic_category != "unknown"
+                else _diagnostic_category(
+                    status=result.status,
+                    book_events=result.book_events,
+                    min_book_events=result.min_book_events,
+                    message=result.message,
+                    gap_hours_missing=result.gap_hours_missing,
+                )
+            ),
+        )
     except TimeoutError:
         return _result_from_candidate(
             candidate,
@@ -277,6 +423,13 @@ async def _probe_with_timeout(
             book_events=0,
             min_book_events=min_book_events,
             message=f"Timed out after {timeout_seconds} seconds.",
+            diagnostic_category="probe_error",
+            selection_phase=selection_phase,
+            source_manifest=source_manifest,
+            window_start_time=start_time,
+            window_end_time=end_time,
+            window_source=window_source,
+            window_provenance=window_provenance,
         )
 
 
@@ -291,10 +444,15 @@ def _pass_manifest_candidate(result: CoverageProbeResult) -> dict[str, Any]:
             "source_strategy": result.source_strategy,
             "coverage": {
                 "status": result.status,
+                "diagnostic_category": result.diagnostic_category,
+                "selection_phase": result.selection_phase,
+                "source_manifest": result.source_manifest,
                 "window": {
                     "start_time": result.window_start_time,
                     "end_time": result.window_end_time,
                 },
+                "window_source": result.window_source,
+                "window_provenance": result.window_provenance,
                 "book_events": result.book_events,
                 "min_book_events": result.min_book_events,
                 "count_key": result.count_key,
@@ -326,9 +484,12 @@ def _build_pass_manifest(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "mode": "shadow/backtest-only",
-        "safety": summary["safety"],
+        "safety": _safety_fields(
+            summary.get("safety") if isinstance(summary.get("safety"), dict) else None
+        ),
         "strategy": summary["strategy"],
         "source_manifest": summary.get("source_manifest") or summary.get("manifest"),
+        "manifest_selection": summary.get("manifest_selection", []),
         "window": summary["window"],
         "windows": summary.get("windows", [summary["window"]]),
         "min_book_events": summary["min_book_events"],
@@ -338,6 +499,7 @@ def _build_pass_manifest(summary: dict[str, Any]) -> dict[str, Any]:
             "pass_window_count": len(pass_rows),
             "unique_pass_market_count": len(deduped_rows),
             "dedupe_policy": "one best-book-events pass window per slug/token_index",
+            "diagnostic_counts": summary.get("diagnostic_counts", {}),
         },
         "candidate_count": len(deduped_rows),
         "candidates": [_pass_manifest_candidate(result) for result in pass_results],
@@ -379,27 +541,373 @@ def _build_probe_windows(args: argparse.Namespace) -> list[tuple[str, str]]:
     return windows
 
 
-async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
-    windows = _build_probe_windows(args)
-    primary_start_time, primary_end_time = windows[0]
-    sources = tuple(args.sources or DEFAULT_SOURCES)
-    candidates = load_candidates(
-        args.manifest, strategy=args.strategy, max_candidates=args.max_candidates
-    )
-    results: list[CoverageProbeResult] = []
+def _int_arg(args: argparse.Namespace, name: str, default: int) -> int:
+    value = getattr(args, name, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-    for candidate in candidates:
-        for start_time, end_time in windows:
-            results.append(
-                await _probe_with_timeout(
-                    candidate,
+
+def _target_key(target: ProbeTarget) -> tuple[str, str, int, str, str, str]:
+    return (
+        target.candidate.slug,
+        str(target.candidate.token_index),
+        int(target.min_book_events),
+        target.start_time,
+        target.end_time,
+        target.source_manifest,
+    )
+
+
+def _append_target(
+    targets: list[ProbeTarget],
+    seen: set[tuple[str, str, int, str, str, str]],
+    target: ProbeTarget,
+) -> None:
+    key = _target_key(target)
+    if key in seen:
+        return
+    seen.add(key)
+    targets.append(target)
+
+
+def _candidate_alternate_windows(
+    candidate: Candidate,
+    *,
+    cli_windows: list[tuple[str, str]],
+    min_book_events: int,
+    primary_window: tuple[str, str],
+    max_alternate_windows: int,
+) -> list[tuple[str, str, int, str | None, str]]:
+    windows: list[tuple[str, str, int, str | None, str]] = []
+    seen: set[tuple[str, str, int]] = set()
+
+    def add_window(
+        start_time: str,
+        end_time: str,
+        events: int | None,
+        source: str | None,
+        provenance: str,
+    ) -> None:
+        if (start_time, end_time) == primary_window:
+            return
+        threshold = int(events if events is not None else min_book_events)
+        key = (start_time, end_time, threshold)
+        if key in seen:
+            return
+        seen.add(key)
+        windows.append((start_time, end_time, threshold, source, provenance))
+
+    for index, (start_time, end_time) in enumerate(cli_windows[1:], start=1):
+        add_window(start_time, end_time, min_book_events, None, f"recent_window_cli[{index}]")
+    for window in candidate.replay_windows:
+        add_window(
+            window.start_time,
+            window.end_time,
+            window.min_book_events,
+            window.source,
+            window.provenance,
+        )
+    return windows[:max_alternate_windows]
+
+
+def _recent_manifest_paths(
+    *,
+    manifest_glob: str | None,
+    primary_manifest: Path,
+    max_count: int,
+) -> list[Path]:
+    if not manifest_glob or max_count <= 0:
+        return []
+    primary_resolved = primary_manifest.resolve()
+    paths = [
+        Path(path)
+        for path in sorted(
+            glob(manifest_glob),
+            key=lambda value: Path(value).stat().st_mtime,
+            reverse=True,
+        )
+    ]
+    selected: list[Path] = []
+    for path in paths:
+        try:
+            if path.resolve() == primary_resolved:
+                continue
+        except OSError:
+            continue
+        selected.append(path)
+        if len(selected) >= max_count:
+            break
+    return selected
+
+
+def _load_candidates_fail_closed(
+    manifest_path: Path,
+    *,
+    strategy: str,
+    max_candidates: int,
+) -> tuple[list[Candidate], dict[str, Any]]:
+    record: dict[str, Any] = {"path": str(manifest_path), "selected": False}
+    try:
+        candidates = load_candidates(
+            manifest_path,
+            strategy=strategy,
+            max_candidates=max_candidates,
+        )
+    except Exception as exc:
+        record["reason"] = "skipped_unreadable_or_invalid"
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        return [], record
+    record["candidate_count"] = len(candidates)
+    record["selected"] = bool(candidates)
+    record["reason"] = "loaded_candidates" if candidates else "skipped_no_eligible_candidates"
+    return candidates, record
+
+
+def _build_probe_targets(
+    args: argparse.Namespace,
+) -> tuple[list[ProbeTarget], list[ProbeTarget], list[dict[str, Any]], list[tuple[str, str]]]:
+    cli_windows = _build_probe_windows(args)
+    primary_window = cli_windows[0]
+    max_candidates = _int_arg(args, "max_candidates", 1)
+    expanded_max_candidates = max(
+        max_candidates,
+        _int_arg(args, "expanded_max_candidates", max_candidates),
+    )
+    max_alternate_windows = _int_arg(args, "max_alternate_windows", 3)
+    max_alternate_probes = _int_arg(args, "max_alternate_probes", 120)
+    alternate_manifest_count = _int_arg(args, "alternate_manifest_count", 0)
+    alternate_manifest_glob = getattr(args, "alternate_manifest_glob", None)
+
+    primary_candidates, primary_record = _load_candidates_fail_closed(
+        args.manifest,
+        strategy=args.strategy,
+        max_candidates=max_candidates,
+    )
+    primary_record["role"] = "primary"
+    expanded_candidates, expanded_record = _load_candidates_fail_closed(
+        args.manifest,
+        strategy=args.strategy,
+        max_candidates=expanded_max_candidates,
+    )
+    expanded_record["role"] = "primary_expanded_candidate_pool"
+    manifest_records = [primary_record]
+    if expanded_max_candidates > max_candidates:
+        manifest_records.append(expanded_record)
+
+    primary_targets: list[ProbeTarget] = []
+    expansion_targets: list[ProbeTarget] = []
+    seen_primary: set[tuple[str, str, int, str, str, str]] = set()
+    seen_expansion: set[tuple[str, str, int, str, str, str]] = set()
+    for candidate in primary_candidates:
+        _append_target(
+            primary_targets,
+            seen_primary,
+            ProbeTarget(
+                candidate=candidate,
+                start_time=primary_window[0],
+                end_time=primary_window[1],
+                min_book_events=int(args.min_book_events),
+                source_manifest=str(args.manifest),
+                selection_phase="primary_exact",
+                window_provenance="cli_exact_window",
+            ),
+        )
+
+    primary_keys = {(candidate.slug, candidate.token_index) for candidate in primary_candidates}
+    expansion_candidates = list(expanded_candidates)
+    for candidate in expansion_candidates:
+        candidate_key = (candidate.slug, candidate.token_index)
+        if candidate_key not in primary_keys:
+            _append_target(
+                expansion_targets,
+                seen_expansion,
+                ProbeTarget(
+                    candidate=candidate,
+                    start_time=primary_window[0],
+                    end_time=primary_window[1],
+                    min_book_events=int(args.min_book_events),
+                    source_manifest=str(args.manifest),
+                    selection_phase="zero_pass_expanded_candidate",
+                    window_provenance="cli_exact_window",
+                ),
+            )
+        phase = (
+            "zero_pass_expanded_candidate_window"
+            if candidate_key not in primary_keys
+            else "zero_pass_expanded_window"
+        )
+        for start_time, end_time, threshold, source, provenance in _candidate_alternate_windows(
+            candidate,
+            cli_windows=cli_windows,
+            min_book_events=int(args.min_book_events),
+            primary_window=primary_window,
+            max_alternate_windows=max_alternate_windows,
+        ):
+            _append_target(
+                expansion_targets,
+                seen_expansion,
+                ProbeTarget(
+                    candidate=candidate,
                     start_time=start_time,
                     end_time=end_time,
-                    min_book_events=args.min_book_events,
-                    sources=sources,
-                    timeout_seconds=args.timeout_seconds,
-                )
+                    min_book_events=threshold,
+                    source_manifest=str(args.manifest),
+                    selection_phase=phase,
+                    window_source=source,
+                    window_provenance=provenance,
+                ),
             )
+
+    for path in _recent_manifest_paths(
+        manifest_glob=alternate_manifest_glob,
+        primary_manifest=args.manifest,
+        max_count=alternate_manifest_count,
+    ):
+        candidates, record = _load_candidates_fail_closed(
+            path,
+            strategy=args.strategy,
+            max_candidates=expanded_max_candidates,
+        )
+        record["role"] = "alternate_recent_manifest"
+        manifest_records.append(record)
+        for candidate in candidates:
+            for start_time, end_time, threshold, source, provenance in _candidate_alternate_windows(
+                candidate,
+                cli_windows=cli_windows,
+                min_book_events=int(args.min_book_events),
+                primary_window=("", ""),
+                max_alternate_windows=max(1, max_alternate_windows),
+            ) or [
+                (
+                    primary_window[0],
+                    primary_window[1],
+                    int(args.min_book_events),
+                    None,
+                    "cli_exact_window",
+                )
+            ]:
+                _append_target(
+                    expansion_targets,
+                    seen_expansion,
+                    ProbeTarget(
+                        candidate=candidate,
+                        start_time=start_time,
+                        end_time=end_time,
+                        min_book_events=threshold,
+                        source_manifest=str(path),
+                        selection_phase="zero_pass_recent_manifest",
+                        window_source=source,
+                        window_provenance=provenance,
+                    ),
+                )
+
+    return primary_targets, expansion_targets[:max_alternate_probes], manifest_records, cli_windows
+
+
+async def _run_targets(
+    targets: list[ProbeTarget],
+    *,
+    sources: tuple[str, ...],
+    timeout_seconds: int,
+) -> list[CoverageProbeResult]:
+    results: list[CoverageProbeResult] = []
+    for target in targets:
+        results.append(
+            await _probe_with_timeout(
+                target.candidate,
+                start_time=target.start_time,
+                end_time=target.end_time,
+                min_book_events=target.min_book_events,
+                sources=sources,
+                timeout_seconds=timeout_seconds,
+                selection_phase=target.selection_phase,
+                source_manifest=target.source_manifest,
+                window_source=target.window_source,
+                window_provenance=target.window_provenance,
+            )
+        )
+    return results
+
+
+def _diagnostic_counts(
+    results: list[CoverageProbeResult], *, no_eligible_candidates: bool
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if no_eligible_candidates:
+        counts["no_eligible_input_candidates"] = 1
+    for result in results:
+        counts[result.diagnostic_category] = counts.get(result.diagnostic_category, 0) + 1
+    for category in (
+        "no_eligible_input_candidates",
+        "pmxt_raw_download_failure",
+        "no_pmxt_l2_book_data",
+        "min_book_events_not_met",
+        "successful_pass_count",
+    ):
+        counts.setdefault(category, 0)
+    return counts
+
+
+def _probed_windows(
+    results: list[CoverageProbeResult],
+    fallback_windows: list[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    windows: list[dict[str, Any]] = []
+    seen: set[tuple[str | None, str | None, int | None]] = set()
+    for result in results:
+        key = (result.window_start_time, result.window_end_time, result.min_book_events)
+        if key in seen:
+            continue
+        seen.add(key)
+        windows.append(
+            {
+                "start_time": result.window_start_time,
+                "end_time": result.window_end_time,
+                "min_book_events": result.min_book_events,
+                "source": result.window_source,
+                "provenance": result.window_provenance,
+            }
+        )
+    if windows:
+        return windows
+    return [
+        {
+            "start_time": start_time,
+            "end_time": end_time,
+            "min_book_events": None,
+            "source": None,
+            "provenance": "cli_window",
+        }
+        for start_time, end_time in fallback_windows
+    ]
+
+
+async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+    primary_targets, expansion_targets, manifest_records, windows = _build_probe_targets(args)
+    primary_start_time, primary_end_time = windows[0]
+    sources = tuple(args.sources or DEFAULT_SOURCES)
+    primary_results = await _run_targets(
+        primary_targets,
+        sources=sources,
+        timeout_seconds=args.timeout_seconds,
+    )
+    expansion_triggered = bool(
+        primary_results
+        and not any(result.status == "pass" for result in primary_results)
+        and expansion_targets
+    )
+    expansion_results = (
+        await _run_targets(
+            expansion_targets,
+            sources=sources,
+            timeout_seconds=args.timeout_seconds,
+        )
+        if expansion_triggered
+        else []
+    )
+    results = primary_results + expansion_results
 
     pass_count = sum(1 for result in results if result.status == "pass")
     no_coverage_count = sum(1 for result in results if result.status == "no_coverage")
@@ -407,33 +915,47 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     pass_markets = {
         (result.slug, result.token_index) for result in results if result.status == "pass"
     }
+    probed_candidates = {(result.slug, result.token_index) for result in results}
+    no_eligible_candidates = not primary_targets and not expansion_targets
+    diagnostic_counts = _diagnostic_counts(
+        results,
+        no_eligible_candidates=no_eligible_candidates,
+    )
+    probed_windows = _probed_windows(results, windows)
     return {
         "schema_version": 1,
         "generated_at": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
-        "safety": {
-            "live_trading": False,
-            "orders_submitted": False,
-            "orders_signed": False,
-            "orders_cancelled": False,
-            "credentials_required": False,
-            "worker_trading_started": False,
-            "live_trading_worker_started": False,
-            "strategy_execution": False,
-        },
+        "safety": _safety_fields(),
         "strategy": args.strategy,
         "source_manifest": str(args.manifest),
+        "manifest_selection": manifest_records,
         "window": {"start_time": primary_start_time, "end_time": primary_end_time},
-        "windows": [{"start_time": start, "end_time": end} for start, end in windows],
+        "windows": probed_windows,
         "min_book_events": args.min_book_events,
         "sources": list(sources),
-        "candidate_count": len(candidates),
-        "probe_window_count": len(windows),
+        "candidate_count": len(probed_candidates),
+        "primary_candidate_count": len(primary_targets),
+        "expansion_candidate_count": max(0, len(probed_candidates) - len(primary_targets)),
+        "probe_window_count": len(probed_windows),
         "probe_count": len(results),
+        "primary_probe_count": len(primary_results),
+        "expansion_probe_count": len(expansion_results),
+        "expansion_triggered": expansion_triggered,
+        "expansion_reason": "primary_exact_zero_pass" if expansion_triggered else None,
+        "max_alternate_probes": _int_arg(args, "max_alternate_probes", 120),
         "pass_market_count": len(pass_markets),
         "pass_count": pass_count,
         "no_coverage_count": no_coverage_count,
         "error_count": error_count,
+        "diagnostic_counts": diagnostic_counts,
+        "diagnostics": {
+            "no_eligible_input_candidates": no_eligible_candidates,
+            "pmxt_raw_download_failure_count": diagnostic_counts["pmxt_raw_download_failure"],
+            "no_pmxt_l2_book_data_count": diagnostic_counts["no_pmxt_l2_book_data"],
+            "min_book_events_not_met_count": diagnostic_counts["min_book_events_not_met"],
+            "successful_pass_count": diagnostic_counts["successful_pass_count"],
+        },
         "results": [asdict(result) for result in results],
     }
 
@@ -447,6 +969,9 @@ def _write_csv(summary: dict[str, Any], csv_path: Path) -> None:
                 "token_index",
                 "source_strategy",
                 "status",
+                "diagnostic_category",
+                "selection_phase",
+                "source_manifest",
                 "book_events",
                 "min_book_events",
                 "count_key",
@@ -457,6 +982,8 @@ def _write_csv(summary: dict[str, Any], csv_path: Path) -> None:
                 "message",
                 "gap_hours_missing",
                 "gap_warning",
+                "window_provenance",
+                "window_source",
             ],
         )
         writer.writeheader()
@@ -481,20 +1008,29 @@ def _write_markdown(summary: dict[str, Any], md_path: Path, pass_manifest_path: 
         f"- pass: {summary['pass_count']}",
         f"- no_coverage: {summary['no_coverage_count']}",
         f"- errors: {summary['error_count']}",
+        f"- diagnostic_counts: {json.dumps(summary.get('diagnostic_counts', {}), sort_keys=True)}",
+        f"- expansion_triggered: {summary.get('expansion_triggered')}",
+        f"- expansion_reason: {summary.get('expansion_reason')}",
         f"- pass_manifest: {pass_manifest_path}",
         "- pass_policy: book_events >= min_book_events and no PMXT missing-hour gap warnings",
         "",
-        "Safety: shadow/backtest only; no live trading, signing, cancellation, order submission, "
-        "credentials, worker-trading, or strategy execution.",
+        "Safety fields:",
+        f"- orders_submitted={str(summary['safety']['orders_submitted']).lower()}",
+        f"- orders_signed={str(summary['safety']['orders_signed']).lower()}",
+        f"- orders_cancelled={str(summary['safety']['orders_cancelled']).lower()}",
+        f"- credentials_required={str(summary['safety']['credentials_required']).lower()}",
+        f"- live_trading_worker_started={str(summary['safety']['live_trading_worker_started']).lower()}",
+        f"- worker_trading_started={str(summary['safety']['worker_trading_started']).lower()}",
         "",
         "## Candidates",
         "",
-        "| status | market | token | window | book_events | message |",
-        "|---|---|---:|---|---:|---|",
+        "| status | diagnostic | phase | market | token | window | book_events | message |",
+        "|---|---|---|---|---:|---|---:|---|",
     ]
     for row in summary["results"]:
         lines.append(
-            f"| {row.get('status')} | {row.get('slug')} | {row.get('token_index')} | "
+            f"| {row.get('status')} | {row.get('diagnostic_category')} | "
+            f"{row.get('selection_phase')} | {row.get('slug')} | {row.get('token_index')} | "
             f"{row.get('window_start_time')} -> {row.get('window_end_time')} | "
             f"{row.get('book_events')} | {row.get('message') or ''} |"
         )
@@ -557,6 +1093,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Hours to step backwards between recent windows.",
     )
+    parser.add_argument(
+        "--expanded-max-candidates",
+        type=int,
+        default=None,
+        help=(
+            "After the primary exact window has zero passes, expand up to this many "
+            "ranked candidates from the primary manifest."
+        ),
+    )
+    parser.add_argument(
+        "--max-alternate-windows",
+        type=int,
+        default=3,
+        help=(
+            "After primary zero-pass, probe up to this many alternate windows per candidate "
+            "from CLI recent windows and manifest coverage guidance."
+        ),
+    )
+    parser.add_argument(
+        "--max-alternate-probes",
+        type=int,
+        default=120,
+        help="Hard cap on zero-pass expansion probes.",
+    )
+    parser.add_argument(
+        "--alternate-manifest-glob",
+        default=None,
+        help="Optional recent manifest glob to consider only after primary exact zero-pass.",
+    )
+    parser.add_argument(
+        "--alternate-manifest-count",
+        type=int,
+        default=0,
+        help="Maximum recent manifests from --alternate-manifest-glob to consider.",
+    )
     parser.add_argument("--timestamp", default=None, help="Override output timestamp for tests.")
     parser.add_argument("--fail-on-errors", action="store_true")
     parser.add_argument("--fail-on-no-pass", action="store_true")
@@ -571,6 +1142,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("recent-window-count must be >= 1")
     if args.window_step_hours < 1:
         raise SystemExit("window-step-hours must be >= 1")
+    if args.expanded_max_candidates is not None and args.expanded_max_candidates < 1:
+        raise SystemExit("expanded-max-candidates must be >= 1")
+    if args.max_alternate_windows < 0:
+        raise SystemExit("max-alternate-windows must be >= 0")
+    if args.max_alternate_probes < 0:
+        raise SystemExit("max-alternate-probes must be >= 0")
+    if args.alternate_manifest_count < 0:
+        raise SystemExit("alternate-manifest-count must be >= 0")
     return args
 
 
@@ -592,6 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
                 "pass_count": summary["pass_count"],
                 "pass_market_count": summary.get("pass_market_count"),
                 "probe_count": summary.get("probe_count"),
+                "expansion_triggered": summary.get("expansion_triggered"),
+                "diagnostic_counts": summary.get("diagnostic_counts"),
             },
             sort_keys=True,
         )

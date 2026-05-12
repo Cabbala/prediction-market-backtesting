@@ -152,7 +152,11 @@ def _replay_window_from_mapping(
         start_time=start_time.strip(),
         end_time=end_time.strip(),
         min_book_events=min_book_events,
-        source=raw.get("source") if isinstance(raw.get("source"), str) else None,
+        source=raw.get("source")
+        if isinstance(raw.get("source"), str)
+        else raw.get("label")
+        if isinstance(raw.get("label"), str)
+        else None,
         candidate_count=_parse_int(raw.get("candidate_count")),
         book_events=_parse_int(raw.get("book_events")),
         provenance=provenance,
@@ -186,16 +190,17 @@ def _manifest_replay_windows(payload: dict[str, Any]) -> tuple[ReplayWindow, ...
 
     guidance = payload.get("coverage_first_guidance")
     if isinstance(guidance, dict):
-        for raw_window in _as_list(guidance.get("recommended_windows")):
-            if not isinstance(raw_window, dict):
-                continue
-            parsed = _replay_window_from_mapping(
-                raw_window,
-                default_min_book_events=default_min_book_events,
-                provenance="coverage_first_guidance",
-            )
-            if parsed is not None:
-                windows.append(parsed)
+        for key in ("recommended_windows", "recommended_pmxt_windows"):
+            for raw_window in _as_list(guidance.get(key)):
+                if not isinstance(raw_window, dict):
+                    continue
+                parsed = _replay_window_from_mapping(
+                    raw_window,
+                    default_min_book_events=default_min_book_events,
+                    provenance=f"coverage_first_guidance.{key}",
+                )
+                if parsed is not None:
+                    windows.append(parsed)
     return _dedupe_replay_windows(windows)
 
 

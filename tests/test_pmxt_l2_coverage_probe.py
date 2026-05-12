@@ -76,7 +76,7 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
             status="error",
             book_events=0,
             min_book_events=50,
-            message="RuntimeError: boom",
+            message="HTTPError downloading PMXT raw parquet from r2.pmxt.dev: 503",
         )
 
     monkeypatch.setattr(probe_pmxt_l2_coverage, "probe_candidate", _fake_probe_candidate)
@@ -108,6 +108,9 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
     assert summary["pass_count"] == 1
     assert summary["no_coverage_count"] == 1
     assert summary["error_count"] == 1
+    assert summary["diagnostic_counts"]["successful_pass_count"] == 1
+    assert summary["diagnostic_counts"]["min_book_events_not_met"] == 1
+    assert summary["diagnostic_counts"]["pmxt_raw_download_failure"] == 1
     assert Path(output_files["json"]).exists()
     assert Path(output_files["csv"]).exists()
     assert Path(output_files["markdown"]).exists()
@@ -132,6 +135,16 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
     ]
     assert pass_manifest["candidates"][0]["source_strategy"] == "microprice_optimizer"
     assert pass_manifest["candidates"][0]["coverage"]["book_events"] == 75
+    assert pass_manifest["candidates"][0]["coverage"]["diagnostic_category"] == (
+        "successful_pass_count"
+    )
+    md = Path(output_files["markdown"]).read_text(encoding="utf-8")
+    assert "- orders_submitted=false" in md
+    assert "- orders_signed=false" in md
+    assert "- orders_cancelled=false" in md
+    assert "- credentials_required=false" in md
+    assert "- live_trading_worker_started=false" in md
+    assert "- worker_trading_started=false" in md
 
     loaded = job_b_microprice_batch.load_candidates(
         Path(output_files["pass_manifest"]),
@@ -278,6 +291,8 @@ def test_fail_on_no_pass_fails_even_with_zero_candidates(tmp_path) -> None:
     summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
     assert summary["candidate_count"] == 0
     assert summary["pass_count"] == 0
+    assert summary["diagnostics"]["no_eligible_input_candidates"] is True
+    assert summary["diagnostic_counts"]["no_eligible_input_candidates"] == 1
     # Exercise the final exit policy through main, not only run_probe.
     assert (
         probe_pmxt_l2_coverage.main(
@@ -407,13 +422,102 @@ def test_recent_window_count_probes_multiple_windows_and_keeps_candidate_window(
     assert summary["candidate_count"] == 1
     assert summary["probe_window_count"] == 2
     assert summary["probe_count"] == 2
+    assert summary["expansion_triggered"] is True
+    assert summary["expansion_reason"] == "primary_exact_zero_pass"
     assert summary["pass_count"] == 1
+    assert summary["diagnostic_counts"]["no_pmxt_l2_book_data"] == 1
+    assert summary["diagnostic_counts"]["successful_pass_count"] == 1
     pass_manifest = json.loads(Path(output_files["pass_manifest"]).read_text(encoding="utf-8"))
     assert pass_manifest["candidates"][0]["coverage"]["window"] == {
         "start_time": "2026-03-22T08:00:00Z",
         "end_time": "2026-03-22T09:00:00Z",
     }
     assert pass_manifest["candidates"][0]["coverage"]["min_book_events"] == 50
+    assert pass_manifest["candidates"][0]["coverage"]["selection_phase"] == (
+        "zero_pass_expanded_window"
+    )
+
+
+def test_zero_pass_expands_to_additional_ranked_candidates(monkeypatch, tmp_path) -> None:
+    source_manifest = tmp_path / "source_manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "microprice_optimizer",
+                "candidates": [
+                    {"market_slug": "first-thin", "question": "Thin?", "token_index": 0},
+                    {"market_slug": "second-covered", "question": "Covered?", "token_index": 0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def _fake_probe_candidate(candidate, **kwargs):  # type: ignore[no-untyped-def]
+        if candidate.slug == "second-covered":
+            return probe_pmxt_l2_coverage._result_from_candidate(
+                candidate,
+                status="pass",
+                book_events=90,
+                min_book_events=50,
+                window_start_time=kwargs["start_time"],
+                window_end_time=kwargs["end_time"],
+            )
+        return probe_pmxt_l2_coverage._result_from_candidate(
+            candidate,
+            status="no_coverage",
+            book_events=0,
+            min_book_events=50,
+            message="No PMXT L2 book replay was loaded for the requested window.",
+            window_start_time=kwargs["start_time"],
+            window_end_time=kwargs["end_time"],
+        )
+
+    monkeypatch.setattr(probe_pmxt_l2_coverage, "probe_candidate", _fake_probe_candidate)
+    args = Namespace(
+        manifest=source_manifest,
+        output_dir=tmp_path / "reports",
+        pass_manifest_dir=tmp_path / "pass_manifests",
+        start_time="2026-03-22T09:00:00Z",
+        end_time="2026-03-22T10:00:00Z",
+        strategy="microprice_optimizer",
+        max_candidates=1,
+        expanded_max_candidates=2,
+        min_book_events=50,
+        sources=None,
+        timeout_seconds=5,
+        recent_window_count=1,
+        window_step_hours=1,
+        max_alternate_windows=0,
+        max_alternate_probes=10,
+        alternate_manifest_glob=None,
+        alternate_manifest_count=0,
+    )
+
+    summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
+    output_files = probe_pmxt_l2_coverage.write_outputs(
+        summary,
+        output_dir=args.output_dir,
+        pass_manifest_dir=args.pass_manifest_dir,
+        timestamp="20260504T000005Z",
+    )
+
+    assert summary["primary_probe_count"] == 1
+    assert summary["expansion_probe_count"] == 1
+    assert summary["expansion_triggered"] is True
+    assert summary["pass_count"] == 1
+    assert [row["selection_phase"] for row in summary["results"]] == [
+        "primary_exact",
+        "zero_pass_expanded_candidate",
+    ]
+    pass_manifest = json.loads(Path(output_files["pass_manifest"]).read_text(encoding="utf-8"))
+    assert [candidate["market_slug"] for candidate in pass_manifest["candidates"]] == [
+        "second-covered"
+    ]
+    assert pass_manifest["candidates"][0]["coverage"]["window"] == {
+        "start_time": "2026-03-22T09:00:00Z",
+        "end_time": "2026-03-22T10:00:00Z",
+    }
 
 
 def test_pass_manifest_dedupes_multiple_pass_windows_for_same_market(tmp_path) -> None:
