@@ -5,6 +5,9 @@ import asyncio
 import csv
 import json
 import math
+import os
+import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1004,6 +1007,52 @@ def _candidate_replay_request(candidate: Candidate, args: argparse.Namespace) ->
     return _candidate_replay_requests(candidate, args)[0]
 
 
+def _candidate_from_mapping(raw: dict[str, Any]) -> Candidate:
+    replay_windows = tuple(
+        ReplayWindow(**window)
+        for window in raw.get("replay_windows", ())
+        if isinstance(window, dict)
+    )
+    return Candidate(
+        slug=str(raw["slug"]),
+        question=str(raw.get("question") or raw["slug"]),
+        token_index=int(raw.get("token_index", 0)),
+        condition_id=raw.get("condition_id") if isinstance(raw.get("condition_id"), str) else None,
+        scan_mid=_parse_float(raw.get("scan_mid")),
+        scan_spread=_parse_float(raw.get("scan_spread")),
+        scan_imbalance5=_parse_float(raw.get("scan_imbalance5")),
+        liquidity=_parse_float(raw.get("liquidity")),
+        source_strategy=str(raw.get("source_strategy") or "Microprice"),
+        coverage_start_time=raw.get("coverage_start_time")
+        if isinstance(raw.get("coverage_start_time"), str)
+        else None,
+        coverage_end_time=raw.get("coverage_end_time")
+        if isinstance(raw.get("coverage_end_time"), str)
+        else None,
+        coverage_book_events=_parse_int(raw.get("coverage_book_events")),
+        coverage_min_book_events=_parse_int(raw.get("coverage_min_book_events")),
+        manifest_rank=_parse_int(raw.get("manifest_rank")),
+        selection_policy=str(
+            raw.get("selection_policy") or "non_extreme_tail_priority_then_liquidity"
+        ),
+        replay_windows=replay_windows,
+    )
+
+
+def _attempt_from_mapping(raw: dict[str, Any]) -> BacktestAttempt:
+    return BacktestAttempt(
+        slug=str(raw["slug"]),
+        question=str(raw.get("question") or raw["slug"]),
+        token_index=int(raw.get("token_index", 0)),
+        source_strategy=str(raw.get("source_strategy") or "Microprice"),
+        params=dict(raw.get("params") or {}),
+        status=str(raw.get("status") or "error"),
+        result=raw.get("result") if isinstance(raw.get("result"), dict) else None,
+        error=raw.get("error") if isinstance(raw.get("error"), str) else None,
+        diagnostics=raw.get("diagnostics") if isinstance(raw.get("diagnostics"), dict) else None,
+    )
+
+
 def _unique_replay_windows(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique: dict[tuple[str | None, str | None, int | None], dict[str, Any]] = {}
     for request in requests:
@@ -1259,6 +1308,152 @@ async def _run_attempt_with_timeout(
         )
 
 
+def _attempt_error(
+    candidate: Candidate,
+    params: dict[str, Any],
+    *,
+    replay_request: dict[str, Any],
+    error: str,
+) -> BacktestAttempt:
+    replay_window = replay_request["window"]
+    min_book_events = int(replay_request["min_book_events"])
+    return BacktestAttempt(
+        slug=candidate.slug,
+        question=candidate.question,
+        token_index=candidate.token_index,
+        source_strategy=candidate.source_strategy,
+        params=params,
+        status="error",
+        result=None,
+        error=error,
+        diagnostics=_diagnose_attempt(
+            candidate,
+            params,
+            None,
+            start_time=replay_window["start_time"],
+            end_time=replay_window["end_time"],
+            min_book_events=min_book_events,
+            status="error",
+            error=error,
+        ),
+    )
+
+
+def _decode_subprocess_output(data: bytes, *, limit: int = 4000) -> str:
+    text = data.decode("utf-8", errors="replace").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+async def _run_attempt_in_subprocess(
+    candidate: Candidate,
+    params: dict[str, Any],
+    *,
+    replay_request: dict[str, Any],
+    timeout_seconds: int,
+) -> BacktestAttempt:
+    payload = {
+        "candidate": asdict(candidate),
+        "params": params,
+        "replay_request": replay_request,
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="job_b_microprice_attempt_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            request_path = tmp_path / "request.json"
+            output_path = tmp_path / "attempt.json"
+            request_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            env = os.environ.copy()
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--single-attempt-input",
+                str(request_path),
+                "--single-attempt-output",
+                str(output_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_seconds
+                )
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                return _attempt_error(
+                    candidate,
+                    params,
+                    replay_request=replay_request,
+                    error=f"TimeoutError: isolated attempt timed out after {timeout_seconds} seconds",
+                )
+            if process.returncode != 0:
+                stdout_text = _decode_subprocess_output(stdout)
+                stderr_text = _decode_subprocess_output(stderr)
+                return _attempt_error(
+                    candidate,
+                    params,
+                    replay_request=replay_request,
+                    error=(
+                        f"SubprocessError: isolated attempt exited {process.returncode}; "
+                        f"stdout={stdout_text!r}; stderr={stderr_text!r}"
+                    ),
+                )
+            if not output_path.exists():
+                return _attempt_error(
+                    candidate,
+                    params,
+                    replay_request=replay_request,
+                    error="SubprocessError: isolated attempt produced no output JSON",
+                )
+            raw_attempt = json.loads(output_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_attempt, dict):
+                return _attempt_error(
+                    candidate,
+                    params,
+                    replay_request=replay_request,
+                    error="SubprocessError: isolated attempt output was not an object",
+                )
+            return _attempt_from_mapping(raw_attempt)
+    except Exception as exc:
+        return _attempt_error(
+            candidate,
+            params,
+            replay_request=replay_request,
+            error=f"{type(exc).__name__}: isolated attempt wrapper failed: {exc}",
+        )
+
+
+def _run_single_attempt_cli(input_path: Path, output_path: Path) -> int:
+    payload = json.loads(input_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("single-attempt payload must be a JSON object")
+    raw_candidate = payload.get("candidate")
+    replay_request = payload.get("replay_request")
+    if not isinstance(raw_candidate, dict):
+        raise TypeError("single-attempt payload missing candidate object")
+    if not isinstance(replay_request, dict):
+        raise TypeError("single-attempt payload missing replay_request object")
+    candidate = _candidate_from_mapping(raw_candidate)
+    params = dict(payload.get("params") or {})
+    replay_window = replay_request["window"]
+    attempt = asyncio.run(
+        run_attempt(
+            candidate,
+            params,
+            start_time=replay_window["start_time"],
+            end_time=replay_window["end_time"],
+            min_book_events=int(replay_request["min_book_events"]),
+        )
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(asdict(attempt), indent=2, sort_keys=True), encoding="utf-8")
+    return 0
+
+
 async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     candidates = load_candidates(
         args.manifest, strategy=args.strategy, max_candidates=args.max_candidates
@@ -1271,10 +1466,16 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         for replay_request in _candidate_replay_requests(candidate, args)
     ]
     replay_requests = [replay_request for _, replay_request in candidate_requests]
+    attempt_isolation = getattr(args, "attempt_isolation", "inline")
     for candidate, replay_request in candidate_requests:
         for params in selected_params:
+            runner = (
+                _run_attempt_in_subprocess
+                if attempt_isolation == "subprocess"
+                else _run_attempt_with_timeout
+            )
             attempts.append(
-                await _run_attempt_with_timeout(
+                await runner(
                     candidate,
                     params,
                     replay_request=replay_request,
@@ -1320,13 +1521,16 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "exact_window_status": exact_window["status"],
         "warnings": exact_window["warnings"],
         "exact_window": exact_window,
+        "attempt_isolation": attempt_isolation,
         "candidate_count": len(candidates),
         "parameter_set_count": len(selected_params),
         "attempt_count": len(attempts),
         "completed_count": completed,
+        "skipped_count": skipped,
         "skipped_no_coverage_count": skipped,
         "error_count": errored,
         "completed": completed,
+        "skipped": skipped,
         "skipped_no_coverage": skipped,
         "errors": errored,
         "fills_orders_pnl": aggregate_diagnostics["fills_orders_pnl"],
@@ -1421,11 +1625,14 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- selected_min_book_events: {summary.get('selected_min_book_events')}",
         f"- exact_window_status: {summary.get('exact_window_status')}",
         f"- warnings: {json.dumps(summary.get('warnings', []), sort_keys=True)}",
+        f"- attempt_isolation: {summary.get('attempt_isolation')}",
+        f"- safety: {json.dumps(summary.get('safety', {}), sort_keys=True)}",
         f"- candidates: {summary['candidate_count']}",
         f"- window_policy: {summary.get('candidate_selection', {}).get('window_policy')}",
         f"- parameter_sets: {summary['parameter_set_count']}",
         f"- attempts: {summary['attempt_count']}",
         f"- completed: {summary.get('completed', summary['completed_count'])}",
+        f"- skipped: {summary.get('skipped', summary.get('skipped_count'))}",
         f"- skipped_no_coverage: {summary.get('skipped_no_coverage', summary['skipped_no_coverage_count'])}",
         f"- errors: {summary.get('errors', summary['error_count'])}",
         f"- fills_orders_pnl: {json.dumps(summary.get('fills_orders_pnl', {}), sort_keys=True)}",
@@ -1473,13 +1680,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Job B bounded PMBT microprice batch runner (backtest-only)."
     )
+    parser.add_argument("--single-attempt-input", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-attempt-output", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument(
         "--manifest-glob",
         default=DEFAULT_PASS_MANIFEST_GLOB,
         help="Pass-manifest glob used when --manifest is omitted; zero-candidate files are skipped.",
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--strategy", default="microprice_optimizer")
     parser.add_argument("--max-candidates", type=int, default=3)
     parser.add_argument("--max-param-sets", type=int, default=2)
@@ -1497,8 +1706,26 @@ def main() -> int:
             "all runs every explicit manifest/coverage-first guidance window."
         ),
     )
+    parser.add_argument(
+        "--attempt-isolation",
+        choices=("subprocess", "inline"),
+        default="subprocess",
+        help=(
+            "Run each candidate/parameter attempt in a fresh Python subprocess by default "
+            "so Nautilus/Rust logging is initialized once per process."
+        ),
+    )
     args = parser.parse_args()
 
+    if args.single_attempt_input is not None or args.single_attempt_output is not None:
+        if args.single_attempt_input is None or args.single_attempt_output is None:
+            parser.error(
+                "--single-attempt-input and --single-attempt-output must be provided together"
+            )
+        return _run_single_attempt_cli(args.single_attempt_input, args.single_attempt_output)
+
+    if args.output_dir is None:
+        parser.error("--output-dir is required")
     if args.max_candidates < 1 or args.max_param_sets < 1:
         raise SystemExit("max-candidates and max-param-sets must be >= 1")
     if args.manifest is None:

@@ -560,6 +560,118 @@ def test_run_batch_attempts_multiple_candidates_and_manifest_windows(monkeypatch
     assert summary["safety"]["orders_cancelled"] is False
 
 
+def test_run_batch_can_use_subprocess_attempt_isolation(monkeypatch, tmp_path):
+    manifest = tmp_path / "microprice_isolated.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "candidate_count": 1,
+                "candidates": [
+                    {
+                        "slug": "isolated-candidate",
+                        "source_strategy": "Microprice",
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 108,
+                            "min_book_events": 50,
+                            "window": {
+                                "start_time": "2026-05-10T08:00:00Z",
+                                "end_time": "2026-05-10T09:00:00Z",
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    class _FakeProcess:
+        def __init__(self, cmd):  # type: ignore[no-untyped-def]
+            self.cmd = list(cmd)
+            self.returncode = 0
+
+        async def communicate(self):  # type: ignore[no-untyped-def]
+            input_path = self.cmd[self.cmd.index("--single-attempt-input") + 1]
+            output_path = self.cmd[self.cmd.index("--single-attempt-output") + 1]
+            with open(input_path, encoding="utf-8") as fh:
+                request = json.load(fh)
+            calls.append(request)
+            replay_window = request["replay_request"]["window"]
+            attempt = job_b_microprice_batch.BacktestAttempt(
+                slug=request["candidate"]["slug"],
+                question=request["candidate"]["question"],
+                token_index=request["candidate"]["token_index"],
+                source_strategy=request["candidate"]["source_strategy"],
+                params=request["params"],
+                status="completed",
+                result={"fills": 1, "pnl": -0.1, "book_events": 108},
+                error=None,
+                diagnostics={
+                    "window": replay_window,
+                    "min_book_events": request["replay_request"]["min_book_events"],
+                    "fills": 1,
+                    "pnl": -0.1,
+                    "strategy_order_count": 1,
+                    "tail_bucket": "unknown",
+                    "no_order": {"causes": [], "blockers": {}},
+                    "suspected_causes": [],
+                },
+            )
+            with open(output_path, "w", encoding="utf-8") as fh:
+                json.dump(job_b_microprice_batch.asdict(attempt), fh)
+            return b"isolated child complete", b""
+
+        def kill(self):  # type: ignore[no-untyped-def]
+            self.returncode = -9
+
+        async def wait(self):  # type: ignore[no-untyped-def]
+            return self.returncode
+
+    async def _fake_create_subprocess_exec(*cmd, **kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["stdout"] == asyncio.subprocess.PIPE
+        assert kwargs["stderr"] == asyncio.subprocess.PIPE
+        assert "env" in kwargs
+        return _FakeProcess(cmd)
+
+    monkeypatch.setattr(
+        job_b_microprice_batch.asyncio,
+        "create_subprocess_exec",
+        _fake_create_subprocess_exec,
+    )
+    args = Namespace(
+        manifest=manifest,
+        strategy="microprice_optimizer",
+        max_candidates=1,
+        max_param_sets=1,
+        start_time="2026-05-10T20:00:00Z",
+        end_time="2026-05-10T21:00:00Z",
+        min_book_events=500,
+        per_attempt_timeout_secs=5,
+        window_policy="candidate",
+        attempt_isolation="subprocess",
+    )
+
+    summary = asyncio.run(job_b_microprice_batch.run_batch(args))
+
+    assert len(calls) == 1
+    assert calls[0]["candidate"]["slug"] == "isolated-candidate"
+    assert calls[0]["replay_request"]["window"] == {
+        "start_time": "2026-05-10T08:00:00Z",
+        "end_time": "2026-05-10T09:00:00Z",
+    }
+    assert summary["attempt_isolation"] == "subprocess"
+    assert summary["attempt_count"] == 1
+    assert summary["completed"] == 1
+    assert summary["skipped"] == 0
+    assert summary["errors"] == 0
+    assert summary["exact_window_status"] == "verified"
+    assert summary["safety"]["orders_submitted"] is False
+    assert summary["safety"]["credentials_required"] is False
+
+
 def test_run_batch_fail_closes_missing_pmxt_coverage(monkeypatch, tmp_path):
     manifest = tmp_path / "microprice_no_coverage.json"
     manifest.write_text(
