@@ -77,6 +77,7 @@ Detailed guides have been filed away in the [docs index](https://evan-kolberg.gi
     - [PMXT](https://evan-kolberg.github.io/prediction-market-backtesting/backtests/#pmxt)
     - [Telonex](https://evan-kolberg.github.io/prediction-market-backtesting/backtests/#telonex)
 - [Reward Market Scanner](https://evan-kolberg.github.io/prediction-market-backtesting/reward-market-scanner/)
+  - [Reward Maker Shadow Lifecycle V2](https://evan-kolberg.github.io/prediction-market-backtesting/reward-market-scanner/#reward-maker-shadow-lifecycle-v2)
 - [Polymarket Account Ledger Replay](https://evan-kolberg.github.io/prediction-market-backtesting/account-ledger-replay/)
   - [Runner And Notebook](https://evan-kolberg.github.io/prediction-market-backtesting/account-ledger-replay/#runner-and-notebook)
   - [What The Strategy Does](https://evan-kolberg.github.io/prediction-market-backtesting/account-ledger-replay/#what-the-strategy-does)

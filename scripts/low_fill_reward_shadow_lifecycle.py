@@ -39,6 +39,7 @@ TOKEN_BLOCKERS = {
     "missing_yes_no_outcome_mapping_for_clob_token_ids",
     "non_binary_outcome_mapping",
 }
+MARKOUT_HORIZONS = (("1m", 60), ("5m", 300), ("15m", 900))
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class BookSide:
     ask_size: float | None
     depth_bid: float | None
     depth_ask: float | None
+    depth_proxy: float | None
     token_id: str | None
 
 
@@ -230,6 +232,9 @@ def _book_side(row: Mapping[str, Any], side: str) -> BookSide:
         ),
         depth_ask=_parse_float(
             first_book_value("depth_ask_2c", "depth_ask_5c", "depth_ask_top10", "depth_ask")
+        ),
+        depth_proxy=_parse_float(
+            first_book_value("depth_proxy", "top_book_depth", "depth_top10", "min_top_book_depth")
         ),
         token_id=token_id,
     )
@@ -502,6 +507,42 @@ def _risk_label(score: float | None) -> str:
     return "low"
 
 
+def _combine_would_fill_classifications(classifications: Iterable[Any]) -> str:
+    values = [str(value) for value in classifications if value not in (None, "")]
+    if not values:
+        return "unknown"
+    if all(value == "conservative" for value in values):
+        return "conservative"
+    if any(value == "optimistic" for value in values):
+        return "optimistic"
+    return "unknown"
+
+
+def _would_fill_classification(
+    would_have_filled: Mapping[str, Any], touch_cross_status: str
+) -> str:
+    if (
+        would_have_filled.get("known") is True
+        and touch_cross_status != "would_cross_or_take_current_ask"
+    ):
+        return "conservative"
+    if touch_cross_status in {"resting_at_best_bid", "inside_spread_post_only"}:
+        return "optimistic"
+    return "unknown"
+
+
+def _markout_proxy() -> dict[str, dict[str, Any]]:
+    return {
+        label: {
+            "horizon_seconds": horizon_seconds,
+            "status": "unknown_missing_future_l2_or_trade_snapshot",
+            "markout_from_quote": None,
+            "basis": "requires_future_l2_snapshot_or_replay",
+        }
+        for label, horizon_seconds in MARKOUT_HORIZONS
+    }
+
+
 def _candidate_evidence_sources(candidate: Candidate) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     if candidate.source_path:
@@ -603,12 +644,13 @@ def build_quote(
     else:
         touch_cross_status = "inside_spread_post_only"
 
-    known_fill = touch_cross_status == "would_cross_or_take_current_ask"
-    if known_fill:
+    post_only_would_cross = touch_cross_status == "would_cross_or_take_current_ask"
+    known_fill = False
+    if post_only_would_cross:
         would_have_filled = {
-            "known": True,
-            "estimate": True,
-            "basis": "hypothetical_bid_crosses_current_ask",
+            "known": False,
+            "estimate": "unknown",
+            "basis": "post_only_quote_would_cross_current_ask_not_maker_fill",
         }
     elif price is None:
         would_have_filled = {
@@ -622,11 +664,12 @@ def build_quote(
             "estimate": "unknown",
             "basis": "requires_trade_tape_or_l2_queue_position",
         }
+    would_fill_classification = _would_fill_classification(would_have_filled, touch_cross_status)
 
     cancel_or_reprice_reason = "none_hold_quote"
     if price is None:
         cancel_or_reprice_reason = "no_quote_missing_book"
-    elif known_fill:
+    elif post_only_would_cross:
         cancel_or_reprice_reason = "cancel_post_only_quote_would_cross"
     elif reward_band_status == "out_of_band_spread":
         cancel_or_reprice_reason = "reprice_spread_outside_reward_band"
@@ -640,6 +683,8 @@ def build_quote(
     depth_near_touch = None
     if book.depth_bid is not None or book.depth_ask is not None:
         depth_near_touch = (book.depth_bid or 0.0) + (book.depth_ask or 0.0)
+    elif book.depth_proxy is not None:
+        depth_near_touch = book.depth_proxy
     depth_coverage = _safe_div(size, depth_near_touch)
 
     risk_score_parts = [
@@ -682,9 +727,13 @@ def build_quote(
         "hypothetical_quote_touch_cross_status": touch_cross_status,
         "would_have_filled_estimate": would_have_filled,
         "would_have_filled_probability": 1.0 if known_fill else None,
+        "would_fill_classification": would_fill_classification,
         "cancel_or_reprice_reason": cancel_or_reprice_reason,
         "scoring_eligible_estimate": scoring_eligible,
         "reward_score_proxy": _round(reward_score_proxy),
+        "queue_ahead_size_proxy": _round(same_side_size),
+        "queue_ahead_size_ratio": _round(queue_ahead_proxy),
+        "book_depth_proxy": _round(depth_near_touch),
         "adverse_selection_risk_proxy": {
             "score": _round(adverse_selection_score),
             "label": _risk_label(adverse_selection_score),
@@ -695,6 +744,8 @@ def build_quote(
             "half_spread_over_mid": _round(exit_slippage_proxy),
             "label": _risk_label(exit_slippage_proxy),
         },
+        "immediate_exit_loss_proxy": _round(exit_slippage_proxy),
+        "markout_proxy": _markout_proxy(),
     }
 
 
@@ -726,6 +777,9 @@ def evaluate_snapshot(
         cancel_reason = "none_hold_quote"
     fill_known = any(quote["would_have_filled_estimate"]["known"] for quote in quotes)
     fill_estimate = any(quote["would_have_filled_estimate"]["estimate"] is True for quote in quotes)
+    would_fill_classification = _combine_would_fill_classifications(
+        quote.get("would_fill_classification") for quote in quotes
+    )
     reward_score_proxy = sum(float(quote["reward_score_proxy"] or 0.0) for quote in quotes)
     max_adverse_risk = max(
         (float(quote["adverse_selection_risk_proxy"]["score"] or 0.0) for quote in quotes),
@@ -764,6 +818,7 @@ def evaluate_snapshot(
             ),
         },
         "would_have_filled_probability": 1.0 if fill_known and fill_estimate else None,
+        "would_fill_classification": would_fill_classification,
         "cancel_or_reprice_reason": cancel_reason,
         "time_in_band_contribution_secs": _round(snapshot_weight_secs if scoring_eligible else 0.0),
         "reward_score_proxy": _round(reward_score_proxy),
@@ -877,6 +932,9 @@ def aggregate_candidates(
             if known_fill_count
             else None
         )
+        would_fill_classification = _combine_would_fill_classifications(
+            snapshot.get("would_fill_classification") for snapshot in candidate_snapshots
+        )
         ev_fields = _reward_ev_fields(
             candidate,
             would_have_filled_probability=would_have_filled_probability,
@@ -892,6 +950,7 @@ def aggregate_candidates(
                 "yes_mid": _round(candidate.yes_mid),
                 "no_mid": _round(candidate.no_mid),
                 "reward_min_size": _round(candidate.reward_min_size),
+                "reward_amount": _round(_reward_value(candidate)),
                 "reward_max_spread_raw": _round(candidate.reward_max_spread_raw),
                 "reward_max_spread_decimal": _round(candidate.reward_max_spread),
                 "double_sided_required": quote_sides(candidate) == ["yes", "no"],
@@ -907,6 +966,7 @@ def aggregate_candidates(
                     else "unknown_requires_trade_tape_or_l2_queue_position"
                 ),
                 "would_have_filled_probability": would_have_filled_probability,
+                "would_fill_classification": would_fill_classification,
                 "adverse_selection_risk": {
                     "score": _round(max_adverse),
                     "label": _risk_label(max_adverse),
@@ -941,7 +1001,59 @@ def aggregate_candidates(
         row["estimated_reward_score_share_proxy"] = _round(
             _safe_div(float(row["reward_score_proxy"] or 0.0), total_reward_score)
         )
+        row["ev_readiness"] = _ev_readiness(row)
     return raw
+
+
+def _ev_readiness(row: Mapping[str, Any]) -> dict[str, Any]:
+    reward_amount = _parse_float(row.get("reward_amount"))
+    reward_share = _parse_float(row.get("estimated_reward_score_share_proxy"))
+    time_ratio = _parse_float(row.get("time_in_band_ratio"))
+    fill_probability = _parse_float(row.get("would_have_filled_probability"))
+    exit_loss = _parse_float(
+        _as_mapping(row.get("exit_loss_proxy")).get("expected_exit_loss_proxy")
+    )
+    missing: list[str] = []
+    if reward_amount is None:
+        missing.append("reward_amount")
+    if reward_share is None:
+        missing.append("reward_score_share_proxy")
+    if time_ratio is None:
+        missing.append("time_in_band_ratio")
+    if fill_probability is None:
+        missing.append("would_have_filled_probability")
+    if exit_loss is None:
+        missing.append("exit_loss_proxy")
+    if row.get("would_fill_classification") != "conservative":
+        missing.append("conservative_would_fill_evidence")
+    if missing:
+        return {
+            "status": "fail_closed_not_computable",
+            "missing_inputs": missing,
+            "base_case_ev": None,
+            "worst_case_ev": None,
+            "best_case_ev": None,
+            "profitable_edge": False,
+            "basis": "requires reward amount, denominator share, time in band, conservative would-fill, and exit-loss evidence",
+        }
+    assert reward_amount is not None
+    assert reward_share is not None
+    assert time_ratio is not None
+    assert fill_probability is not None
+    assert exit_loss is not None
+    reward_income = reward_amount * reward_share * time_ratio
+    base_case = reward_income - fill_probability * exit_loss
+    worst_case = reward_income - fill_probability * exit_loss * 2.0
+    best_case = reward_income
+    return {
+        "status": "computable_shadow_proxy_not_profit_claim",
+        "missing_inputs": [],
+        "base_case_ev": _round(base_case),
+        "worst_case_ev": _round(worst_case),
+        "best_case_ev": _round(best_case),
+        "profitable_edge": bool(base_case > 0 and worst_case > 0),
+        "basis": "reward_amount * reward_score_share * time_in_band - fill_probability * exit_loss",
+    }
 
 
 def build_report(
@@ -1042,6 +1154,7 @@ def _csv_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "time_in_band_ratio": candidate.get("time_in_band_ratio"),
                 "would_have_filled_status": candidate.get("would_have_filled_status"),
                 "would_have_filled_probability": candidate.get("would_have_filled_probability"),
+                "would_fill_classification": candidate.get("would_fill_classification"),
                 "reward_score_proxy": candidate.get("reward_score_proxy"),
                 "estimated_reward_score_share_proxy": candidate.get(
                     "estimated_reward_score_share_proxy"
@@ -1132,15 +1245,275 @@ def _markdown_report(report: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _quote_log_records(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    source_manifest = str(report.get("source_manifest") or "")
+    for snapshot in _as_list(report.get("snapshots")):
+        if not isinstance(snapshot, Mapping):
+            continue
+        safety = safety_object()
+        for quote in _as_list(snapshot.get("quotes")):
+            if not isinstance(quote, Mapping):
+                continue
+            would_fill = _as_mapping(quote.get("would_have_filled_estimate"))
+            exit_slippage = _as_mapping(quote.get("exit_slippage_proxy"))
+            record = {
+                "schema_version": "polymarket.reward-maker-virtual-quote-log.v2",
+                "generated_at_utc": report.get("generated_at_utc"),
+                "snapshot_at_utc": snapshot.get("snapshot_at_utc"),
+                "snapshot_index": snapshot.get("snapshot_index"),
+                "mode": SAFETY_MODE,
+                "source_manifest": source_manifest,
+                "slug": snapshot.get("slug"),
+                "question": snapshot.get("question"),
+                "condition_id": snapshot.get("condition_id"),
+                "source_url": snapshot.get("source_url"),
+                "side": quote.get("side"),
+                "token_id": quote.get("token_id"),
+                "book": {
+                    "best_bid": quote.get("best_bid"),
+                    "best_ask": quote.get("best_ask"),
+                    "spread": quote.get("spread"),
+                    "mid": quote.get("mid"),
+                    "depth_proxy": quote.get("book_depth_proxy"),
+                },
+                "reward_terms": {
+                    "reward_min_size": quote.get("reward_min_size"),
+                    "reward_max_spread_raw": quote.get("reward_max_spread_raw"),
+                    "reward_max_spread_decimal": quote.get("reward_max_spread_decimal"),
+                },
+                "virtual_quote": {
+                    "action": quote.get("action"),
+                    "post_only": True,
+                    "price": quote.get("price"),
+                    "size": quote.get("size"),
+                    "would_submit_order": False,
+                },
+                "reward_band": {
+                    "status": quote.get("reward_band_status"),
+                    "eligible_now": quote.get("reward_band_status") == "in_band",
+                    "time_in_band_contribution_secs": snapshot.get(
+                        "time_in_band_contribution_secs"
+                    ),
+                },
+                "queue_ahead_proxy": {
+                    "size_proxy": quote.get("queue_ahead_size_proxy"),
+                    "size_ratio": quote.get("queue_ahead_size_ratio"),
+                    "basis": "same-side top-of-book size at quote price",
+                },
+                "trade_l2_evidence": {
+                    "status": snapshot.get("trade_snapshot_status"),
+                    "basis": would_fill.get("basis"),
+                },
+                "would_fill": {
+                    "classification": quote.get("would_fill_classification"),
+                    "known": would_fill.get("known"),
+                    "estimate": would_fill.get("estimate"),
+                    "probability": quote.get("would_have_filled_probability"),
+                    "basis": would_fill.get("basis"),
+                },
+                "exit_risk": {
+                    "immediate_exit_loss_proxy": quote.get("immediate_exit_loss_proxy"),
+                    "exit_slippage_proxy": exit_slippage,
+                    "markout_proxy": quote.get("markout_proxy"),
+                },
+                "safety": safety,
+                **safety,
+            }
+            records.append(record)
+    return records
+
+
+def _counts_by(records: Sequence[Mapping[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        value: Any = record
+        for part in key.split("."):
+            value = _as_mapping(value).get(part)
+        label = str(value if value not in (None, "") else "unknown")
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _would_fill_report(
+    report: Mapping[str, Any], quote_records: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    candidates = [
+        {
+            "slug": row.get("slug"),
+            "would_fill_classification": row.get("would_fill_classification"),
+            "would_have_filled_status": row.get("would_have_filled_status"),
+            "would_have_filled_probability": row.get("would_have_filled_probability"),
+            "would_have_filled_known_count": row.get("would_have_filled_known_count"),
+            "would_have_filled_estimated_true_count": row.get(
+                "would_have_filled_estimated_true_count"
+            ),
+        }
+        for row in _as_list(report.get("candidate_table"))
+        if isinstance(row, Mapping)
+    ]
+    return {
+        "schema_version": 1,
+        "generated_at_utc": report.get("generated_at_utc"),
+        "mode": SAFETY_MODE,
+        "source_manifest": report.get("source_manifest"),
+        "safety": safety_object(),
+        "no_profit_claim": True,
+        "quote_record_count": len(quote_records),
+        "classification_counts": _counts_by(quote_records, "would_fill.classification"),
+        "known_quote_count": sum(
+            1 for record in quote_records if _as_mapping(record.get("would_fill")).get("known")
+        ),
+        "unknown_probability_count": sum(
+            1
+            for record in quote_records
+            if _as_mapping(record.get("would_fill")).get("probability") is None
+        ),
+        "candidates": candidates,
+    }
+
+
+def _exit_risk_report(
+    report: Mapping[str, Any], quote_records: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    losses = [
+        float(_as_mapping(record.get("exit_risk")).get("immediate_exit_loss_proxy"))
+        for record in quote_records
+        if _as_mapping(record.get("exit_risk")).get("immediate_exit_loss_proxy") is not None
+    ]
+    markout_available_count = 0
+    for record in quote_records:
+        markouts = _as_mapping(_as_mapping(record.get("exit_risk")).get("markout_proxy"))
+        for markout in markouts.values():
+            if isinstance(markout, Mapping) and markout.get("markout_from_quote") is not None:
+                markout_available_count += 1
+    candidates = [
+        {
+            "slug": row.get("slug"),
+            "exit_slippage_proxy": row.get("exit_slippage_proxy"),
+            "exit_loss_proxy": row.get("exit_loss_proxy"),
+            "adverse_selection_risk": row.get("adverse_selection_risk"),
+        }
+        for row in _as_list(report.get("candidate_table"))
+        if isinstance(row, Mapping)
+    ]
+    return {
+        "schema_version": 1,
+        "generated_at_utc": report.get("generated_at_utc"),
+        "mode": SAFETY_MODE,
+        "source_manifest": report.get("source_manifest"),
+        "safety": safety_object(),
+        "no_profit_claim": True,
+        "quote_record_count": len(quote_records),
+        "immediate_exit_loss_proxy_count": len(losses),
+        "max_immediate_exit_loss_proxy": _round(max(losses) if losses else None),
+        "markout_available_count": markout_available_count,
+        "markout_missing_count": len(quote_records) * len(MARKOUT_HORIZONS)
+        - markout_available_count,
+        "exit_slippage_label_counts": _counts_by(
+            quote_records, "exit_risk.exit_slippage_proxy.label"
+        ),
+        "candidates": candidates,
+    }
+
+
+def _ev_readiness_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    candidates = [
+        {
+            "slug": row.get("slug"),
+            "reward_ev_status": row.get("reward_ev_status"),
+            "expected_reward_ev_minus_loss": row.get("expected_reward_ev_minus_loss"),
+            "ev_readiness": row.get("ev_readiness"),
+        }
+        for row in _as_list(report.get("candidate_table"))
+        if isinstance(row, Mapping)
+    ]
+    computable = [
+        row
+        for row in candidates
+        if _as_mapping(row.get("ev_readiness")).get("status")
+        == "computable_shadow_proxy_not_profit_claim"
+    ]
+    profitable = [
+        row for row in computable if _as_mapping(row.get("ev_readiness")).get("profitable_edge")
+    ]
+    verdict = "profitable_edge_not_established_fail_closed"
+    if profitable and len(profitable) == len(computable):
+        verdict = "computable_positive_base_and_worst_shadow_proxy_not_profit_claim"
+    return {
+        "schema_version": 1,
+        "generated_at_utc": report.get("generated_at_utc"),
+        "mode": SAFETY_MODE,
+        "source_manifest": report.get("source_manifest"),
+        "safety": safety_object(),
+        "no_profit_claim": True,
+        "profitable_edge_verdict": verdict,
+        "candidate_count": len(candidates),
+        "computable_count": len(computable),
+        "profitable_edge_count": len(profitable),
+        "candidates": candidates,
+    }
+
+
+def _simple_markdown_report(title: str, report: Mapping[str, Any]) -> str:
+    safety = _as_mapping(report.get("safety"))
+    lines = [
+        f"# {title}",
+        "",
+        f"- mode: {report.get('mode')}",
+        f"- source_manifest: {report.get('source_manifest')}",
+        f"- no_profit_claim: {report.get('no_profit_claim')}",
+        f"- orders_submitted={str(safety.get('orders_submitted')).lower()}",
+        f"- orders_signed={str(safety.get('orders_signed')).lower()}",
+        f"- orders_cancelled={str(safety.get('orders_cancelled')).lower()}",
+        f"- credentials_required={str(safety.get('credentials_required')).lower()}",
+        f"- live_trading_worker_started={str(safety.get('live_trading_worker_started')).lower()}",
+        f"- worker_trading_started={str(safety.get('worker_trading_started')).lower()}",
+        "",
+    ]
+    if "classification_counts" in report:
+        lines.extend(["## Would-fill", ""])
+        for key, value in sorted(_as_mapping(report.get("classification_counts")).items()):
+            lines.append(f"- {key}: {value}")
+    if "max_immediate_exit_loss_proxy" in report:
+        lines.extend(["## Exit Risk", ""])
+        lines.append(
+            f"- max_immediate_exit_loss_proxy: {report.get('max_immediate_exit_loss_proxy')}"
+        )
+        lines.append(f"- markout_available_count: {report.get('markout_available_count')}")
+        lines.append(f"- markout_missing_count: {report.get('markout_missing_count')}")
+    if "profitable_edge_verdict" in report:
+        lines.extend(["## EV Readiness", ""])
+        lines.append(f"- profitable_edge_verdict: {report.get('profitable_edge_verdict')}")
+        lines.append(f"- computable_count: {report.get('computable_count')}")
+        lines.append(f"- profitable_edge_count: {report.get('profitable_edge_count')}")
+    lines.extend(["", "No reward or profitability claim is made from shadow diagnostics alone."])
+    return "\n".join(lines) + "\n"
+
+
 def write_outputs(report: dict[str, Any], output_dir: Path, timestamp: str) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"low_fill_reward_shadow_lifecycle_{timestamp}.json"
     csv_path = output_dir / f"low_fill_reward_shadow_lifecycle_{timestamp}.csv"
     md_path = output_dir / f"low_fill_reward_shadow_lifecycle_{timestamp}.md"
+    quote_log_path = output_dir / f"low_fill_reward_shadow_quote_log_{timestamp}.jsonl"
+    would_fill_json_path = output_dir / f"low_fill_reward_would_fill_{timestamp}.json"
+    would_fill_md_path = output_dir / f"low_fill_reward_would_fill_{timestamp}.md"
+    exit_risk_json_path = output_dir / f"low_fill_reward_exit_risk_{timestamp}.json"
+    exit_risk_md_path = output_dir / f"low_fill_reward_exit_risk_{timestamp}.md"
+    ev_readiness_json_path = output_dir / f"low_fill_reward_ev_readiness_{timestamp}.json"
+    ev_readiness_md_path = output_dir / f"low_fill_reward_ev_readiness_{timestamp}.md"
     report["output_files"] = {
         "json": str(json_path),
         "csv": str(csv_path),
         "markdown": str(md_path),
+        "quote_log_jsonl": str(quote_log_path),
+        "would_fill_json": str(would_fill_json_path),
+        "would_fill_markdown": str(would_fill_md_path),
+        "exit_risk_json": str(exit_risk_json_path),
+        "exit_risk_markdown": str(exit_risk_md_path),
+        "ev_readiness_json": str(ev_readiness_json_path),
+        "ev_readiness_markdown": str(ev_readiness_md_path),
     }
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     rows = _csv_rows(report)
@@ -1149,6 +1522,41 @@ def write_outputs(report: dict[str, Any], output_dir: Path, timestamp: str) -> d
         writer.writeheader()
         writer.writerows(rows)
     md_path.write_text(_markdown_report(report), encoding="utf-8")
+    quote_records = _quote_log_records(report)
+    quote_log_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in quote_records),
+        encoding="utf-8",
+    )
+    would_fill_report = _would_fill_report(report, quote_records)
+    would_fill_report["source_quote_log"] = str(quote_log_path)
+    would_fill_json_path.write_text(
+        json.dumps(would_fill_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    would_fill_md_path.write_text(
+        _simple_markdown_report("Low-fill Reward Would-fill Evidence", would_fill_report),
+        encoding="utf-8",
+    )
+    exit_risk_report = _exit_risk_report(report, quote_records)
+    exit_risk_report["source_quote_log"] = str(quote_log_path)
+    exit_risk_json_path.write_text(
+        json.dumps(exit_risk_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    exit_risk_md_path.write_text(
+        _simple_markdown_report("Low-fill Reward Exit Risk Evidence", exit_risk_report),
+        encoding="utf-8",
+    )
+    ev_readiness_report = _ev_readiness_report(report)
+    ev_readiness_report["source_quote_log"] = str(quote_log_path)
+    ev_readiness_json_path.write_text(
+        json.dumps(ev_readiness_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    ev_readiness_md_path.write_text(
+        _simple_markdown_report("Low-fill Reward EV Readiness", ev_readiness_report),
+        encoding="utf-8",
+    )
     return report["output_files"]
 
 

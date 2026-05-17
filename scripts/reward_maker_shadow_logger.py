@@ -31,10 +31,11 @@ def _book_side(raw: dict[str, Any], side: str) -> dict[str, float | None]:
     return {
         "bid": _parse_float(book.get("bid") or book.get("best_bid")),
         "ask": _parse_float(book.get("ask") or book.get("best_ask")),
-        "bid_size": _parse_float(book.get("bid_size")),
-        "ask_size": _parse_float(book.get("ask_size")),
+        "bid_size": _parse_float(book.get("bid_size") or book.get("best_bid_size")),
+        "ask_size": _parse_float(book.get("ask_size") or book.get("best_ask_size")),
         "depth_bid_5c": _parse_float(book.get("depth_bid_5c") or book.get("depth_bid_top10")),
         "depth_ask_5c": _parse_float(book.get("depth_ask_5c") or book.get("depth_ask_top10")),
+        "depth_proxy": _parse_float(book.get("depth_proxy")),
     }
 
 
@@ -46,7 +47,9 @@ def _reward_fields(raw: dict[str, Any]) -> dict[str, Any]:
     return {k: evidence.get(k) for k in allow if k in evidence}
 
 
-def build_shadow_record(raw: dict[str, Any], *, generated_at: str, quote_size: float) -> dict[str, Any] | None:
+def build_shadow_record(
+    raw: dict[str, Any], *, generated_at: str, quote_size: float
+) -> dict[str, Any] | None:
     slug = raw.get("slug") or raw.get("market_slug")
     if not isinstance(slug, str) or not slug:
         return None
@@ -72,7 +75,12 @@ def build_shadow_record(raw: dict[str, Any], *, generated_at: str, quote_size: f
             accidental_fill_risk = "tight_spread_possible_fill"
         else:
             accidental_fill_risk = "moderate"
+    queue_ahead_size = yes["bid_size"] if quoted_price is not None else None
+    queue_ahead_ratio = None
+    if queue_ahead_size is not None and queue_ahead_size > 0:
+        queue_ahead_ratio = quote_size / queue_ahead_size
     return {
+        "schema_version": "polymarket.reward-maker-shadow-record.v2",
         "generated_at_utc": generated_at,
         "mode": SAFETY_MODE,
         "slug": slug,
@@ -94,6 +102,9 @@ def build_shadow_record(raw: dict[str, Any], *, generated_at: str, quote_size: f
             "in_reward_band_now": in_band,
             "time_in_band_seconds_observed": 0,
             "would_have_filled": "unknown_single_snapshot",
+            "would_fill_classification": "optimistic" if quoted_price is not None else "unknown",
+            "queue_ahead_size_proxy": queue_ahead_size,
+            "queue_ahead_size_ratio": _parse_float(queue_ahead_ratio),
             "accidental_fill_risk": accidental_fill_risk,
             "exit_risk": "unknown_until_multisnapshot_or_replay",
         },
@@ -101,7 +112,9 @@ def build_shadow_record(raw: dict[str, Any], *, generated_at: str, quote_size: f
             "live_trading": False,
             "orders_submitted": False,
             "orders_signed": False,
+            "orders_cancelled": False,
             "credentials_required": False,
+            "live_trading_worker_started": False,
             "worker_trading_started": False,
         },
     }
@@ -113,7 +126,14 @@ def load_scan_candidates(scan_path: Path) -> list[dict[str, Any]]:
     return [c for c in candidates if isinstance(c, dict)]
 
 
-def write_outputs(records: list[dict[str, Any]], *, output_dir: Path, report_dir: Path, timestamp: str, source_scan: Path) -> dict[str, str]:
+def write_outputs(
+    records: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    report_dir: Path,
+    timestamp: str,
+    source_scan: Path,
+) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / f"reward_shadow_{timestamp}.jsonl"
@@ -125,20 +145,41 @@ def write_outputs(records: list[dict[str, Any]], *, output_dir: Path, report_dir
         "mode": SAFETY_MODE,
         "source_scan": str(source_scan),
         "record_count": len(records),
-        "safety": {"live_trading": False, "orders_submitted": False, "orders_signed": False, "credentials_required": False},
+        "safety": {
+            "live_trading": False,
+            "orders_submitted": False,
+            "orders_signed": False,
+            "orders_cancelled": False,
+            "credentials_required": False,
+            "live_trading_worker_started": False,
+            "worker_trading_started": False,
+        },
         "records": records,
     }
     json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-    lines = ["# Reward Maker Shadow Observation", "", f"- source_scan: {source_scan}", f"- records: {len(records)}", "- safety: shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.", "", "| slug | yes_mid | spread | quote | in_band | fill_risk |", "|---|---:|---:|---:|---|---|"]
+    lines = [
+        "# Reward Maker Shadow Observation",
+        "",
+        f"- source_scan: {source_scan}",
+        f"- records: {len(records)}",
+        "- safety: shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.",
+        "",
+        "| slug | yes_mid | spread | quote | in_band | fill_risk |",
+        "|---|---:|---:|---:|---|---|",
+    ]
     for r in records:
         q = r["shadow_quote"]
-        lines.append(f"| {r['slug']} | {r.get('yes_mid')} | {r.get('yes_spread')} | {q.get('price')} | {q.get('in_reward_band_now')} | {q.get('accidental_fill_risk')} |")
+        lines.append(
+            f"| {r['slug']} | {r.get('yes_mid')} | {r.get('yes_spread')} | {q.get('price')} | {q.get('in_reward_band_now')} | {q.get('accidental_fill_risk')} |"
+        )
     md_path.write_text("\n".join(lines) + "\n")
     return {"jsonl": str(jsonl_path), "json": str(json_path), "markdown": str(md_path)}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build reward-maker shadow-only observation records from a market scan.")
+    parser = argparse.ArgumentParser(
+        description="Build reward-maker shadow-only observation records from a market scan."
+    )
     parser.add_argument("--scan", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
@@ -157,8 +198,20 @@ def main() -> int:
             records.append(rec)
         if len(records) >= args.limit:
             break
-    outputs = write_outputs(records, output_dir=args.output_dir, report_dir=args.report_dir, timestamp=timestamp, source_scan=args.scan)
-    print(json.dumps({"record_count": len(records), "output_files": outputs, "mode": SAFETY_MODE}, indent=2, sort_keys=True))
+    outputs = write_outputs(
+        records,
+        output_dir=args.output_dir,
+        report_dir=args.report_dir,
+        timestamp=timestamp,
+        source_scan=args.scan,
+    )
+    print(
+        json.dumps(
+            {"record_count": len(records), "output_files": outputs, "mode": SAFETY_MODE},
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

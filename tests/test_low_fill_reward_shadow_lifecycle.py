@@ -106,7 +106,7 @@ def test_duplicate_side_tokens_block_lifecycle_report_without_dropping_candidate
 
     report = build_report(
         source,
-        duration_secs=0,
+        duration_secs=1,
         interval_secs=1,
         max_candidates=1,
         sleep=False,
@@ -146,9 +146,12 @@ def test_build_report_scores_lifecycle_without_live_actions(tmp_path) -> None:
     assert row["double_sided_required"] is True
     assert row["time_in_band_secs"] == 2
     assert row["would_have_filled_status"] == "unknown_requires_trade_tape_or_l2_queue_position"
+    assert row["would_fill_classification"] == "optimistic"
     assert row["would_have_filled_probability"] is None
     assert row["reward_ev_status"] == "not_computable_missing_inputs"
     assert "would_have_filled_probability" in row["missing_reward_ev_inputs"]
+    assert row["ev_readiness"]["status"] == "fail_closed_not_computable"
+    assert "conservative_would_fill_evidence" in row["ev_readiness"]["missing_inputs"]
     assert row["expected_reward_ev_minus_expected_loss_classification"] == (
         "unknown_missing_reward_amount_or_fill_loss_distribution"
     )
@@ -158,7 +161,7 @@ def test_build_report_scores_lifecycle_without_live_actions(tmp_path) -> None:
     assert first_snapshot["safety"]["orders_submitted"] is False
 
 
-def test_build_report_marks_reward_ev_computable_only_with_would_fill_evidence(tmp_path) -> None:
+def test_build_report_fails_closed_when_post_only_quote_would_cross(tmp_path) -> None:
     source = tmp_path / "source.json"
     row = _candidate()
     row["yes_book"] = {
@@ -173,19 +176,25 @@ def test_build_report_marks_reward_ev_computable_only_with_would_fill_evidence(t
 
     report = build_report(
         source,
-        duration_secs=0,
+        duration_secs=1,
         interval_secs=1,
         max_candidates=1,
         sleep=False,
     )
     candidate = report["candidate_table"][0]
 
-    assert candidate["would_have_filled_status"] == "known"
-    assert candidate["would_have_filled_probability"] == 1.0
-    assert candidate["reward_ev_status"] == "computable_shadow_proxy_not_profit_claim"
-    assert candidate["expected_reward_ev_minus_loss"] is not None
-    assert candidate["missing_reward_ev_inputs"] == []
-    assert report["summary"]["reward_ev_computable_count"] == 1
+    assert (
+        candidate["would_have_filled_status"] == "unknown_requires_trade_tape_or_l2_queue_position"
+    )
+    assert candidate["would_have_filled_probability"] is None
+    assert candidate["would_fill_classification"] in {"optimistic", "unknown"}
+    assert candidate["reward_ev_status"] == "not_computable_missing_inputs"
+    assert candidate["expected_reward_ev_minus_loss"] is None
+    assert candidate["ev_readiness"]["status"] == "fail_closed_not_computable"
+    assert "would_have_filled_probability" in candidate["ev_readiness"]["missing_inputs"]
+    assert "conservative_would_fill_evidence" in candidate["ev_readiness"]["missing_inputs"]
+    assert candidate["missing_reward_ev_inputs"]
+    assert report["summary"]["reward_ev_computable_count"] == 0
 
 
 def test_missing_book_fails_closed_as_blocked_unknown(tmp_path) -> None:
@@ -224,7 +233,18 @@ def test_write_outputs_includes_csv_and_safety_columns(tmp_path) -> None:
 
     outputs = write_outputs(report, tmp_path / "reports", "20260511T000000Z")
 
-    assert set(outputs) == {"json", "csv", "markdown"}
+    assert set(outputs) == {
+        "json",
+        "csv",
+        "markdown",
+        "quote_log_jsonl",
+        "would_fill_json",
+        "would_fill_markdown",
+        "exit_risk_json",
+        "exit_risk_markdown",
+        "ev_readiness_json",
+        "ev_readiness_markdown",
+    }
     with open(outputs["csv"], newline="", encoding="utf-8") as csv_file:
         rows = list(csv.DictReader(csv_file))
     assert rows[0]["orders_submitted"] == "False"
@@ -234,3 +254,26 @@ def test_write_outputs_includes_csv_and_safety_columns(tmp_path) -> None:
     assert rows[0]["live_trading"] == "False"
     assert rows[0]["worker_trading_started"] == "False"
     assert rows[0]["live_trading_worker_started"] == "False"
+    quote_rows = [
+        json.loads(line)
+        for line in open(outputs["quote_log_jsonl"], encoding="utf-8")
+        if line.strip()
+    ]
+    assert quote_rows[0]["schema_version"] == "polymarket.reward-maker-virtual-quote-log.v2"
+    assert quote_rows[0]["would_fill"]["classification"] == "optimistic"
+    assert quote_rows[0]["virtual_quote"]["would_submit_order"] is False
+    assert quote_rows[0]["safety"]["orders_submitted"] is False
+    would_fill = json.loads(open(outputs["would_fill_json"], encoding="utf-8").read())
+    exit_risk = json.loads(open(outputs["exit_risk_json"], encoding="utf-8").read())
+    ev_readiness = json.loads(open(outputs["ev_readiness_json"], encoding="utf-8").read())
+    assert would_fill["classification_counts"]["optimistic"] >= 1
+    assert exit_risk["markout_missing_count"] >= 1
+    assert ev_readiness["profitable_edge_verdict"] == "profitable_edge_not_established_fail_closed"
+
+
+def test_partial_conservative_would_fill_does_not_promote_to_conservative() -> None:
+    from scripts.low_fill_reward_shadow_lifecycle import _combine_would_fill_classifications
+
+    assert _combine_would_fill_classifications(["conservative", "unknown"]) == "unknown"
+    assert _combine_would_fill_classifications(["conservative", "optimistic"]) == "optimistic"
+    assert _combine_would_fill_classifications(["conservative", "conservative"]) == "conservative"

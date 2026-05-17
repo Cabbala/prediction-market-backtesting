@@ -119,6 +119,12 @@ def test_ev_evidence_fails_closed_without_l2_and_counts_high_tick_cost(tmp_path:
         "not_computable_missing_l2_or_trade_fill_evidence"
     )
     assert "missing_l2_or_trade_fill_evidence" in by_slug["medium-tail"]["not_computable_reasons"]
+    assert by_slug["medium-tail"]["ev_readiness"]["status"] == "fail_closed_not_computable"
+    assert (
+        "real_l2_or_trade_would_fill_evidence"
+        in by_slug["medium-tail"]["ev_readiness"]["missing_inputs"]
+    )
+    assert report["profit_verdict"] == "profitable_edge_not_established_fail_closed"
     assert report["safety"]["orders_submitted"] is False
 
 
@@ -179,6 +185,11 @@ def test_ev_evidence_computes_only_with_real_fill_evidence(tmp_path: Path) -> No
         "computable_shadow_ev_evidence_not_profit_claim"
     )
     assert row["expected_reward_ev_minus_loss"] == 2.45
+    assert row["ev_readiness"]["base_case_ev"] == 2.45
+    assert row["ev_readiness"]["worst_case_ev"] == 2.4
+    assert row["ev_readiness"]["best_case_ev"] == 2.5
+    assert row["ev_readiness"]["profitable_edge"] is True
+    assert report["summary"]["strict_profitable_edge_count"] == 1
     assert row["not_computable_reasons"] == []
 
 

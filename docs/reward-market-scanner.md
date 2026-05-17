@@ -31,3 +31,28 @@ Run locally in the PMBT worktree:
 ```
 
 A manifest is a research queue, not a go-live approval. Live promotion remains blocked until separate user approval plus geoblock, secrets, execution-adapter, risk-limit, and dry-run evidence gates.
+
+## Reward Maker Shadow Lifecycle V2
+
+`scripts/low_fill_reward_shadow_lifecycle.py` emits shadow-only virtual maker
+quote evidence for low-fill reward research. It defines post-only virtual quotes
+from manifest top-of-book snapshots, measures reward-band scheduled time,
+classifies would-fill evidence as `conservative`, `optimistic`, or `unknown`,
+and writes fail-closed EV readiness scenarios.
+
+The writer produces:
+
+- `low_fill_reward_shadow_quote_log_*.jsonl` with one virtual quote record per
+  snapshot side, including book touch, reward terms, queue-ahead proxy,
+  would-fill classification, immediate exit loss proxy, 1m/5m/15m markout
+  placeholders, and explicit shadow safety fields.
+- `low_fill_reward_would_fill_*.json/.md` summarizing conservative,
+  optimistic, and unknown fill evidence.
+- `low_fill_reward_exit_risk_*.json/.md` summarizing immediate exit-loss and
+  missing markout evidence.
+- `low_fill_reward_ev_readiness_*.json/.md` with base/worst/best cases.
+
+EV readiness fails closed unless reward amount, reward-score denominator share,
+time in band, conservative would-fill evidence, and exit-loss evidence are all
+available. The reports do not make a profitability claim from shadow diagnostics
+alone.

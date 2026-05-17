@@ -441,6 +441,55 @@ def _base_candidate(
     }
 
 
+def _ev_readiness(row: Mapping[str, Any]) -> dict[str, Any]:
+    reward_amount = _parse_float(row.get("reward_amount"))
+    reward_share = _parse_float(row.get("reward_score_share_proxy"))
+    time_ratio = _parse_float(row.get("time_in_band_ratio_proxy"))
+    fill_probability = _parse_float(row.get("would_fill_probability_proxy"))
+    exit_loss = _parse_float(row.get("expected_exit_loss_proxy"))
+    missing: list[str] = []
+    if reward_amount is None:
+        missing.append("reward_amount")
+    if reward_share is None:
+        missing.append("reward_score_share_proxy")
+    if time_ratio is None:
+        missing.append("time_in_band_ratio")
+    if fill_probability is None:
+        missing.append("would_fill_probability")
+    if exit_loss is None:
+        missing.append("expected_exit_loss_proxy")
+    if row.get("would_fill_evidence_status") != "real_l2_or_trade_evidence":
+        missing.append("real_l2_or_trade_would_fill_evidence")
+    if missing:
+        return {
+            "status": "fail_closed_not_computable",
+            "missing_inputs": missing,
+            "base_case_ev": None,
+            "worst_case_ev": None,
+            "best_case_ev": None,
+            "profitable_edge": False,
+            "basis": "requires reward amount, denominator share, time in band, real fill evidence, and exit-loss evidence",
+        }
+    assert reward_amount is not None
+    assert reward_share is not None
+    assert time_ratio is not None
+    assert fill_probability is not None
+    assert exit_loss is not None
+    reward_income = reward_amount * reward_share * time_ratio
+    base_case = reward_income - fill_probability * exit_loss
+    worst_case = reward_income - fill_probability * exit_loss * 2.0
+    best_case = reward_income
+    return {
+        "status": "computable_shadow_ev_evidence_not_profit_claim",
+        "missing_inputs": [],
+        "base_case_ev": _round(base_case),
+        "worst_case_ev": _round(worst_case),
+        "best_case_ev": _round(best_case),
+        "profitable_edge": bool(base_case > 0 and worst_case > 0),
+        "basis": "reward_amount * reward_score_share * time_in_band - fill_probability * exit_loss",
+    }
+
+
 def build_report(
     observation_path: Path,
     *,
@@ -486,6 +535,7 @@ def build_report(
             primary = row["not_computable_reasons"][0]
             row["not_computable_reason"] = primary
             row["expected_reward_ev_minus_loss_status"] = f"not_computable_{primary}"
+            row["ev_readiness"] = _ev_readiness(row)
             continue
 
         reward_amount = float(row["reward_amount"])
@@ -499,6 +549,7 @@ def build_report(
         row["expected_reward_ev_minus_loss_status"] = (
             "computable_shadow_ev_evidence_not_profit_claim"
         )
+        row["ev_readiness"] = _ev_readiness(row)
 
     computable = [
         row
@@ -515,6 +566,17 @@ def build_report(
     summary = {
         "candidate_count": len(candidates),
         "reward_ev_computable_count": len(computable),
+        "ev_readiness_computable_count": sum(
+            1
+            for row in candidates
+            if _as_mapping(row.get("ev_readiness")).get("status")
+            == "computable_shadow_ev_evidence_not_profit_claim"
+        ),
+        "strict_profitable_edge_count": sum(
+            1
+            for row in candidates
+            if _as_mapping(row.get("ev_readiness")).get("profitable_edge") is True
+        ),
         "would_have_filled_known_count": sum(
             1
             for row in candidates
@@ -541,6 +603,9 @@ def build_report(
     classification = "blocked" if not candidates else "diagnostic_only"
     if summary["reward_ev_computable_count"] > 0:
         classification = "adopted"
+    profit_verdict = "profitable_edge_not_established_fail_closed"
+    if summary["strict_profitable_edge_count"] > 0:
+        profit_verdict = "computable_positive_base_and_worst_shadow_proxy_not_profit_claim"
     return {
         "schema_version": 1,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -552,7 +617,7 @@ def build_report(
         "exclude_high_tick_cost": exclude_high_tick_cost,
         "safety": safety_object(),
         "no_profit_claim": True,
-        "profit_verdict": "no_profit_claim_shadow_diagnostic_only",
+        "profit_verdict": profit_verdict,
         "summary": summary,
         "candidates": candidates,
     }
@@ -569,6 +634,7 @@ def _markdown_report(report: Mapping[str, Any]) -> str:
         f"- source_observation: {report.get('source_observation')}",
         f"- source_manifest: {report.get('source_manifest')}",
         f"- no_profit_claim: {report.get('no_profit_claim')}",
+        f"- profit_verdict: {report.get('profit_verdict')}",
         "",
         "Safety fields:",
         f"- orders_submitted={str(safety.get('orders_submitted')).lower()}",
@@ -581,6 +647,8 @@ def _markdown_report(report: Mapping[str, Any]) -> str:
         "## Summary",
         "",
         f"- reward_ev_computable_count: {summary.get('reward_ev_computable_count')}",
+        f"- ev_readiness_computable_count: {summary.get('ev_readiness_computable_count')}",
+        f"- strict_profitable_edge_count: {summary.get('strict_profitable_edge_count')}",
         f"- would_have_filled_known_count: {summary.get('would_have_filled_known_count')}",
         f"- high_relative_tick_cost_count: {summary.get('high_relative_tick_cost_count')}",
         f"- excluded_high_tick_cost_count: {summary.get('excluded_high_tick_cost_count')}",
