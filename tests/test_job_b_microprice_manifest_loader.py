@@ -342,8 +342,10 @@ def test_select_latest_non_empty_pass_manifest_skips_zero_candidate_files(tmp_pa
     assert selected == older_non_empty
     assert records[0]["path"] == str(newer_zero)
     assert records[0]["reason"] == "skipped_zero_candidates"
+    assert records[0]["classification"] == "no_pass"
     assert records[1]["path"] == str(older_non_empty)
     assert records[1]["reason"] == "selected_newest_non_empty_pass_manifest"
+    assert records[1]["classification"] == "pass"
 
 
 def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(monkeypatch, tmp_path):
@@ -367,8 +369,8 @@ def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(monkeypat
                             "book_events": 108,
                             "min_book_events": 50,
                             "window": {
-                                "start_time": "2026-05-10T08:00:00Z",
-                                "end_time": "2026-05-10T09:00:00Z",
+                                "start_time": "2026-05-10T07:00:00Z",
+                                "end_time": "2026-05-10T08:00:00Z",
                             },
                         },
                     }
@@ -435,7 +437,10 @@ def test_run_batch_uses_pass_manifest_exact_window_and_min_book_events(monkeypat
     assert summary["requested_min_book_events"] == 500
     assert summary["selected_min_book_events"] == 50
     assert summary["exact_window_status"] == "verified"
+    assert summary["classification"] == "diagnostic_only"
+    assert summary["pass_manifest_status"] == "pass"
     assert summary["warnings"] == []
+    assert summary["candidate_replay_requests"][0]["window_provenance"] == "manifest_window"
     assert summary["safety"]["orders_submitted"] is False
     assert summary["safety"]["orders_signed"] is False
     assert summary["safety"]["credentials_required"] is False
@@ -959,4 +964,82 @@ def test_run_batch_fail_closes_on_exact_window_mismatch(monkeypatch, tmp_path):
     summary = asyncio.run(job_b_microprice_batch.run_batch(args))
 
     assert summary["exact_window_status"] == "fail_closed"
+    assert summary["classification"] == "blocked"
     assert "exact_window_mismatch" in summary["warnings"]
+    assert "exact_window_metadata_blocker" in summary["warnings"]
+    assert summary["blockers"][0]["type"] == "exact_window_metadata_blocker"
+
+
+def test_validate_artifact_fail_closes_against_selected_manifest_window(tmp_path):
+    manifest = tmp_path / "coverage_window.json"
+    artifact = tmp_path / "job_b_artifact.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "candidate_count": 1,
+                "window": {
+                    "start_time": "2026-05-10T08:00:00Z",
+                    "end_time": "2026-05-10T09:00:00Z",
+                },
+                "min_book_events": 50,
+                "candidates": [
+                    {
+                        "slug": "covered-window",
+                        "source_strategy": "Microprice",
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 108,
+                            "min_book_events": 50,
+                            "window": {
+                                "start_time": "2026-05-10T07:00:00Z",
+                                "end_time": "2026-05-10T08:00:00Z",
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact.write_text(
+        json.dumps(
+            {
+                "window": {
+                    "start_time": "2026-05-10T07:00:00Z",
+                    "end_time": "2026-05-10T08:00:00Z",
+                },
+                "min_book_events": 50,
+                "attempts": [
+                    {
+                        "slug": "covered-window",
+                        "token_index": 0,
+                        "diagnostics": {
+                            "window": {
+                                "start_time": "2026-05-10T07:00:00Z",
+                                "end_time": "2026-05-10T08:00:00Z",
+                            },
+                            "min_book_events": 50,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = job_b_microprice_batch.build_exact_window_validation_report(
+        manifest_path=manifest,
+        artifact_path=artifact,
+        command=["python", "scripts/job_b_microprice_batch.py", "--validate-artifact"],
+    )
+
+    assert report["classification"] == "blocked"
+    assert report["exact_window_status"] == "fail_closed"
+    assert report["pass_manifest_status"] == "pass"
+    assert report["expected_selected_windows"][0]["window"] == {
+        "start_time": "2026-05-10T08:00:00Z",
+        "end_time": "2026-05-10T09:00:00Z",
+    }
+    assert "exact_window_metadata_blocker" in report["warnings"]
+    assert report["blockers"][0]["type"] == "exact_window_metadata_blocker"

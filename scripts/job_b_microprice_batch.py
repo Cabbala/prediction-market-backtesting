@@ -304,6 +304,7 @@ def _normalize_candidate(
     default_coverage_window: dict[str, Any] | None = None,
     default_min_book_events: int | None = None,
     default_replay_windows: tuple[ReplayWindow, ...] = (),
+    prefer_default_replay_windows: bool = False,
 ) -> Candidate | None:
     slug = _candidate_slug(raw)
     if slug is None:
@@ -317,32 +318,41 @@ def _normalize_candidate(
     candidate_coverage_window = (
         coverage.get("window") if isinstance(coverage.get("window"), dict) else {}
     )
-    coverage_window = candidate_coverage_window
+    coverage_window = (
+        {}
+        if prefer_default_replay_windows and default_replay_windows
+        else candidate_coverage_window
+    )
     coverage_book_events = _parse_int(coverage.get("book_events"))
     coverage_min_book_events = _parse_int(coverage.get("min_book_events"))
     if coverage_min_book_events is None:
         coverage_min_book_events = default_min_book_events
+    if prefer_default_replay_windows and default_replay_windows:
+        coverage_book_events = default_replay_windows[0].book_events
     replay_windows: list[ReplayWindow] = []
-    coverage_windows = coverage.get("windows")
-    if isinstance(coverage_windows, list):
-        for raw_window in coverage_windows:
-            if not isinstance(raw_window, dict):
-                continue
+    if prefer_default_replay_windows and default_replay_windows:
+        replay_windows.extend(default_replay_windows)
+    else:
+        coverage_windows = coverage.get("windows")
+        if isinstance(coverage_windows, list):
+            for raw_window in coverage_windows:
+                if not isinstance(raw_window, dict):
+                    continue
+                parsed = _replay_window_from_mapping(
+                    raw_window,
+                    default_min_book_events=coverage_min_book_events,
+                    provenance="candidate_coverage_windows",
+                )
+                if parsed is not None:
+                    replay_windows.append(parsed)
+        if candidate_coverage_window:
             parsed = _replay_window_from_mapping(
-                raw_window,
+                candidate_coverage_window,
                 default_min_book_events=coverage_min_book_events,
-                provenance="candidate_coverage_windows",
+                provenance="candidate_coverage_window",
             )
             if parsed is not None:
                 replay_windows.append(parsed)
-    if candidate_coverage_window:
-        parsed = _replay_window_from_mapping(
-            candidate_coverage_window,
-            default_min_book_events=coverage_min_book_events,
-            provenance="candidate_coverage_window",
-        )
-        if parsed is not None:
-            replay_windows.append(parsed)
     if not replay_windows:
         replay_windows.extend(default_replay_windows)
     replay_window_tuple = _dedupe_replay_windows(replay_windows)
@@ -455,6 +465,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                         default_coverage_window=manifest_window,
                         default_min_book_events=manifest_min_book_events,
                         default_replay_windows=manifest_replay_windows,
+                        prefer_default_replay_windows=bool(manifest_replay_windows),
                     )
                     if cand is None:
                         continue
@@ -492,6 +503,7 @@ def load_candidates(manifest_path: Path, *, strategy: str, max_candidates: int) 
                     default_coverage_window=manifest_window,
                     default_min_book_events=manifest_min_book_events,
                     default_replay_windows=manifest_replay_windows,
+                    prefer_default_replay_windows=bool(manifest_replay_windows),
                 )
                 if cand is None:
                     continue
@@ -550,12 +562,14 @@ def select_latest_non_empty_pass_manifest(
             record["candidate_count"] = declared_count
             if declared_count <= 0:
                 record["reason"] = "skipped_zero_candidates"
+                record["classification"] = "no_pass"
                 records.append(record)
                 continue
             matching_candidates = load_candidates(path, strategy=strategy, max_candidates=1)
             record["matching_candidate_count"] = len(matching_candidates)
             if not matching_candidates:
                 record["reason"] = "skipped_no_matching_pass_candidates"
+                record["classification"] = "no_pass"
                 records.append(record)
                 continue
         except Exception as exc:  # pass manifest discovery must fail closed
@@ -565,6 +579,7 @@ def select_latest_non_empty_pass_manifest(
             continue
         record["selected"] = True
         record["reason"] = "selected_newest_non_empty_pass_manifest"
+        record["classification"] = "pass"
         records.append(record)
         return path, records
     return None, records
@@ -1116,10 +1131,18 @@ def _build_exact_window_metadata(
     root_window: dict[str, str | None] = dict(requested_window)
     root_min_book_events: int | None = requested_min_book_events
     status = "verified"
+    blockers: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
 
     if not replay_requests:
         status = "fail_closed_no_candidates"
         warnings.append("no_candidate_coverage_pass_manifest")
+        blockers.append(
+            {
+                "type": "coverage_pass_manifest_no_candidates",
+                "message": "No positive coverage-pass candidate replay requests were available.",
+            }
+        )
     else:
         selected = selected_windows[0]
         selected_window = dict(selected["window"])
@@ -1149,6 +1172,17 @@ def _build_exact_window_metadata(
         else:
             status = "fail_closed"
             warnings.append("exact_window_mismatch")
+            warnings.append("exact_window_metadata_blocker")
+            blockers.append(
+                {
+                    "type": "exact_window_metadata_blocker",
+                    "message": (
+                        "One or more Job B attempts did not report the selected coverage-pass "
+                        "manifest replay window and min_book_events."
+                    ),
+                    "mismatches": mismatches,
+                }
+            )
             if not attempts:
                 warnings.append("no_attempts_generated")
 
@@ -1162,6 +1196,236 @@ def _build_exact_window_metadata(
         "root_window": root_window,
         "root_min_book_events": root_min_book_events,
         "warnings": warnings,
+        "blockers": blockers,
+        "mismatches": mismatches,
+    }
+
+
+def _classification_for_exact_window(
+    *,
+    candidate_count: int,
+    exact_window_status: str,
+) -> str:
+    if candidate_count <= 0 or exact_window_status != "verified":
+        return "blocked"
+    return "diagnostic_only"
+
+
+def _canonical_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _window_key_from_record(
+    record: dict[str, Any],
+) -> tuple[str | None, str | None, int | None]:
+    window = record.get("window") if isinstance(record.get("window"), dict) else {}
+    return (
+        _canonical_timestamp(window.get("start_time")),
+        _canonical_timestamp(window.get("end_time")),
+        _parse_int(record.get("min_book_events")),
+    )
+
+
+def _expected_window_records_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for window in _manifest_replay_windows(payload):
+        records.append(
+            {
+                "window": {
+                    "start_time": window.start_time,
+                    "end_time": window.end_time,
+                },
+                "min_book_events": window.min_book_events,
+                "window_source": window.source,
+                "window_provenance": window.provenance,
+                "candidate_count": window.candidate_count,
+                "book_events": window.book_events,
+            }
+        )
+    return records
+
+
+def _add_artifact_window_record(
+    records: list[dict[str, Any]],
+    *,
+    window: Any,
+    min_book_events: Any,
+    source: str,
+    slug: str | None = None,
+    token_index: int | None = None,
+) -> None:
+    if not isinstance(window, dict):
+        return
+    start_time = window.get("start_time")
+    end_time = window.get("end_time")
+    if not isinstance(start_time, str) or not isinstance(end_time, str):
+        return
+    record: dict[str, Any] = {
+        "source": source,
+        "window": {"start_time": start_time, "end_time": end_time},
+        "min_book_events": _parse_int(min_book_events),
+    }
+    if slug is not None:
+        record["slug"] = slug
+    if token_index is not None:
+        record["token_index"] = token_index
+    records.append(record)
+
+
+def _artifact_window_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    _add_artifact_window_record(
+        records,
+        window=payload.get("window"),
+        min_book_events=payload.get("min_book_events"),
+        source="artifact.window",
+    )
+    _add_artifact_window_record(
+        records,
+        window=payload.get("selected_window"),
+        min_book_events=payload.get("selected_min_book_events"),
+        source="artifact.selected_window",
+    )
+    selected_windows = payload.get("selected_windows")
+    if isinstance(selected_windows, list):
+        for index, selected in enumerate(selected_windows):
+            if not isinstance(selected, dict):
+                continue
+            _add_artifact_window_record(
+                records,
+                window=selected.get("window"),
+                min_book_events=selected.get("min_book_events"),
+                source=f"artifact.selected_windows[{index}]",
+            )
+    attempts = payload.get("attempts")
+    if isinstance(attempts, list):
+        for index, attempt in enumerate(attempts):
+            if not isinstance(attempt, dict):
+                continue
+            diagnostics = (
+                attempt.get("diagnostics") if isinstance(attempt.get("diagnostics"), dict) else {}
+            )
+            _add_artifact_window_record(
+                records,
+                window=diagnostics.get("window"),
+                min_book_events=diagnostics.get("min_book_events"),
+                source=f"artifact.attempts[{index}].diagnostics",
+                slug=attempt.get("slug") if isinstance(attempt.get("slug"), str) else None,
+                token_index=_parse_int(attempt.get("token_index")),
+            )
+    return records
+
+
+def build_exact_window_validation_report(
+    *,
+    manifest_path: Path,
+    artifact_path: Path,
+    command: list[str],
+    manifest_selection: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest_payload, dict):
+        raise TypeError("manifest must be a JSON object")
+    if not isinstance(artifact_payload, dict):
+        raise TypeError("artifact must be a JSON object")
+
+    expected_records = _expected_window_records_from_payload(manifest_payload)
+    actual_records = _artifact_window_records(artifact_payload)
+    expected_keys = {_window_key_from_record(record) for record in expected_records}
+    actual_mismatches = [
+        record for record in actual_records if _window_key_from_record(record) not in expected_keys
+    ]
+    missing_expected_metadata = [
+        record
+        for record in expected_records
+        if _window_key_from_record(record)[0] is None
+        or _window_key_from_record(record)[1] is None
+        or _window_key_from_record(record)[2] is None
+    ]
+    candidate_count = _declared_candidate_count(manifest_path)
+    warnings: list[str] = []
+    blockers: list[dict[str, Any]] = []
+
+    if candidate_count <= 0:
+        warnings.append("coverage_pass_manifest_no_pass")
+        blockers.append(
+            {
+                "type": "coverage_pass_manifest_no_pass",
+                "message": "Selected coverage-pass manifest declares zero candidates.",
+            }
+        )
+    if not expected_records or missing_expected_metadata:
+        warnings.append("selected_pass_window_metadata_missing")
+        blockers.append(
+            {
+                "type": "selected_pass_window_metadata_missing",
+                "message": (
+                    "Selected coverage-pass manifest does not declare a complete "
+                    "window/start/end/min_book_events tuple."
+                ),
+                "records": missing_expected_metadata,
+            }
+        )
+    if not actual_records:
+        warnings.append("job_b_artifact_window_metadata_missing")
+        blockers.append(
+            {
+                "type": "job_b_artifact_window_metadata_missing",
+                "message": "Job B artifact does not expose comparable replay window metadata.",
+            }
+        )
+    if actual_mismatches:
+        warnings.extend(["exact_window_mismatch", "exact_window_metadata_blocker"])
+        blockers.append(
+            {
+                "type": "exact_window_metadata_blocker",
+                "message": (
+                    "Job B artifact replay window/min_book_events differs from the "
+                    "selected coverage-pass manifest."
+                ),
+                "mismatches": actual_mismatches,
+            }
+        )
+
+    exact_window_status = "verified" if not blockers else "fail_closed"
+    classification = _classification_for_exact_window(
+        candidate_count=candidate_count,
+        exact_window_status=exact_window_status,
+    )
+    return {
+        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "mode": SAFETY_MODE,
+        "classification": classification,
+        "exact_window_status": exact_window_status,
+        "pass_manifest_status": "pass" if candidate_count > 0 else "no_pass",
+        "manifest": str(manifest_path),
+        "artifact": str(artifact_path),
+        "manifest_selection": manifest_selection
+        or [{"path": str(manifest_path), "selected": True, "reason": "explicit_manifest"}],
+        "expected_selected_windows": expected_records,
+        "artifact_windows": actual_records,
+        "warnings": warnings,
+        "blockers": blockers,
+        "commands": [" ".join(command)],
+        "safety": {
+            "live_trading": False,
+            "orders_submitted": False,
+            "orders_signed": False,
+            "orders_cancelled": False,
+            "credentials_required": False,
+            "worker_trading_started": False,
+            "live_trading_worker_started": False,
+        },
     }
 
 
@@ -1493,9 +1757,15 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         attempts=attempts,
     )
     aggregate_diagnostics = _aggregate_diagnostics(attempts)
+    classification = _classification_for_exact_window(
+        candidate_count=len(candidates),
+        exact_window_status=str(exact_window["status"]),
+    )
     return {
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
+        "classification": classification,
+        "pass_manifest_status": "pass" if candidates else "no_pass",
         "safety": {
             "live_trading": False,
             "orders_submitted": False,
@@ -1520,6 +1790,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "selected_min_book_events": exact_window["selected_min_book_events"],
         "exact_window_status": exact_window["status"],
         "warnings": exact_window["warnings"],
+        "blockers": exact_window["blockers"],
         "exact_window": exact_window,
         "attempt_isolation": attempt_isolation,
         "candidate_count": len(candidates),
@@ -1616,6 +1887,8 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         "",
         f"- generated_at_utc: {summary['generated_at_utc']}",
         f"- mode: {summary['mode']}",
+        f"- classification: {summary.get('classification')}",
+        f"- pass_manifest_status: {summary.get('pass_manifest_status')}",
         f"- manifest: {summary['manifest']}",
         f"- window: {summary['window']['start_time']} -> {summary['window']['end_time']}",
         f"- min_book_events: {summary.get('min_book_events')}",
@@ -1625,6 +1898,7 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- selected_min_book_events: {summary.get('selected_min_book_events')}",
         f"- exact_window_status: {summary.get('exact_window_status')}",
         f"- warnings: {json.dumps(summary.get('warnings', []), sort_keys=True)}",
+        f"- blockers: {json.dumps(summary.get('blockers', []), sort_keys=True)}",
         f"- attempt_isolation: {summary.get('attempt_isolation')}",
         f"- safety: {json.dumps(summary.get('safety', {}), sort_keys=True)}",
         f"- candidates: {summary['candidate_count']}",
@@ -1676,6 +1950,39 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
     return output_files
 
 
+def _write_validation_outputs(
+    report: dict[str, Any], output_dir: Path, timestamp: str
+) -> dict[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"job_B_microprice_exact_window_validation_{timestamp}.json"
+    md_path = output_dir / f"job_B_microprice_exact_window_validation_{timestamp}.md"
+    output_files = {"json": str(json_path), "markdown": str(md_path)}
+    json_report = dict(report)
+    json_report["output_files"] = output_files
+    json_path.write_text(json.dumps(json_report, indent=2, sort_keys=True), encoding="utf-8")
+    lines = [
+        "# Job B Exact-Window Validation",
+        "",
+        f"- generated_at_utc: {report.get('generated_at_utc')}",
+        f"- mode: {report.get('mode')}",
+        f"- classification: {report.get('classification')}",
+        f"- exact_window_status: {report.get('exact_window_status')}",
+        f"- pass_manifest_status: {report.get('pass_manifest_status')}",
+        f"- manifest: {report.get('manifest')}",
+        f"- artifact: {report.get('artifact')}",
+        f"- expected_selected_windows: {json.dumps(report.get('expected_selected_windows', []), sort_keys=True)}",
+        f"- artifact_windows: {json.dumps(report.get('artifact_windows', []), sort_keys=True)}",
+        f"- warnings: {json.dumps(report.get('warnings', []), sort_keys=True)}",
+        f"- blockers: {json.dumps(report.get('blockers', []), sort_keys=True)}",
+        f"- commands: {json.dumps(report.get('commands', []), sort_keys=True)}",
+        f"- safety: {json.dumps(report.get('safety', {}), sort_keys=True)}",
+        "",
+        "Safety: backtest/shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.",
+    ]
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_files
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Job B bounded PMBT microprice batch runner (backtest-only)."
@@ -1683,6 +1990,15 @@ def main() -> int:
     parser.add_argument("--single-attempt-input", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-attempt-output", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--manifest", type=Path, default=None)
+    parser.add_argument(
+        "--validate-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Validate an existing Job B artifact against the selected coverage-pass "
+            "manifest window without running a backtest."
+        ),
+    )
     parser.add_argument(
         "--manifest-glob",
         default=DEFAULT_PASS_MANIFEST_GLOB,
@@ -1738,9 +2054,20 @@ def main() -> int:
             print(
                 json.dumps(
                     {
+                        "classification": "blocked",
                         "error": "no_non_empty_pass_manifest",
                         "manifest_glob": args.manifest_glob,
                         "manifest_selection": selection_records,
+                        "pass_manifest_status": "no_pass",
+                        "safety": {
+                            "live_trading": False,
+                            "orders_submitted": False,
+                            "orders_signed": False,
+                            "orders_cancelled": False,
+                            "credentials_required": False,
+                            "worker_trading_started": False,
+                            "live_trading_worker_started": False,
+                        },
                     },
                     indent=2,
                     sort_keys=True,
@@ -1752,6 +2079,17 @@ def main() -> int:
         args.manifest_selection = [
             {"path": str(args.manifest), "selected": True, "reason": "explicit_manifest"}
         ]
+    if args.validate_artifact is not None:
+        timestamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+        report = build_exact_window_validation_report(
+            manifest_path=args.manifest,
+            artifact_path=args.validate_artifact,
+            command=[sys.executable, *sys.argv],
+            manifest_selection=args.manifest_selection,
+        )
+        report["output_files"] = _write_validation_outputs(report, args.output_dir, timestamp)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["classification"] != "blocked" else 2
     if args.end_time is None:
         end = _utc_now().replace(minute=0, second=0) - timedelta(hours=3)
         args.end_time = end.isoformat().replace("+00:00", "Z")
@@ -1765,7 +2103,7 @@ def main() -> int:
     summary = asyncio.run(run_batch(args))
     summary["output_files"] = _write_outputs(summary, args.output_dir, timestamp)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0 if summary["candidate_count"] > 0 else 2
+    return 0 if summary["candidate_count"] > 0 and summary["classification"] != "blocked" else 2
 
 
 if __name__ == "__main__":
