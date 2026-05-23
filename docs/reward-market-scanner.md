@@ -9,7 +9,7 @@ Safety invariants:
 - no wallet private keys, Polymarket L2 credentials, GitHub PATs, or secrets required
 - public/read-only scan artifacts only
 
-The scanner consumes the latest autonomous market-scan JSON under `/opt/polymarket-lab/data/market_scans/` and writes timestamped manifests under `/opt/polymarket-lab/autoresearch/reward_scanner/manifests/`.
+The scanner consumes the latest autonomous market-scan JSON under `/opt/polymarket-lab/data/market_scans/` and writes timestamped manifests under `/opt/polymarket-lab/autoresearch/reward_scanner/manifests/`. The canonical output is `reward_scanner_manifest_<timestamp>.json`; the writer also emits a same-timestamp `reward_market_manifest_<timestamp>.json` sibling for legacy consumers. New consumers should read the `reward_scanner_manifest_*` prefix.
 
 Scored features include:
 
@@ -22,6 +22,7 @@ Scored features include:
 - accidental-fill risk flags for tail-price, wide-spread, thin-depth, and one-sided-depth markets
 - fail-closed token mapping checks: exactly two unique Yes/No CLOB token IDs are required for backtest queue eligibility
 - manifest provenance (`input_scan_path`, optional strategy/report path, and `source_paths`) plus summary counts and stable candidate ranks
+- explicit shadow-safety fields (`orders_submitted=false`, `orders_signed=false`, `orders_cancelled=false`, `credentials_required=false`, `live_trading_worker_started=false`)
 
 Run locally in the PMBT worktree:
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cabbala.local/polymarket/reward-market-manifest.schema.json",
-  "title": "Polymarket reward market scanner manifest",
+  "title": "Polymarket reward scanner manifest",
   "type": "object",
   "required": [
     "schema_version",
@@ -17,6 +17,18 @@
     },
     "mode": {
       "const": "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"
+    },
+    "manifest_kind": {
+      "const": "reward_scanner_manifest"
+    },
+    "canonical_manifest_prefix": {
+      "const": "reward_scanner_manifest"
+    },
+    "legacy_manifest_prefixes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "generated_at_utc": {
       "type": "string"
@@ -36,6 +48,34 @@
     },
     "source_artifacts": {
       "type": "object"
+    },
+    "source_provenance": {
+      "type": "object",
+      "properties": {
+        "source_artifact_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_scan_timestamp_utc": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_scan_mode": {
+          "type": [
+            "string",
+            "null",
+            "boolean"
+          ]
+        },
+        "source_artifacts": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
     },
     "input_scan_path": {
       "type": "string"
@@ -94,6 +134,11 @@
         "submit_orders",
         "sign_orders",
         "requires_secrets",
+        "orders_submitted",
+        "orders_signed",
+        "orders_cancelled",
+        "credentials_required",
+        "live_trading_worker_started",
         "intended_uses"
       ],
       "properties": {
@@ -116,22 +161,22 @@
           }
         },
         "orders_submitted": {
-          "type": "boolean"
+          "const": false
         },
         "orders_signed": {
-          "type": "boolean"
+          "const": false
         },
         "orders_cancelled": {
-          "type": "boolean"
+          "const": false
         },
         "credentials_required": {
-          "type": "boolean"
+          "const": false
         },
         "live_trading_worker_started": {
-          "type": "boolean"
+          "const": false
         },
         "worker_trading_started": {
-          "type": "boolean"
+          "const": false
         }
       },
       "additionalProperties": true

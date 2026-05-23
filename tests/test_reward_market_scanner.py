@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from prediction_market_extensions.adapters.polymarket.reward_market_scanner import (
+    CANONICAL_MANIFEST_PREFIX,
+    LEGACY_MANIFEST_PREFIX,
     SHADOW_MODE,
     accidental_fill_risk_flags,
     build_reward_manifest,
@@ -165,6 +167,15 @@ def test_build_reward_manifest_accepts_candidates_key_and_declares_no_live_tradi
     manifest = build_reward_manifest(scan, limit=2)
 
     assert manifest["mode"] == SHADOW_MODE
+    assert manifest["manifest_kind"] == "reward_scanner_manifest"
+    assert manifest["canonical_manifest_prefix"] == CANONICAL_MANIFEST_PREFIX
+    assert manifest["legacy_manifest_prefixes"] == [LEGACY_MANIFEST_PREFIX]
+    assert manifest["source_provenance"] == {
+        "source_artifact_path": None,
+        "source_scan_timestamp_utc": "2026-05-04T06:01:34+00:00",
+        "source_scan_mode": SHADOW_MODE,
+        "source_artifacts": {},
+    }
     assert manifest["safety"] == {
         "live_trading": False,
         "submit_orders": False,
@@ -312,15 +323,37 @@ def test_build_reward_manifest_main_writes_source_paths(tmp_path: Path) -> None:
         )
         == 0
     )
-    manifest_paths = sorted(output_dir.glob("reward_market_manifest_*.json"))
+    manifest_paths = sorted(output_dir.glob(f"{CANONICAL_MANIFEST_PREFIX}_*.json"))
+    legacy_manifest_paths = sorted(output_dir.glob(f"{LEGACY_MANIFEST_PREFIX}_*.json"))
+    rules_paths = sorted(output_dir.glob(f"{CANONICAL_MANIFEST_PREFIX}_rules_*.md"))
+    legacy_rules_paths = sorted(output_dir.glob(f"{LEGACY_MANIFEST_PREFIX}_rules_*.md"))
     assert len(manifest_paths) == 1
+    assert len(legacy_manifest_paths) == 1
+    assert len(rules_paths) == 1
+    assert len(legacy_rules_paths) == 1
+    assert manifest_paths[0].name.replace(CANONICAL_MANIFEST_PREFIX, LEGACY_MANIFEST_PREFIX) == (
+        legacy_manifest_paths[0].name
+    )
+    assert rules_paths[0].name.replace(CANONICAL_MANIFEST_PREFIX, LEGACY_MANIFEST_PREFIX) == (
+        legacy_rules_paths[0].name
+    )
     manifest = load_scan(manifest_paths[0])
+    legacy_manifest = load_scan(legacy_manifest_paths[0])
+    assert legacy_manifest == manifest
     assert manifest["input_scan_path"] == str(scan_path)
     assert manifest["input_strategy_report_path"] == str(report_path)
     assert manifest["source_paths"] == {
         "market_scan_json": str(scan_path),
         "strategy_or_scan_report_md": str(report_path),
     }
+    assert manifest["source_provenance"]["source_artifact_path"] == str(scan_path)
+    assert manifest["canonical_manifest_prefix"] == CANONICAL_MANIFEST_PREFIX
+    assert manifest["legacy_manifest_prefixes"] == [LEGACY_MANIFEST_PREFIX]
+    assert manifest["safety"]["orders_submitted"] is False
+    assert manifest["safety"]["orders_signed"] is False
+    assert manifest["safety"]["orders_cancelled"] is False
+    assert manifest["safety"]["credentials_required"] is False
+    assert manifest["safety"]["live_trading_worker_started"] is False
 
 
 def test_build_reward_manifest_main_rejects_negative_limit(tmp_path: Path) -> None:

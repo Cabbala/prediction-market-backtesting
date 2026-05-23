@@ -11,6 +11,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from prediction_market_extensions.adapters.polymarket.reward_market_scanner import (  # noqa: E402
+    CANONICAL_MANIFEST_PREFIX,
+    LEGACY_MANIFEST_PREFIX,
     build_reward_manifest,
     load_scan,
     write_manifest,
@@ -46,7 +48,7 @@ def latest_scan(scan_dir: Path = DEFAULT_SCAN_DIR) -> Path:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Build a shadow/backtest-only Polymarket reward-market candidate manifest."
+        description="Build a shadow/backtest-only Polymarket reward scanner candidate manifest."
     )
     parser.add_argument(
         "--input",
@@ -76,11 +78,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "strategy_or_scan_report_md": str(report_path) if report_path else None,
     }
     manifest_path, rules_path = write_manifest(manifest, args.output_dir)
+    legacy_manifest_path = manifest_path.with_name(
+        manifest_path.name.replace(CANONICAL_MANIFEST_PREFIX, LEGACY_MANIFEST_PREFIX, 1)
+    )
+    legacy_rules_path = rules_path.with_name(
+        rules_path.name.replace(CANONICAL_MANIFEST_PREFIX, LEGACY_MANIFEST_PREFIX, 1)
+    )
     print(
         json.dumps(
             {
                 "manifest": str(manifest_path),
+                "legacy_manifest": (
+                    str(legacy_manifest_path) if legacy_manifest_path.exists() else None
+                ),
                 "rules": str(rules_path),
+                "legacy_rules": str(legacy_rules_path) if legacy_rules_path.exists() else None,
                 "candidates": len(manifest["candidates"]),
                 "mode": manifest["mode"],
                 "strategy_report": str(report_path) if report_path else None,

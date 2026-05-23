@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 
 SHADOW_MODE = "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"
 MANIFEST_SCHEMA_VERSION = "polymarket.reward-market-manifest.v1"
+CANONICAL_MANIFEST_PREFIX = "reward_scanner_manifest"
+LEGACY_MANIFEST_PREFIX = "reward_market_manifest"
 REWARD_EVIDENCE_KEYS = (
     "clobRewards",
     "rewards",
@@ -656,7 +658,11 @@ def build_reward_manifest(
 ) -> dict[str, Any]:
     rules = rules or RewardScoreRules()
     metadata = scan.get("metadata") if isinstance(scan.get("metadata"), Mapping) else {}
-    generated_at = _parse_dt(_scan_timestamp(metadata)) or datetime.now(UTC)
+    metadata_safety = metadata.get("safety") if isinstance(metadata.get("safety"), Mapping) else {}
+    source_scan_timestamp_utc = _scan_timestamp(metadata)
+    source_scan_mode = metadata.get("mode") or metadata_safety.get("mode")
+    source_artifacts = metadata.get("sources", metadata.get("data_sources", {}))
+    generated_at = _parse_dt(source_scan_timestamp_utc) or datetime.now(UTC)
     scored: list[dict[str, Any]] = []
     for candidate in _scan_candidates(scan):
         if not isinstance(candidate, Mapping):
@@ -702,10 +708,19 @@ def build_reward_manifest(
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "mode": SHADOW_MODE,
+        "manifest_kind": "reward_scanner_manifest",
+        "canonical_manifest_prefix": CANONICAL_MANIFEST_PREFIX,
+        "legacy_manifest_prefixes": [LEGACY_MANIFEST_PREFIX],
         "generated_at_utc": datetime.now(UTC).isoformat(),
-        "source_scan_timestamp_utc": _scan_timestamp(metadata),
-        "source_scan_mode": metadata.get("mode") or metadata.get("safety", {}).get("mode"),
-        "source_artifacts": metadata.get("sources", metadata.get("data_sources", {})),
+        "source_scan_timestamp_utc": source_scan_timestamp_utc,
+        "source_scan_mode": source_scan_mode,
+        "source_artifacts": source_artifacts,
+        "source_provenance": {
+            "source_artifact_path": source_artifact_path,
+            "source_scan_timestamp_utc": source_scan_timestamp_utc,
+            "source_scan_mode": source_scan_mode,
+            "source_artifacts": source_artifacts,
+        },
         "summary": {
             "candidate_count": len(scored),
             "manifest_candidate_count": len(scored[: max(0, limit)]),
@@ -739,19 +754,28 @@ def load_scan(path: str | Path) -> dict[str, Any]:
     return value
 
 
+def _manifest_stamp(manifest: Mapping[str, Any]) -> str:
+    generated_at = manifest.get("generated_at_utc")
+    parsed = _parse_dt(generated_at) if isinstance(generated_at, str) else None
+    return (parsed or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+
+
 def write_manifest(
-    manifest: Mapping[str, Any], output_dir: str | Path, *, prefix: str = "reward_market_manifest"
+    manifest: Mapping[str, Any],
+    output_dir: str | Path,
+    *,
+    prefix: str = CANONICAL_MANIFEST_PREFIX,
+    legacy_prefix: str | None = LEGACY_MANIFEST_PREFIX,
 ) -> tuple[Path, Path]:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = _manifest_stamp(manifest)
     manifest_path = out / f"{prefix}_{stamp}.json"
     rules_path = out / f"{prefix}_rules_{stamp}.md"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    manifest_text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    manifest_path.write_text(manifest_text, encoding="utf-8")
     rules = manifest.get("scoring_rules", {})
-    rules_path.write_text(
+    rules_text = (
         "# Reward Market Scanner Scoring Rules\n\n"
         "Mode: SHADOW/BACKTEST ONLY. No live trading, signing, order placement, or secret access.\n\n"
         "This scanner ranks public/read-only Polymarket candidates for later PMBT backtests and Homerun shadow-forward logging. "
@@ -762,7 +786,14 @@ def write_manifest(
         "- `*_tail_price_accidental_fill_risk`: very low/high probability outcomes can have asymmetric loss if filled.\n"
         "- `wide_spread_adverse_selection_risk`: spread is too wide for reward proxy assumptions.\n"
         "- `thin_top_of_book_fill_risk`: visible top-of-book depth is below proxy threshold.\n"
-        "- `one_sided_depth_queue_risk`: queue/depth imbalance may create unfavorable fills.\n",
-        encoding="utf-8",
+        "- `one_sided_depth_queue_risk`: queue/depth imbalance may create unfavorable fills.\n"
     )
+    rules_path.write_text(rules_text, encoding="utf-8")
+    if (
+        prefix == CANONICAL_MANIFEST_PREFIX
+        and legacy_prefix
+        and legacy_prefix != CANONICAL_MANIFEST_PREFIX
+    ):
+        (out / f"{legacy_prefix}_{stamp}.json").write_text(manifest_text, encoding="utf-8")
+        (out / f"{legacy_prefix}_rules_{stamp}.md").write_text(rules_text, encoding="utf-8")
     return manifest_path, rules_path
