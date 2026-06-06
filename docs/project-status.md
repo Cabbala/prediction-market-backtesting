@@ -20,6 +20,10 @@ No repo-level open issues are tracked here right now.
 
 ## Recently Fixed
 
+- [x] Microprice Job B artifacts now have a shadow-only negative-PnL filter
+  follow-up report that consumes `negative_pnl_attribution` diagnostics and
+  emits fail-closed adverse-selection, spread/tick-cost, and parameter-bucket
+  replay-promotion recommendations without claiming live readiness or profit.
 - [x] PR#119 upgrades public Polymarket runners to L2-native `BookReplay`
   semantics with `OrderBookDeltas` plus real `TradeTick` execution evidence,
   keeps Nautilus on `BookType.L2_MBP` with `trade_execution=True`, removes
