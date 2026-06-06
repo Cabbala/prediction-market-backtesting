@@ -19,6 +19,7 @@ SAFETY_FALSE_FIELDS = {
     "orders_cancelled": False,
     "credentials_required": False,
     "live_trading_worker_started": False,
+    "worker_trading_started": False,
 }
 
 
@@ -169,6 +170,114 @@ def _provenance_side(row: Mapping[str, Any], side: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return [value] if value else []
+        value = parsed
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray, Mapping)):
+        return [str(item) for item in value if item not in (None, "")]
+    return []
+
+
+def _top_book(row: Mapping[str, Any], side: str) -> dict[str, Any]:
+    side_book = _provenance_side(row, side)
+    return {
+        "side": side,
+        "token_id": side_book.get("token_id") or row.get(f"{side}_token_id"),
+        "best_bid": _parse_float(side_book.get("best_bid") or side_book.get("bid")),
+        "best_ask": _parse_float(side_book.get("best_ask") or side_book.get("ask")),
+        "best_bid_size": _parse_float(side_book.get("best_bid_size") or side_book.get("bid_size")),
+        "best_ask_size": _parse_float(side_book.get("best_ask_size") or side_book.get("ask_size")),
+        "depth_bid": _parse_float(side_book.get("depth_bid")),
+        "depth_ask": _parse_float(side_book.get("depth_ask")),
+        "depth_proxy": _parse_float(side_book.get("depth_proxy")),
+        "mid": _parse_float(side_book.get("mid")),
+        "spread": _parse_float(side_book.get("spread")),
+        "present": bool(side_book.get("present", bool(side_book))),
+    }
+
+
+def _token_provenance(row: Mapping[str, Any]) -> dict[str, Any]:
+    explicit = row.get("token_provenance")
+    explicit_map = explicit if isinstance(explicit, Mapping) else {}
+    canonical_ids = _string_list(
+        row.get("clob_token_ids") or explicit_map.get("canonical_clob_token_ids")
+    )
+    canonical_yes = (
+        row.get("yes_token_id")
+        or explicit_map.get("canonical_yes_token_id")
+        or (canonical_ids[0] if len(canonical_ids) == 2 else None)
+    )
+    canonical_no = (
+        row.get("no_token_id")
+        or explicit_map.get("canonical_no_token_id")
+        or (canonical_ids[1] if len(canonical_ids) == 2 else None)
+    )
+    yes_book = _top_book(row, "yes")
+    no_book = _top_book(row, "no")
+    source_ids = _string_list(
+        row.get("source_clob_token_ids")
+        or explicit_map.get("source_clob_token_ids")
+        or row.get("clobTokenIds")
+    )
+    if not source_ids and len(canonical_ids) == 2:
+        source_ids = list(canonical_ids)
+    fail_closed_reasons = set(
+        str(reason) for reason in explicit_map.get("fail_closed_reasons") or []
+    )
+    provenance = _book_provenance(row)
+    fail_closed_reasons.update(
+        str(reason) for reason in provenance.get("fail_closed_reasons") or []
+    )
+    if (
+        (canonical_yes in (None, "") or canonical_no in (None, ""))
+        and provenance.get("complete") is True
+        and yes_book.get("token_id") not in (None, "")
+        and no_book.get("token_id") not in (None, "")
+        and str(yes_book["token_id"]) != str(no_book["token_id"])
+    ):
+        canonical_yes = yes_book["token_id"]
+        canonical_no = no_book["token_id"]
+    canonical_complete = (
+        canonical_yes not in (None, "")
+        and canonical_no not in (None, "")
+        and str(canonical_yes) != str(canonical_no)
+    )
+    if not canonical_complete:
+        fail_closed_reasons.add("missing_canonical_yes_no_clob_token_ids")
+    book_complete = bool(provenance.get("complete")) if provenance else False
+    status = "complete" if canonical_complete and book_complete else "incomplete_fail_closed"
+    return {
+        "status": status,
+        "canonical_complete": canonical_complete,
+        "canonical_yes_token_id": str(canonical_yes) if canonical_yes not in (None, "") else None,
+        "canonical_no_token_id": str(canonical_no) if canonical_no not in (None, "") else None,
+        "canonical_clob_token_ids": (
+            [str(canonical_yes), str(canonical_no)] if canonical_complete else []
+        ),
+        "source_clob_token_ids": source_ids,
+        "side_book_token_ids": {
+            "yes": yes_book.get("token_id"),
+            "no": no_book.get("token_id"),
+        },
+        "fail_closed_reasons": sorted(fail_closed_reasons),
+    }
+
+
+def _observation_key(row: Mapping[str, Any]) -> str:
+    slug = _candidate_slug(dict(row))
+    token_provenance = _token_provenance(row)
+    token_ids = (
+        token_provenance["canonical_clob_token_ids"] or token_provenance["source_clob_token_ids"]
+    )
+    if len(token_ids) == 2:
+        return f"{slug}|yes={token_ids[0]}|no={token_ids[1]}"
+    return slug
+
+
 def _first_side_float(row: dict[str, Any], side: str, *keys: str) -> float | None:
     side_book = _provenance_side(row, side)
     for key in keys:
@@ -252,6 +361,26 @@ def _reward_value(row: Mapping[str, Any]) -> float | None:
     )
 
 
+def _reward_score_share(row: Mapping[str, Any]) -> float | None:
+    return _parse_float(
+        row.get("reward_score_share_proxy")
+        or row.get("estimated_reward_score_share_proxy")
+        or row.get("estimated_reward_score_share")
+    )
+
+
+def _time_in_band_fraction(row: Mapping[str, Any], measurement: Mapping[str, Any]) -> float | None:
+    direct = _parse_float(row.get("time_in_band_ratio"))
+    if direct is not None:
+        return max(0.0, min(1.0, direct))
+    observed_fraction = _parse_float(measurement.get("observed_fraction"))
+    if observed_fraction is not None and str(measurement.get("status", "")).startswith(
+        "measured_multi_snapshot"
+    ):
+        return max(0.0, min(1.0, observed_fraction))
+    return None
+
+
 def _exit_loss_proxy(
     row: Mapping[str, Any], *, yes_mid: float | None, spread: float | None
 ) -> dict[str, Any]:
@@ -278,28 +407,61 @@ def _reward_ev_fields(
     *,
     would_have_filled_probability: float | None,
     exit_loss_proxy: Mapping[str, Any],
+    time_in_band: Mapping[str, Any],
+    fill_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     reward_value = _reward_value(row)
+    reward_score_share = _reward_score_share(row)
+    time_fraction = _time_in_band_fraction(row, time_in_band)
     expected_exit_loss = _parse_float(exit_loss_proxy.get("expected_exit_loss_proxy"))
+    conservative_fill_count = int(fill_evidence.get("conservative_would_fill_snapshot_count") or 0)
     missing: list[str] = []
     if would_have_filled_probability is None:
         missing.append("would_have_filled_probability")
+    if conservative_fill_count <= 0:
+        missing.append("conservative_would_fill_evidence")
     if reward_value is None:
         missing.append("reward_amount")
+    if reward_score_share is None:
+        missing.append("reward_denominator_or_score_share")
+    if time_fraction is None:
+        missing.append("time_in_band")
     if expected_exit_loss is None:
         missing.append("exit_loss_proxy")
     if missing:
         return {
-            "reward_ev_status": "not_computable_missing_inputs",
+            "reward_ev_status": "reward_ev_not_yet_computable",
             "expected_reward_ev_minus_loss": None,
             "missing_reward_ev_inputs": missing,
+            "reward_ev_inputs": {
+                "reward_amount": _round(reward_value),
+                "reward_score_share_proxy": _round(reward_score_share),
+                "time_in_band_fraction": _round(time_fraction),
+                "would_have_filled_probability": _round(would_have_filled_probability),
+                "conservative_would_fill_snapshot_count": conservative_fill_count,
+                "expected_exit_loss_proxy": _round(expected_exit_loss),
+            },
         }
+    assert reward_value is not None
+    assert reward_score_share is not None
+    assert time_fraction is not None
+    assert expected_exit_loss is not None
+    assert would_have_filled_probability is not None
     return {
         "reward_ev_status": "computable_shadow_proxy_not_profit_claim",
         "expected_reward_ev_minus_loss": _round(
-            would_have_filled_probability * reward_value - expected_exit_loss
+            reward_value * reward_score_share * time_fraction
+            - would_have_filled_probability * expected_exit_loss
         ),
         "missing_reward_ev_inputs": [],
+        "reward_ev_inputs": {
+            "reward_amount": _round(reward_value),
+            "reward_score_share_proxy": _round(reward_score_share),
+            "time_in_band_fraction": _round(time_fraction),
+            "would_have_filled_probability": _round(would_have_filled_probability),
+            "conservative_would_fill_snapshot_count": conservative_fill_count,
+            "expected_exit_loss_proxy": _round(expected_exit_loss),
+        },
     }
 
 
@@ -374,14 +536,42 @@ def _observation(
     )
     would_have_filled_probability = would_have_filled.get("probability")
     would_have_filled_status = str(would_have_filled["status"])
+    token_provenance = _token_provenance(row)
+    yes_book = _top_book(row, "yes")
+    no_book = _top_book(row, "no")
+    time_in_band = {
+        "status": time_in_band_status,
+        "sample_count": 1,
+        "in_band": in_band,
+        "in_band_snapshot_count": 1 if in_band is True else 0,
+        "observed_fraction": (1.0 if in_band else 0.0) if in_band is not None else None,
+        "basis": time_in_band_basis,
+    }
+    fill_evidence = _fill_evidence_summary(evidence_row_list or [row])
     ev_fields = _reward_ev_fields(
         row,
         would_have_filled_probability=would_have_filled_probability,
         exit_loss_proxy=exit_loss_proxy,
+        time_in_band=time_in_band,
+        fill_evidence=fill_evidence,
     )
     return {
         "slug": _candidate_slug(row),
+        "market_slug": _candidate_slug(row),
+        "observation_key": _observation_key(row),
         "question": row.get("question"),
+        "yes_token_id": token_provenance["canonical_yes_token_id"],
+        "no_token_id": token_provenance["canonical_no_token_id"],
+        "canonical_yes_token_id": token_provenance["canonical_yes_token_id"],
+        "canonical_no_token_id": token_provenance["canonical_no_token_id"],
+        "canonical_clob_token_ids": token_provenance["canonical_clob_token_ids"],
+        "source_clob_token_ids": token_provenance["source_clob_token_ids"],
+        "token_provenance": token_provenance,
+        "book_provenance": _book_provenance(row),
+        "book_provenance_status": _book_provenance(row).get("status"),
+        "book_provenance_complete": bool(_book_provenance(row).get("complete")),
+        "yes_book": yes_book,
+        "no_book": no_book,
         "evidence_sources": _evidence_sources(row, evidence_row_list),
         "yes_mid": yes_mid,
         "spread": spread,
@@ -390,17 +580,11 @@ def _observation(
         "has_reward_evidence": has_reward_evidence,
         "time_in_band_observed": in_band,
         "time_in_band_basis": time_in_band_basis,
-        "time_in_band": {
-            "status": time_in_band_status,
-            "sample_count": 1,
-            "in_band": in_band,
-            "in_band_snapshot_count": 1 if in_band is True else 0,
-            "observed_fraction": (1.0 if in_band else 0.0) if in_band is not None else None,
-            "basis": time_in_band_basis,
-        },
+        "time_in_band": time_in_band,
         "would_have_filled": "unknown_requires_l2_or_shadow_quote_log",
         "would_have_filled_status": would_have_filled_status,
         "would_have_filled_probability": would_have_filled_probability,
+        "fill_evidence": fill_evidence,
         "accidental_fill_risk": accidental_fill_risk,
         "exit_risk": exit_risk,
         "exit_loss_proxy": exit_loss_proxy,
@@ -410,6 +594,7 @@ def _observation(
         "orders_cancelled": False,
         "credentials_required": False,
         "live_trading_worker_started": False,
+        "worker_trading_started": False,
     }
 
 
@@ -440,6 +625,7 @@ def _safe_observation_input(path: Path, payload: dict[str, Any]) -> None:
         "live_trading_worker_started": safety.get(
             "live_trading_worker_started", safety.get("worker_trading_started")
         ),
+        "worker_trading_started": safety.get("worker_trading_started"),
     }
     for key, value in unsafe_fields.items():
         if value not in (False, None):
@@ -523,7 +709,7 @@ def _load_snapshot(path: Path) -> tuple[datetime, list[dict[str, Any]]]:
     observations = payload.get("observations")
     if not isinstance(observations, list) or not observations:
         raise ValueError(f"{path} has no observation rows to aggregate")
-    seen_slugs: set[str] = set()
+    seen_keys: set[str] = set()
     rows: list[dict[str, Any]] = []
     for raw in observations:
         if not isinstance(raw, dict):
@@ -531,10 +717,11 @@ def _load_snapshot(path: Path) -> tuple[datetime, list[dict[str, Any]]]:
         slug = _candidate_slug(raw)
         if slug == "unknown":
             raise ValueError(f"{path} contains an observation without a stable slug")
-        if slug in seen_slugs:
-            raise ValueError(f"{path} contains duplicate observation rows for {slug}")
-        seen_slugs.add(slug)
         row = dict(raw)
+        observation_key = _observation_key(row)
+        if observation_key in seen_keys:
+            raise ValueError(f"{path} contains duplicate observation rows for {observation_key}")
+        seen_keys.add(observation_key)
         row["source_snapshot_file"] = str(path)
         row["source_observed_at_utc"] = observed_at.isoformat().replace("+00:00", "Z")
         rows.append(row)
@@ -573,10 +760,99 @@ def _snapshot_would_have_filled(row: dict[str, Any]) -> bool | None:
     shadow_quote = row.get("shadow_quote")
     if isinstance(shadow_quote, dict):
         return _parse_bool(shadow_quote.get("would_have_filled"))
+    would_fill = row.get("would_fill")
+    if isinstance(would_fill, dict) and would_fill.get("known") is True:
+        return _parse_bool(would_fill.get("estimate"))
     estimate = row.get("would_have_filled_estimate")
     if isinstance(estimate, dict) and estimate.get("known") is True:
         return _parse_bool(estimate.get("estimate"))
     return None
+
+
+def _would_fill_classification(row: Mapping[str, Any]) -> str:
+    direct = row.get("would_fill_classification")
+    if direct not in (None, ""):
+        return str(direct)
+    would_fill = row.get("would_fill")
+    if isinstance(would_fill, Mapping) and would_fill.get("classification") not in (None, ""):
+        return str(would_fill["classification"])
+    shadow_quote = row.get("shadow_quote")
+    if isinstance(shadow_quote, Mapping) and shadow_quote.get("would_fill_classification") not in (
+        None,
+        "",
+    ):
+        return str(shadow_quote["would_fill_classification"])
+    return "unknown"
+
+
+def _touch_cross_status(row: Mapping[str, Any]) -> str:
+    for value in (
+        row.get("hypothetical_quote_touch_cross_status"),
+        row.get("touch_cross_status"),
+    ):
+        if value not in (None, ""):
+            return str(value)
+    return "unknown"
+
+
+def _cancel_or_reprice_reason(row: Mapping[str, Any]) -> str:
+    value = row.get("cancel_or_reprice_reason")
+    return str(value) if value not in (None, "") else "unknown"
+
+
+def _has_markout_placeholder(row: Mapping[str, Any]) -> bool:
+    markout = row.get("markout_proxy")
+    if isinstance(markout, Mapping):
+        return True
+    exit_risk = row.get("exit_risk")
+    if isinstance(exit_risk, Mapping) and isinstance(exit_risk.get("markout_proxy"), Mapping):
+        return True
+    return False
+
+
+def _fill_evidence_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    classifications = [_would_fill_classification(row) for row in rows]
+    optimistic_count = sum(1 for value in classifications if value == "optimistic")
+    unknown_count = sum(
+        1 for value in classifications if value not in {"conservative", "optimistic"}
+    )
+    touch_statuses = [_touch_cross_status(row) for row in rows]
+    cancel_reprice_reasons = [_cancel_or_reprice_reason(row) for row in rows]
+    known_fill_values = [_snapshot_would_have_filled(row) for row in rows]
+    known_fill_count = sum(1 for value in known_fill_values if value is not None)
+    conservative_fill_count = sum(
+        1
+        for row, known in zip(rows, known_fill_values, strict=True)
+        if known is not None and _would_fill_classification(row) == "conservative"
+    )
+    post_only_cross_count = sum(
+        1 for status in touch_statuses if "would_cross_or_take_current_ask" in status
+    )
+    cancel_or_reprice_count = sum(
+        1 for reason in cancel_reprice_reasons if reason not in {"none_hold_quote", "unknown", ""}
+    )
+    status = "unknown_no_would_fill_evidence"
+    if conservative_fill_count:
+        status = "conservative_would_fill_evidence_present"
+    elif known_fill_count:
+        status = "diagnostic_proxy_would_fill_only"
+    return {
+        "status": status,
+        "sample_count": len(rows),
+        "known_would_fill_snapshot_count": known_fill_count,
+        "conservative_would_fill_snapshot_count": conservative_fill_count,
+        "optimistic_would_fill_snapshot_count": optimistic_count,
+        "unknown_would_fill_snapshot_count": unknown_count,
+        "post_only_cross_snapshot_count": post_only_cross_count,
+        "cancel_or_reprice_snapshot_count": cancel_or_reprice_count,
+        "touch_cross_statuses": sorted(set(touch_statuses)),
+        "cancel_or_reprice_reasons": sorted(set(cancel_reprice_reasons)),
+        "markout_placeholder_count": sum(1 for row in rows if _has_markout_placeholder(row)),
+        "basis": (
+            "conservative maker fill requires explicit L2/trade evidence; "
+            "optimistic post-only shadow quotes remain diagnostic"
+        ),
+    }
 
 
 def _risk_value(row: dict[str, Any], field: str) -> str | None:
@@ -717,7 +993,7 @@ def _latest_float(rows: list[dict[str, Any]], key: str) -> float | None:
     return None
 
 
-def _aggregate_candidate(slug: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_candidate(observation_key: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     accidental_severity = {
         "high_relative_tick_cost": 50,
         "tight_spread_possible_fill": 40,
@@ -730,6 +1006,8 @@ def _aggregate_candidate(slug: str, rows: list[dict[str, Any]]) -> dict[str, Any
         "tail_exit_slippage_risk": 30,
         "liquidity_proxy_ok_needs_l2": 10,
     }
+    latest = rows[-1] if rows else {}
+    slug = _candidate_slug(latest) if latest else observation_key
     question = next((row.get("question") for row in rows if row.get("question")), None)
     observed_times = [
         row["source_observed_at_utc"]
@@ -738,15 +1016,36 @@ def _aggregate_candidate(slug: str, rows: list[dict[str, Any]]) -> dict[str, Any
     ]
     would_have_filled = _would_have_filled_measurement(rows)
     exit_loss_proxy = _exit_loss_proxy_measurement(rows)
+    time_in_band = _time_in_band_measurement(rows)
+    fill_evidence = _fill_evidence_summary(rows)
+    token_provenance = _token_provenance(latest)
+    yes_book = _top_book(latest, "yes")
+    no_book = _top_book(latest, "no")
     ev_fields = _reward_ev_fields(
-        rows[-1] if rows else {},
+        latest,
         would_have_filled_probability=would_have_filled.get("probability"),
         exit_loss_proxy=exit_loss_proxy,
+        time_in_band=time_in_band,
+        fill_evidence=fill_evidence,
     )
     return {
         "slug": slug,
+        "market_slug": slug,
+        "observation_key": observation_key,
         "question": question,
-        "evidence_sources": _evidence_sources(rows[-1] if rows else {}, rows),
+        "yes_token_id": token_provenance["canonical_yes_token_id"],
+        "no_token_id": token_provenance["canonical_no_token_id"],
+        "canonical_yes_token_id": token_provenance["canonical_yes_token_id"],
+        "canonical_no_token_id": token_provenance["canonical_no_token_id"],
+        "canonical_clob_token_ids": token_provenance["canonical_clob_token_ids"],
+        "source_clob_token_ids": token_provenance["source_clob_token_ids"],
+        "token_provenance": token_provenance,
+        "book_provenance": _book_provenance(latest),
+        "book_provenance_status": _book_provenance(latest).get("status"),
+        "book_provenance_complete": bool(_book_provenance(latest).get("complete")),
+        "yes_book": yes_book,
+        "no_book": no_book,
+        "evidence_sources": _evidence_sources(latest, rows),
         "source_observation_count": len(rows),
         "first_observed_at_utc": observed_times[0] if observed_times else None,
         "last_observed_at_utc": observed_times[-1] if observed_times else None,
@@ -754,10 +1053,11 @@ def _aggregate_candidate(slug: str, rows: list[dict[str, Any]]) -> dict[str, Any
         "latest_spread": _latest_float(rows, "spread"),
         "latest_liquidity": _latest_float(rows, "liquidity"),
         "latest_reward_max_spread": _latest_float(rows, "reward_max_spread"),
-        "time_in_band": _time_in_band_measurement(rows),
+        "time_in_band": time_in_band,
         "would_have_filled": would_have_filled,
         "would_have_filled_status": would_have_filled["status"],
         "would_have_filled_probability": would_have_filled.get("probability"),
+        "fill_evidence": fill_evidence,
         "accidental_fill_risk": _categorical_measurement(
             rows, "accidental_fill_risk", accidental_severity
         ),
@@ -778,35 +1078,52 @@ def build_aggregation_report(
     loaded.sort(key=lambda item: item[0])
     evidence_rows = _load_evidence_rows(evidence_paths)
     grouped: dict[str, list[dict[str, Any]]] = {}
+    grouped_by_slug: dict[str, list[str]] = {}
     source_files: list[str] = []
     for _, rows in loaded:
         for row in rows:
             source_file = row["source_snapshot_file"]
             if source_file not in source_files:
                 source_files.append(source_file)
-            grouped.setdefault(_candidate_slug(row), []).append(row)
+            observation_key = _observation_key(row)
+            grouped.setdefault(observation_key, []).append(row)
+            slug_keys = grouped_by_slug.setdefault(_candidate_slug(row), [])
+            if observation_key not in slug_keys:
+                slug_keys.append(observation_key)
     source_evidence_files: list[str] = []
     for row in evidence_rows:
         source_file = row["source_evidence_file"]
         if source_file not in source_evidence_files:
             source_evidence_files.append(source_file)
         slug = _candidate_slug(row)
-        if snapshot_paths and slug not in grouped:
-            continue
-        grouped.setdefault(slug, []).append(row)
+        observation_key = _observation_key(row)
+        if snapshot_paths and observation_key not in grouped:
+            slug_keys = grouped_by_slug.get(slug, [])
+            if len(slug_keys) != 1:
+                continue
+            observation_key = slug_keys[0]
+        grouped.setdefault(observation_key, []).append(row)
+        slug_keys = grouped_by_slug.setdefault(slug, [])
+        if observation_key not in slug_keys:
+            slug_keys.append(observation_key)
     observations = [
-        _aggregate_candidate(slug, rows)
-        for slug, rows in sorted(
+        _aggregate_candidate(observation_key, rows)
+        for observation_key, rows in sorted(
             grouped.items(), key=lambda item: item[1][0].get("source_observed_at_utc", "")
         )
     ][:limit]
     would_have_filled_known_count = sum(
         1 for row in observations if row["would_have_filled"]["status"].startswith("measured")
     )
+    reward_ev_computable_count = sum(
+        1
+        for row in observations
+        if row["reward_ev_status"] == "computable_shadow_proxy_not_profit_claim"
+    )
     classification = "diagnostic_only"
     if not observations:
         classification = "blocked"
-    elif would_have_filled_known_count > 0:
+    elif reward_ev_computable_count > 0:
         classification = "adopted"
     return {
         "schema_version": 2,
@@ -814,6 +1131,7 @@ def build_aggregation_report(
         "mode": AGGREGATION_MODE,
         "classification": classification,
         "safety": _safety_fields(),
+        **_safety_fields(),
         "source_snapshot_files": source_files,
         "source_evidence_files": source_evidence_files,
         "snapshot_file_count": len(source_files),
@@ -838,6 +1156,17 @@ def build_aggregation_report(
                 for row in observations
                 if row["would_have_filled"]["status"].startswith("unknown")
             ),
+            "conservative_would_fill_candidate_count": sum(
+                1
+                for row in observations
+                if row["fill_evidence"]["conservative_would_fill_snapshot_count"] > 0
+            ),
+            "post_only_cross_or_cancel_reprice_candidate_count": sum(
+                1
+                for row in observations
+                if row["fill_evidence"]["post_only_cross_snapshot_count"] > 0
+                or row["fill_evidence"]["cancel_or_reprice_snapshot_count"] > 0
+            ),
             "accidental_fill_risk_known_count": sum(
                 1
                 for row in observations
@@ -846,6 +1175,7 @@ def build_aggregation_report(
             "exit_risk_known_count": sum(
                 1 for row in observations if row["exit_risk"]["status"].startswith("measured")
             ),
+            "reward_ev_computable_count": reward_ev_computable_count,
         },
     }
 
@@ -873,6 +1203,7 @@ def build_report(
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
         "safety": _safety_fields(),
+        **_safety_fields(),
         "source_manifest": str(manifest),
         "source_evidence_files": source_evidence_files,
         "candidate_count": len(rows),

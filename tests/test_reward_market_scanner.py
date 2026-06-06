@@ -189,6 +189,12 @@ def test_build_reward_manifest_accepts_candidates_key_and_declares_no_live_tradi
         "worker_trading_started": False,
         "intended_uses": ["PMBT_BACKTEST_QUEUE", "HOMERUN_SHADOW_FORWARD_LOGGING"],
     }
+    assert manifest["orders_submitted"] is False
+    assert manifest["orders_signed"] is False
+    assert manifest["orders_cancelled"] is False
+    assert manifest["credentials_required"] is False
+    assert manifest["live_trading_worker_started"] is False
+    assert manifest["worker_trading_started"] is False
     assert [candidate["market_id"] for candidate in manifest["candidates"]] == ["tight", "wide"]
     assert "spread_too_wide_for_reward_proxy" in manifest["candidates"][1]["blockers"]
 
@@ -409,6 +415,49 @@ def test_latest_scan_shape_uses_liquidity_num_top10_depth_and_reward_evidence() 
     assert row["features"]["has_explicit_reward_evidence"] is True
     assert row["features"]["book_token_ids_match_yes_no_mapping"] is True
     assert row["reward_evidence"] == {"rewardsMinSize": "100", "rewardsMaxSpread": "3.0"}
+
+
+def test_latest_scan_shape_preserves_raw_tokens_without_canonical_mapping() -> None:
+    candidate = {
+        "id": "553858",
+        "condition_id": "0xabc",
+        "slug": "will-the-new-york-knicks-win-the-2026-nba-finals",
+        "question": "Will the New York Knicks win the 2026 NBA Finals?",
+        "liquidity_num": 453532.94,
+        "volume_24h": 1400427.53,
+        "yes_mid": 0.7905,
+        "clob_token_ids": ["yes-source-token", "no-source-token"],
+        "yes_book": {
+            "token_id": "yes-source-token",
+            "best_bid": 0.79,
+            "best_ask": 0.791,
+            "spread": 0.001,
+            "mid": 0.7905,
+        },
+    }
+
+    manifest = build_reward_manifest({"metadata": {}, "top_candidates": [candidate]}, limit=1)
+    row = manifest["candidates"][0]
+
+    assert row["source_clob_token_ids"] == ["yes-source-token", "no-source-token"]
+    assert row["clob_token_ids"] == []
+    assert row["yes_token_id"] is None
+    assert row["no_token_id"] is None
+    assert row["yes_book"]["token_id"] == "yes-source-token"
+    assert row["token_provenance"]["source_clob_token_ids"] == [
+        "yes-source-token",
+        "no-source-token",
+    ]
+    assert row["token_provenance"]["side_book_token_ids"] == {
+        "yes": "yes-source-token",
+        "no": None,
+    }
+    assert row["token_provenance"]["status"] == "incomplete_fail_closed"
+    assert (
+        "missing_canonical_yes_no_clob_token_ids" in row["token_provenance"]["fail_closed_reasons"]
+    )
+    assert "missing_no_best_bid" in row["book_provenance"]["fail_closed_reasons"]
+    assert row["eligible_for_backtest_queue"] is False
 
 
 def test_current_scan_bid_ask_books_emit_complete_book_provenance() -> None:

@@ -468,6 +468,37 @@ def _book_provenance(
     }
 
 
+def _token_provenance(
+    candidate: Mapping[str, Any],
+    clob_token_ids: Sequence[str],
+    book_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    sides = book_provenance.get("sides")
+    side_books = sides if isinstance(sides, Mapping) else {}
+    yes_book = side_books.get("yes") if isinstance(side_books.get("yes"), Mapping) else {}
+    no_book = side_books.get("no") if isinstance(side_books.get("no"), Mapping) else {}
+    canonical_complete = len(clob_token_ids) == 2
+    fail_closed_reasons = list(book_provenance.get("fail_closed_reasons") or [])
+    if (
+        not canonical_complete
+        and "missing_canonical_yes_no_clob_token_ids" not in fail_closed_reasons
+    ):
+        fail_closed_reasons.append("missing_canonical_yes_no_clob_token_ids")
+    return {
+        "status": "complete" if canonical_complete else "incomplete_fail_closed",
+        "canonical_complete": canonical_complete,
+        "canonical_yes_token_id": clob_token_ids[0] if canonical_complete else None,
+        "canonical_no_token_id": clob_token_ids[1] if canonical_complete else None,
+        "canonical_clob_token_ids": list(clob_token_ids),
+        "source_clob_token_ids": _candidate_token_ids(candidate),
+        "side_book_token_ids": {
+            "yes": yes_book.get("token_id"),
+            "no": no_book.get("token_id"),
+        },
+        "fail_closed_reasons": sorted(set(str(reason) for reason in fail_closed_reasons)),
+    }
+
+
 @dataclass(frozen=True)
 class RewardScoreRules:
     """Public-data proxy scoring rules for reward/backtest market selection.
@@ -685,11 +716,13 @@ def build_reward_manifest(
                 "slug": candidate.get("slug"),
                 "question": candidate.get("question"),
                 "clob_token_ids": clob_token_ids,
+                "source_clob_token_ids": _candidate_token_ids(candidate),
                 "yes_token_id": clob_token_ids[0] if len(clob_token_ids) == 2 else None,
                 "no_token_id": clob_token_ids[1] if len(clob_token_ids) == 2 else None,
                 "outcomes": _outcomes(candidate),
                 "reward_evidence": _reward_evidence(candidate),
                 "book_provenance": provenance,
+                "token_provenance": _token_provenance(candidate, clob_token_ids, provenance),
                 "yes_book": provenance["sides"]["yes"],
                 "no_book": provenance["sides"]["no"],
                 "source_candidate_score": _first_present(candidate, "candidate_score", "score"),
@@ -741,6 +774,13 @@ def build_reward_manifest(
             "worker_trading_started": False,
             "intended_uses": ["PMBT_BACKTEST_QUEUE", "HOMERUN_SHADOW_FORWARD_LOGGING"],
         },
+        "live_trading": False,
+        "orders_submitted": False,
+        "orders_signed": False,
+        "orders_cancelled": False,
+        "credentials_required": False,
+        "live_trading_worker_started": False,
+        "worker_trading_started": False,
         "scoring_rules": asdict(rules),
         "candidates": scored[: max(0, limit)],
     }
