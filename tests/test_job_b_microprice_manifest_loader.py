@@ -902,6 +902,110 @@ def test_diagnose_attempt_distinguishes_spread_and_queue_blockers():
     assert aggregate["no_order_cause_counts"]["queue_blocker"] == 1
 
 
+def test_diagnose_attempt_attributes_filled_negative_pnl_fail_closed():
+    candidate = job_b_microprice_batch.Candidate(
+        slug="filled-loss",
+        question="Filled loss market",
+        token_index=0,
+        condition_id=None,
+        scan_mid=0.0125,
+        scan_spread=0.001,
+        scan_imbalance5=None,
+        liquidity=1_000_000.0,
+        source_strategy="Microprice",
+    )
+    params = {
+        "depth_levels": 1,
+        "entry_imbalance": 0.55,
+        "exit_imbalance": 0.50,
+        "min_microprice_edge": 0.0005,
+        "quote_lifetime_seconds": 10.0,
+    }
+    result = {
+        "fills": 2,
+        "pnl": -0.28315,
+        "book_events": 179,
+        "last": 0.0095,
+        "fill_events": [
+            {
+                "action": "buy",
+                "price": 0.06,
+                "quantity": 5.0,
+                "commission": 0.0282,
+                "timestamp": "2026-05-25T08:01:32.339000+00:00",
+            },
+            {
+                "action": "sell",
+                "price": 0.01,
+                "quantity": 5.0,
+                "commission": 0.00495,
+                "timestamp": "2026-05-25T08:02:17.569000+00:00",
+            },
+        ],
+        "portfolio_stats": {"total_orders": 2},
+        "strategy_diagnostics": {
+            "book_signal_count": 177,
+            "flat_evaluation_count": 174,
+            "entry_signal_count": 1,
+            "entry_block_counts": {
+                "microprice_edge": 169,
+                "spread": 3,
+                "pending_order": 2,
+                "reentry_cooldown_seconds": 1,
+            },
+            "observed": {
+                "min_spread": 0.001,
+                "max_spread": 0.59,
+                "max_microprice_edge": 0.2886326247,
+            },
+            "thresholds": {"max_spread": 0.05, "min_microprice_edge": 0.0005},
+        },
+    }
+
+    diagnostics = job_b_microprice_batch._diagnose_attempt(
+        candidate,
+        params,
+        result,
+        start_time="2026-05-25T08:00:00Z",
+        end_time="2026-05-25T09:00:00Z",
+        min_book_events=50,
+        status="completed",
+    )
+    attribution = diagnostics["negative_pnl_attribution"]
+    aggregate = job_b_microprice_batch._aggregate_diagnostics(
+        [
+            job_b_microprice_batch.BacktestAttempt(
+                slug="filled-loss",
+                question="filled",
+                token_index=0,
+                source_strategy="Microprice",
+                params=params,
+                status="completed",
+                result=result,
+                error=None,
+                diagnostics=diagnostics,
+            )
+        ]
+    )
+
+    assert attribution["eligible"] is True
+    assert attribution["fail_closed"] is True
+    assert attribution["primary_cause"] == "adverse_selection_markout"
+    assert "adverse_selection_markout" in attribution["causes"]
+    assert "spread_tick_cost_too_large" in attribution["causes"]
+    assert "queue_fill_timing" in attribution["causes"]
+    assert "parameter_candidate_bucket" in attribution["causes"]
+    assert round(attribution["adverse_selection_markout"]["round_trip_price_edge"], 6) == -0.05
+    assert attribution["spread_tick_cost"]["spread_tick_cost_too_large"] is True
+    assert attribution["queue_fill_timing"]["queue_or_fill_timing_suspected"] is True
+    summary = aggregate["negative_pnl_attribution_summary"]
+    assert summary["eligible"] is True
+    assert summary["classification"] == "non_positive_pnl_after_orders_or_fills"
+    assert summary["cause_counts"]["adverse_selection_markout"] == 1
+    assert summary["cause_counts"]["spread_tick_cost_too_large"] == 1
+    assert summary["cause_counts"]["queue_fill_timing"] == 1
+
+
 def test_run_batch_fail_closes_on_exact_window_mismatch(monkeypatch, tmp_path):
     manifest = tmp_path / "coverage_window.json"
     manifest.write_text(
@@ -1043,3 +1147,136 @@ def test_validate_artifact_fail_closes_against_selected_manifest_window(tmp_path
     }
     assert "exact_window_metadata_blocker" in report["warnings"]
     assert report["blockers"][0]["type"] == "exact_window_metadata_blocker"
+
+
+def test_validate_artifact_derives_negative_pnl_attribution_from_legacy_artifact(tmp_path):
+    manifest = tmp_path / "coverage_window.json"
+    artifact = tmp_path / "job_b_artifact.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "candidate_count": 1,
+                "window": {
+                    "start_time": "2026-05-25T08:00:00Z",
+                    "end_time": "2026-05-25T09:00:00Z",
+                },
+                "min_book_events": 50,
+                "candidates": [
+                    {
+                        "slug": "filled-loss",
+                        "source_strategy": "Microprice",
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 179,
+                            "min_book_events": 50,
+                            "window": {
+                                "start_time": "2026-05-25T08:00:00Z",
+                                "end_time": "2026-05-25T09:00:00Z",
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact.write_text(
+        json.dumps(
+            {
+                "classification": "diagnostic_only",
+                "window": {
+                    "start_time": "2026-05-25T08:00:00Z",
+                    "end_time": "2026-05-25T09:00:00Z",
+                },
+                "min_book_events": 50,
+                "fills_orders_pnl": {
+                    "total_fills": 2,
+                    "total_strategy_orders": 2,
+                    "completed_pnl_sum": -0.28315,
+                    "completed_positive_pnl_attempts": 0,
+                    "completed_negative_pnl_attempts": 1,
+                    "completed_zero_pnl_attempts": 0,
+                },
+                "attempts": [
+                    {
+                        "slug": "filled-loss",
+                        "token_index": 0,
+                        "source_strategy": "Microprice",
+                        "status": "completed",
+                        "params": {
+                            "depth_levels": 1,
+                            "entry_imbalance": 0.55,
+                            "exit_imbalance": 0.50,
+                            "min_microprice_edge": 0.0005,
+                            "quote_lifetime_seconds": 10.0,
+                        },
+                        "result": {
+                            "fills": 2,
+                            "pnl": -0.28315,
+                            "last": 0.0095,
+                            "fill_events": [
+                                {
+                                    "action": "buy",
+                                    "price": 0.06,
+                                    "quantity": 5.0,
+                                    "commission": 0.0282,
+                                    "timestamp": "2026-05-25T08:01:32.339000+00:00",
+                                },
+                                {
+                                    "action": "sell",
+                                    "price": 0.01,
+                                    "quantity": 5.0,
+                                    "commission": 0.00495,
+                                    "timestamp": "2026-05-25T08:02:17.569000+00:00",
+                                },
+                            ],
+                        },
+                        "diagnostics": {
+                            "window": {
+                                "start_time": "2026-05-25T08:00:00Z",
+                                "end_time": "2026-05-25T09:00:00Z",
+                            },
+                            "min_book_events": 50,
+                            "fills": 2,
+                            "pnl": -0.28315,
+                            "strategy_order_count": 2,
+                            "scan_mid": 0.0125,
+                            "scan_spread": 0.001,
+                            "tail_bucket": "non_extreme_tail",
+                            "strategy_diagnostics": {
+                                "entry_signal_count": 1,
+                                "entry_block_counts": {
+                                    "spread": 3,
+                                    "pending_order": 2,
+                                    "reentry_cooldown_seconds": 1,
+                                },
+                                "observed": {
+                                    "min_spread": 0.001,
+                                    "max_spread": 0.59,
+                                },
+                                "thresholds": {"max_spread": 0.05},
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = job_b_microprice_batch.build_exact_window_validation_report(
+        manifest_path=manifest,
+        artifact_path=artifact,
+        command=["python", "scripts/job_b_microprice_batch.py", "--validate-artifact"],
+    )
+
+    summary = report["negative_pnl_attribution_summary"]
+    assert report["classification"] == "diagnostic_only"
+    assert report["exact_window_status"] == "verified"
+    assert report["live_ready"] is False
+    assert summary["eligible"] is True
+    assert summary["classification"] == "non_positive_pnl_after_orders_or_fills"
+    assert summary["cause_counts"]["adverse_selection_markout"] == 1
+    assert summary["cause_counts"]["spread_tick_cost_too_large"] == 1
+    assert summary["cause_counts"]["queue_fill_timing"] == 1

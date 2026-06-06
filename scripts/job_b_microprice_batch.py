@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -657,6 +658,471 @@ def _safe_nested_float(mapping: dict[str, Any], key: str) -> float | None:
     return _parse_float(mapping.get(key))
 
 
+def _safe_mapping_from(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _safe_fill_events(result: dict[str, Any]) -> list[dict[str, Any]]:
+    fill_events = result.get("fill_events")
+    if not isinstance(fill_events, list):
+        return []
+    return [dict(event) for event in fill_events if isinstance(event, Mapping)]
+
+
+def _weighted_fill_stats(fill_events: list[dict[str, Any]], action: str) -> dict[str, Any]:
+    quantity = 0.0
+    notional = 0.0
+    commissions = 0.0
+    for event in fill_events:
+        if str(event.get("action") or "").lower() != action:
+            continue
+        price = _parse_float(event.get("price"))
+        qty = _parse_float(event.get("quantity"))
+        if price is None or qty is None:
+            continue
+        quantity += qty
+        notional += price * qty
+        commissions += _parse_float(event.get("commission")) or 0.0
+    return {
+        "quantity": quantity,
+        "notional": notional,
+        "average_price": notional / quantity if quantity > 0 else None,
+        "commission": commissions,
+    }
+
+
+def _fill_time_span_seconds(fill_events: list[dict[str, Any]]) -> float | None:
+    timestamps: list[float] = []
+    for event in fill_events:
+        timestamp = event.get("timestamp")
+        if not isinstance(timestamp, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        timestamps.append(parsed.timestamp())
+    if len(timestamps) < 2:
+        return None
+    return max(timestamps) - min(timestamps)
+
+
+def _terminal_price(result: dict[str, Any]) -> float | None:
+    for key in ("last", "entry_min"):
+        price = _parse_float(result.get(key))
+        if price is not None:
+            return price
+    return None
+
+
+def _price_move_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    fill_events = _safe_fill_events(result)
+    buy = _weighted_fill_stats(fill_events, "buy")
+    sell = _weighted_fill_stats(fill_events, "sell")
+    terminal_price = _terminal_price(result)
+    avg_buy = _parse_float(buy.get("average_price"))
+    avg_sell = _parse_float(sell.get("average_price"))
+    round_trip_edge = avg_sell - avg_buy if avg_buy is not None and avg_sell is not None else None
+    terminal_long_markout = (
+        terminal_price - avg_buy if terminal_price is not None and avg_buy is not None else None
+    )
+    available = round_trip_edge is not None or terminal_long_markout is not None
+    adverse = bool(
+        (round_trip_edge is not None and round_trip_edge < 0)
+        or (terminal_long_markout is not None and terminal_long_markout < 0)
+    )
+    return {
+        "available": available,
+        "adverse_selection_or_markout_detected": adverse,
+        "fill_event_count": len(fill_events),
+        "buy_quantity": buy["quantity"],
+        "sell_quantity": sell["quantity"],
+        "average_buy_price": avg_buy,
+        "average_sell_price": avg_sell,
+        "terminal_price": terminal_price,
+        "round_trip_price_edge": round_trip_edge,
+        "terminal_long_markout": terminal_long_markout,
+        "commission_total": buy["commission"] + sell["commission"],
+        "fill_time_span_seconds": _fill_time_span_seconds(fill_events),
+    }
+
+
+def _spread_tick_cost_attribution(
+    *,
+    diagnostics: dict[str, Any],
+    result: dict[str, Any],
+    price_move: dict[str, Any],
+) -> dict[str, Any]:
+    strategy_diagnostics = _safe_mapping_from(diagnostics.get("strategy_diagnostics"))
+    observed = _safe_mapping_from(strategy_diagnostics.get("observed"))
+    thresholds = _safe_mapping_from(strategy_diagnostics.get("thresholds"))
+    no_order = _safe_mapping_from(diagnostics.get("no_order"))
+    blockers = _safe_mapping_from(no_order.get("blockers"))
+    tick_cost = _safe_mapping_from(blockers.get("tick_cost"))
+    scan_mid = _parse_float(diagnostics.get("scan_mid"))
+    scan_spread = _parse_float(diagnostics.get("scan_spread"))
+    observed_min_spread = _parse_float(observed.get("min_spread"))
+    observed_max_spread = _parse_float(observed.get("max_spread"))
+    max_spread_threshold = _parse_float(thresholds.get("max_spread"))
+    spread_to_mid_ratio = _parse_float(tick_cost.get("spread_to_mid_ratio"))
+    if spread_to_mid_ratio is None and scan_mid is not None and scan_mid > 0:
+        effective_spread = scan_spread if scan_spread is not None else observed_min_spread
+        spread_to_mid_ratio = effective_spread / scan_mid if effective_spread is not None else None
+    threshold_ratio = _parse_float(tick_cost.get("threshold_ratio")) or 0.20
+    commission_total = _parse_float(price_move.get("commission_total")) or 0.0
+    fill_events = _safe_fill_events(result)
+    fill_notional = 0.0
+    for event in fill_events:
+        price = _parse_float(event.get("price"))
+        quantity = _parse_float(event.get("quantity"))
+        if price is not None and quantity is not None:
+            fill_notional += price * quantity
+    commission_to_notional_ratio = commission_total / fill_notional if fill_notional > 0 else None
+    round_trip_edge = _parse_float(price_move.get("round_trip_price_edge"))
+    effective_spread = scan_spread if scan_spread is not None else observed_min_spread
+    spread_move_exceeded = bool(
+        round_trip_edge is not None
+        and effective_spread is not None
+        and abs(round_trip_edge) >= effective_spread
+    )
+    too_large = bool(
+        tick_cost.get("blocked") is True
+        or (spread_to_mid_ratio is not None and spread_to_mid_ratio >= threshold_ratio)
+        or (
+            observed_max_spread is not None
+            and max_spread_threshold is not None
+            and observed_max_spread > max_spread_threshold
+        )
+        or (commission_to_notional_ratio is not None and commission_to_notional_ratio >= 0.005)
+        or spread_move_exceeded
+    )
+    return {
+        "spread_tick_cost_too_large": too_large,
+        "scan_mid": scan_mid,
+        "scan_spread": scan_spread,
+        "observed_min_spread": observed_min_spread,
+        "observed_max_spread": observed_max_spread,
+        "max_spread_threshold": max_spread_threshold,
+        "spread_to_mid_ratio": spread_to_mid_ratio,
+        "threshold_ratio": threshold_ratio,
+        "commission_total": commission_total,
+        "fill_notional": fill_notional,
+        "commission_to_notional_ratio": commission_to_notional_ratio,
+        "round_trip_move_exceeded_effective_spread": spread_move_exceeded,
+    }
+
+
+def _queue_fill_timing_attribution(
+    *,
+    diagnostics: dict[str, Any],
+    result: dict[str, Any],
+    params: dict[str, Any],
+    price_move: dict[str, Any],
+) -> dict[str, Any]:
+    strategy_diagnostics = _safe_mapping_from(diagnostics.get("strategy_diagnostics"))
+    entry_block_counts = _safe_mapping_from(strategy_diagnostics.get("entry_block_counts"))
+    fills = _parse_float(diagnostics.get("fills"))
+    strategy_order_count = _parse_float(diagnostics.get("strategy_order_count"))
+    entry_signal_count = _parse_int(strategy_diagnostics.get("entry_signal_count"))
+    fill_span_seconds = _parse_float(price_move.get("fill_time_span_seconds"))
+    quote_lifetime_seconds = _parse_float(params.get("quote_lifetime_seconds"))
+    order_fill_ratio = (
+        fills / strategy_order_count
+        if fills is not None and strategy_order_count is not None and strategy_order_count > 0
+        else None
+    )
+    pending_order_blocks = _safe_count(entry_block_counts.get("pending_order"))
+    cooldown_blocks = _safe_count(entry_block_counts.get("reentry_cooldown_seconds")) + _safe_count(
+        entry_block_counts.get("reentry_cooldown_updates")
+    )
+    suspected = bool(
+        (fills or 0.0) > 0
+        and (
+            pending_order_blocks > 0
+            or cooldown_blocks > 0
+            or (
+                fill_span_seconds is not None
+                and quote_lifetime_seconds is not None
+                and fill_span_seconds > quote_lifetime_seconds
+            )
+            or (order_fill_ratio is not None and order_fill_ratio < 1.0)
+        )
+    )
+    return {
+        "queue_or_fill_timing_suspected": suspected,
+        "fills": fills,
+        "strategy_order_count": strategy_order_count,
+        "entry_signal_count": entry_signal_count,
+        "order_fill_ratio": order_fill_ratio,
+        "fill_time_span_seconds": fill_span_seconds,
+        "quote_lifetime_seconds": quote_lifetime_seconds,
+        "pending_order_block_count": pending_order_blocks,
+        "cooldown_block_count": cooldown_blocks,
+    }
+
+
+def _parameter_candidate_bucket(
+    *,
+    slug: str | None,
+    token_index: int | None,
+    source_strategy: str | None,
+    diagnostics: dict[str, Any],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "slug": slug,
+        "token_index": token_index,
+        "source_strategy": source_strategy,
+        "tail_bucket": diagnostics.get("tail_bucket") or "unknown",
+        "scan_mid": diagnostics.get("scan_mid"),
+        "scan_spread": diagnostics.get("scan_spread"),
+        "liquidity": diagnostics.get("liquidity"),
+        "params": dict(params),
+        "bucket_key": (
+            f"{diagnostics.get('tail_bucket') or 'unknown'}|"
+            f"depth={params.get('depth_levels')}|"
+            f"edge={params.get('min_microprice_edge')}|"
+            f"entry={params.get('entry_imbalance')}|"
+            f"hold={params.get('quote_lifetime_seconds')}"
+        ),
+    }
+
+
+def _negative_pnl_attempt_attribution(
+    *,
+    slug: str | None,
+    token_index: int | None,
+    source_strategy: str | None,
+    status: str,
+    params: dict[str, Any],
+    result: dict[str, Any] | None,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    result = result or {}
+    fills = _parse_float(diagnostics.get("fills"))
+    pnl = _parse_float(diagnostics.get("pnl"))
+    strategy_order_count = _parse_float(diagnostics.get("strategy_order_count"))
+    eligible = bool(
+        status == "completed"
+        and pnl is not None
+        and pnl <= 0
+        and ((fills or 0.0) > 0 or (strategy_order_count or 0.0) > 0)
+    )
+    price_move = _price_move_diagnostics(result)
+    spread_tick_cost = _spread_tick_cost_attribution(
+        diagnostics=diagnostics, result=result, price_move=price_move
+    )
+    queue_fill_timing = _queue_fill_timing_attribution(
+        diagnostics=diagnostics, result=result, params=params, price_move=price_move
+    )
+    parameter_bucket = _parameter_candidate_bucket(
+        slug=slug,
+        token_index=token_index,
+        source_strategy=source_strategy,
+        diagnostics=diagnostics,
+        params=params,
+    )
+    causes: list[str] = []
+    if eligible and price_move["adverse_selection_or_markout_detected"]:
+        causes.append("adverse_selection_markout")
+    if eligible and spread_tick_cost["spread_tick_cost_too_large"]:
+        causes.append("spread_tick_cost_too_large")
+    if eligible and queue_fill_timing["queue_or_fill_timing_suspected"]:
+        causes.append("queue_fill_timing")
+    if eligible:
+        causes.append("parameter_candidate_bucket")
+    missing: list[str] = []
+    if eligible and not price_move["available"]:
+        missing.append("markout_or_round_trip_price_move_unavailable")
+    if eligible and not diagnostics.get("strategy_diagnostics"):
+        missing.append("strategy_diagnostics_unavailable")
+    if eligible and diagnostics.get("scan_mid") is None:
+        missing.append("scan_mid_unavailable")
+    unknown = bool(eligible and not any(cause != "parameter_candidate_bucket" for cause in causes))
+    if unknown:
+        causes.append("unknown_insufficient_evidence")
+    primary_cause = None
+    for candidate_cause in (
+        "adverse_selection_markout",
+        "spread_tick_cost_too_large",
+        "queue_fill_timing",
+        "unknown_insufficient_evidence",
+        "parameter_candidate_bucket",
+    ):
+        if candidate_cause in causes:
+            primary_cause = candidate_cause
+            break
+    return {
+        "schema_version": 1,
+        "eligible": eligible,
+        "classification": "non_positive_pnl_after_fills" if eligible else "not_applicable",
+        "fail_closed": True,
+        "primary_cause": primary_cause,
+        "causes": causes,
+        "cause_counts": {cause: 1 for cause in causes},
+        "pnl": pnl,
+        "fills": fills,
+        "strategy_order_count": strategy_order_count,
+        "adverse_selection_markout": price_move,
+        "spread_tick_cost": spread_tick_cost,
+        "queue_fill_timing": queue_fill_timing,
+        "parameter_candidate_bucket": parameter_bucket,
+        "unknown_insufficient_evidence": {
+            "blocked": unknown,
+            "fail_closed": True,
+            "missing_evidence": missing,
+        },
+    }
+
+
+def _attempt_record(attempt: BacktestAttempt | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(attempt, BacktestAttempt):
+        return {
+            "slug": attempt.slug,
+            "question": attempt.question,
+            "token_index": attempt.token_index,
+            "source_strategy": attempt.source_strategy,
+            "params": attempt.params,
+            "status": attempt.status,
+            "result": attempt.result,
+            "error": attempt.error,
+            "diagnostics": attempt.diagnostics,
+        }
+    return dict(attempt)
+
+
+def _attribution_from_attempt_record(
+    attempt: BacktestAttempt | Mapping[str, Any],
+) -> dict[str, Any]:
+    record = _attempt_record(attempt)
+    diagnostics = _safe_mapping_from(record.get("diagnostics"))
+    result = _safe_mapping_from(record.get("result"))
+    params = _safe_mapping_from(record.get("params") or diagnostics.get("params"))
+    existing = diagnostics.get("negative_pnl_attribution")
+    if isinstance(existing, Mapping):
+        return dict(existing)
+    return _negative_pnl_attempt_attribution(
+        slug=record.get("slug") if isinstance(record.get("slug"), str) else None,
+        token_index=_parse_int(record.get("token_index")),
+        source_strategy=(
+            record.get("source_strategy")
+            if isinstance(record.get("source_strategy"), str)
+            else None
+        ),
+        status=str(record.get("status") or ""),
+        params=params,
+        result=result,
+        diagnostics=diagnostics,
+    )
+
+
+def _negative_pnl_attribution_summary(
+    attempts: list[BacktestAttempt] | list[Mapping[str, Any]],
+    fills_orders_pnl: dict[str, Any],
+) -> dict[str, Any]:
+    completed_pnl_sum = _parse_float(fills_orders_pnl.get("completed_pnl_sum"))
+    total_fills = _parse_float(fills_orders_pnl.get("total_fills")) or 0.0
+    total_strategy_orders = _parse_float(fills_orders_pnl.get("total_strategy_orders")) or 0.0
+    attributions: list[dict[str, Any]] = []
+    cause_counts: dict[str, int] = {}
+    primary_cause_counts: dict[str, int] = {}
+    for attempt in attempts:
+        attribution = _attribution_from_attempt_record(attempt)
+        if not attribution.get("eligible"):
+            continue
+        attributions.append(attribution)
+        for cause, count in (attribution.get("cause_counts") or {}).items():
+            cause_counts[str(cause)] = cause_counts.get(str(cause), 0) + int(count or 0)
+        primary_cause = attribution.get("primary_cause")
+        if primary_cause:
+            key = str(primary_cause)
+            primary_cause_counts[key] = primary_cause_counts.get(key, 0) + 1
+
+    aggregate_eligible = bool(
+        completed_pnl_sum is not None
+        and completed_pnl_sum <= 0
+        and (total_fills > 0 or total_strategy_orders > 0)
+    )
+    if not aggregate_eligible:
+        classification = (
+            "not_applicable_positive_aggregate_pnl"
+            if completed_pnl_sum is not None and completed_pnl_sum > 0
+            else "not_applicable_no_orders_or_fills"
+        )
+    elif attributions:
+        classification = "non_positive_pnl_after_orders_or_fills"
+    else:
+        classification = "unknown_insufficient_evidence_fail_closed"
+        cause_counts["unknown_insufficient_evidence"] = (
+            cause_counts.get("unknown_insufficient_evidence", 0) + 1
+        )
+
+    primary_cause = None
+    for candidate_cause in (
+        "adverse_selection_markout",
+        "spread_tick_cost_too_large",
+        "queue_fill_timing",
+        "unknown_insufficient_evidence",
+        "parameter_candidate_bucket",
+    ):
+        if cause_counts.get(candidate_cause):
+            primary_cause = candidate_cause
+            break
+    unknown_count = cause_counts.get("unknown_insufficient_evidence", 0)
+    return {
+        "schema_version": 1,
+        "eligible": aggregate_eligible,
+        "classification": classification,
+        "fail_closed": True,
+        "primary_cause": primary_cause,
+        "cause_counts": cause_counts,
+        "primary_cause_counts": primary_cause_counts,
+        "eligible_attempt_count": len(attributions),
+        "completed_pnl_sum": completed_pnl_sum,
+        "total_fills": total_fills,
+        "total_strategy_orders": total_strategy_orders,
+        "adverse_selection_markout_available_attempts": sum(
+            1
+            for attribution in attributions
+            if _safe_mapping_from(attribution.get("adverse_selection_markout")).get("available")
+        ),
+        "spread_tick_cost_too_large_attempts": sum(
+            1
+            for attribution in attributions
+            if _safe_mapping_from(attribution.get("spread_tick_cost")).get(
+                "spread_tick_cost_too_large"
+            )
+        ),
+        "queue_fill_timing_suspected_attempts": sum(
+            1
+            for attribution in attributions
+            if _safe_mapping_from(attribution.get("queue_fill_timing")).get(
+                "queue_or_fill_timing_suspected"
+            )
+        ),
+        "unknown_insufficient_evidence_attempts": unknown_count,
+        "attempts": [
+            {
+                "slug": _safe_mapping_from(attribution.get("parameter_candidate_bucket")).get(
+                    "slug"
+                ),
+                "token_index": _safe_mapping_from(
+                    attribution.get("parameter_candidate_bucket")
+                ).get("token_index"),
+                "pnl": attribution.get("pnl"),
+                "fills": attribution.get("fills"),
+                "strategy_order_count": attribution.get("strategy_order_count"),
+                "primary_cause": attribution.get("primary_cause"),
+                "causes": attribution.get("causes", []),
+                "parameter_candidate_bucket": attribution.get("parameter_candidate_bucket"),
+            }
+            for attribution in attributions
+        ],
+    }
+
+
 def _tick_cost_diagnostic(
     *, scan_mid: float | None, scan_spread: float | None, observed_min_spread: float | None
 ) -> dict[str, Any]:
@@ -861,6 +1327,26 @@ def _diagnose_attempt(
     for cause in no_order.get("causes", []):
         if cause not in suspected_causes:
             suspected_causes.append(cause)
+    negative_pnl_attribution = _negative_pnl_attempt_attribution(
+        slug=candidate.slug,
+        token_index=candidate.token_index,
+        source_strategy=candidate.source_strategy,
+        status=status,
+        params=params,
+        result=result,
+        diagnostics={
+            "scan_mid": mid,
+            "scan_spread": spread,
+            "liquidity": candidate.liquidity,
+            "tail_bucket": tail_bucket,
+            "fills": fills,
+            "pnl": pnl,
+            "strategy_order_count": strategy_order_count,
+            "params": params,
+            "strategy_diagnostics": strategy_diagnostics,
+            "no_order": no_order,
+        },
+    )
     return {
         "window": {"start_time": start_time, "end_time": end_time},
         "min_book_events": min_book_events,
@@ -878,6 +1364,7 @@ def _diagnose_attempt(
         "no_order": no_order,
         "no_order_primary_cause": no_order.get("primary_cause"),
         "no_order_causes": no_order.get("causes", []),
+        "negative_pnl_attribution": negative_pnl_attribution,
         "suspected_causes": suspected_causes,
     }
 
@@ -944,6 +1431,7 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
         "completed_negative_pnl_attempts": sum(1 for value in completed_pnl_values if value < 0),
         "completed_zero_pnl_attempts": sum(1 for value in completed_pnl_values if value == 0),
     }
+    negative_pnl_summary = _negative_pnl_attribution_summary(attempts, fills_orders_pnl)
     return {
         "completed_attempts": len(completed),
         "zero_fill_completed_attempts": len(zero_fill),
@@ -953,6 +1441,7 @@ def _aggregate_diagnostics(attempts: list[BacktestAttempt]) -> dict[str, Any]:
         "tail_bucket_counts": tail_bucket_counts,
         "tick_cost_bucket_counts": tick_cost_bucket_counts,
         "fills_orders_pnl": fills_orders_pnl,
+        "negative_pnl_attribution_summary": negative_pnl_summary,
         "profit_opportunity_demonstrated": any(
             ((a.result or {}).get("pnl") or 0) > 0 and ((a.result or {}).get("fills") or 0) > 0
             for a in attempts
@@ -1402,14 +1891,33 @@ def build_exact_window_validation_report(
         candidate_count=candidate_count,
         exact_window_status=exact_window_status,
     )
+    artifact_fills_orders_pnl = (
+        artifact_payload.get("fills_orders_pnl")
+        if isinstance(artifact_payload.get("fills_orders_pnl"), dict)
+        else {}
+    )
+    artifact_negative_pnl_summary = artifact_payload.get("negative_pnl_attribution_summary")
+    if not isinstance(artifact_negative_pnl_summary, dict):
+        attempts = (
+            artifact_payload.get("attempts")
+            if isinstance(artifact_payload.get("attempts"), list)
+            else []
+        )
+        artifact_negative_pnl_summary = _negative_pnl_attribution_summary(
+            [attempt for attempt in attempts if isinstance(attempt, Mapping)],
+            artifact_fills_orders_pnl,
+        )
     return {
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
         "classification": classification,
+        "live_ready": False,
+        "no_profit_claim": True,
         "exact_window_status": exact_window_status,
         "pass_manifest_status": "pass" if candidate_count > 0 else "no_pass",
         "manifest": str(manifest_path),
         "artifact": str(artifact_path),
+        "negative_pnl_attribution_summary": artifact_negative_pnl_summary,
         "manifest_selection": manifest_selection
         or [{"path": str(manifest_path), "selected": True, "reason": "explicit_manifest"}],
         "expected_selected_windows": expected_records,
@@ -1765,6 +2273,8 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
         "classification": classification,
+        "live_ready": False,
+        "no_profit_claim": True,
         "pass_manifest_status": "pass" if candidates else "no_pass",
         "safety": {
             "live_trading": False,
@@ -1805,6 +2315,9 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "skipped_no_coverage": skipped,
         "errors": errored,
         "fills_orders_pnl": aggregate_diagnostics["fills_orders_pnl"],
+        "negative_pnl_attribution_summary": aggregate_diagnostics[
+            "negative_pnl_attribution_summary"
+        ],
         "tail_bucket_counts": aggregate_diagnostics["tail_bucket_counts"],
         "tick_cost_buckets": aggregate_diagnostics["tick_cost_bucket_counts"],
         "candidate_selection": {
@@ -1888,6 +2401,8 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- generated_at_utc: {summary['generated_at_utc']}",
         f"- mode: {summary['mode']}",
         f"- classification: {summary.get('classification')}",
+        f"- live_ready: {str(summary.get('live_ready')).lower()}",
+        f"- no_profit_claim: {str(summary.get('no_profit_claim')).lower()}",
         f"- pass_manifest_status: {summary.get('pass_manifest_status')}",
         f"- manifest: {summary['manifest']}",
         f"- window: {summary['window']['start_time']} -> {summary['window']['end_time']}",
@@ -1901,6 +2416,12 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- blockers: {json.dumps(summary.get('blockers', []), sort_keys=True)}",
         f"- attempt_isolation: {summary.get('attempt_isolation')}",
         f"- safety: {json.dumps(summary.get('safety', {}), sort_keys=True)}",
+        f"- orders_submitted={str(summary.get('safety', {}).get('orders_submitted')).lower()}",
+        f"- orders_signed={str(summary.get('safety', {}).get('orders_signed')).lower()}",
+        f"- orders_cancelled={str(summary.get('safety', {}).get('orders_cancelled')).lower()}",
+        f"- credentials_required={str(summary.get('safety', {}).get('credentials_required')).lower()}",
+        f"- live_trading_worker_started={str(summary.get('safety', {}).get('live_trading_worker_started')).lower()}",
+        f"- worker_trading_started={str(summary.get('safety', {}).get('worker_trading_started')).lower()}",
         f"- candidates: {summary['candidate_count']}",
         f"- window_policy: {summary.get('candidate_selection', {}).get('window_policy')}",
         f"- parameter_sets: {summary['parameter_set_count']}",
@@ -1910,6 +2431,7 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- skipped_no_coverage: {summary.get('skipped_no_coverage', summary['skipped_no_coverage_count'])}",
         f"- errors: {summary.get('errors', summary['error_count'])}",
         f"- fills_orders_pnl: {json.dumps(summary.get('fills_orders_pnl', {}), sort_keys=True)}",
+        f"- negative_pnl_attribution_summary: {json.dumps(summary.get('negative_pnl_attribution_summary', {}), sort_keys=True)}",
         f"- tail_bucket_counts: {json.dumps(summary.get('tail_bucket_counts', {}), sort_keys=True)}",
         f"- tick_cost_buckets: {json.dumps(summary.get('tick_cost_buckets', {}), sort_keys=True)}",
         f"- no_order_cause_counts: {json.dumps(aggregate_diagnostics.get('no_order_cause_counts', {}), sort_keys=True)}",
@@ -1966,6 +2488,8 @@ def _write_validation_outputs(
         f"- generated_at_utc: {report.get('generated_at_utc')}",
         f"- mode: {report.get('mode')}",
         f"- classification: {report.get('classification')}",
+        f"- live_ready: {str(report.get('live_ready')).lower()}",
+        f"- no_profit_claim: {str(report.get('no_profit_claim')).lower()}",
         f"- exact_window_status: {report.get('exact_window_status')}",
         f"- pass_manifest_status: {report.get('pass_manifest_status')}",
         f"- manifest: {report.get('manifest')}",
@@ -1976,6 +2500,13 @@ def _write_validation_outputs(
         f"- blockers: {json.dumps(report.get('blockers', []), sort_keys=True)}",
         f"- commands: {json.dumps(report.get('commands', []), sort_keys=True)}",
         f"- safety: {json.dumps(report.get('safety', {}), sort_keys=True)}",
+        f"- orders_submitted={str(report.get('safety', {}).get('orders_submitted')).lower()}",
+        f"- orders_signed={str(report.get('safety', {}).get('orders_signed')).lower()}",
+        f"- orders_cancelled={str(report.get('safety', {}).get('orders_cancelled')).lower()}",
+        f"- credentials_required={str(report.get('safety', {}).get('credentials_required')).lower()}",
+        f"- live_trading_worker_started={str(report.get('safety', {}).get('live_trading_worker_started')).lower()}",
+        f"- worker_trading_started={str(report.get('safety', {}).get('worker_trading_started')).lower()}",
+        f"- negative_pnl_attribution_summary: {json.dumps(report.get('negative_pnl_attribution_summary', {}), sort_keys=True)}",
         "",
         "Safety: backtest/shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.",
     ]
