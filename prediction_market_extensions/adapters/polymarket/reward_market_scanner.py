@@ -373,6 +373,244 @@ def _strategy_fits(candidate: Mapping[str, Any]) -> set[str]:
     return set()
 
 
+def _source_row_key(row: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("market_id", "id", "condition_id", "conditionId", "slug"):
+        value = row.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}:{value}")
+    if parts:
+        return "|".join(parts)
+    question = row.get("question")
+    if question not in (None, ""):
+        return f"question:{question}"
+    return json.dumps(row, sort_keys=True, default=str)
+
+
+def _type_name(value: Any) -> str | None:
+    return type(value).__name__ if value is not None else None
+
+
+def _source_exclusion(
+    *,
+    source_key: str,
+    reason: str,
+    source_shape: str,
+    strategy_bucket: str | None = None,
+    value: Any = None,
+) -> dict[str, Any]:
+    exclusion: dict[str, Any] = {
+        "source_key": source_key,
+        "reason": reason,
+        "source_shape": source_shape,
+    }
+    if strategy_bucket is not None:
+        exclusion["strategy_bucket"] = strategy_bucket
+    if value is not None:
+        exclusion["value_type"] = type(value).__name__
+    return exclusion
+
+
+def _scan_rows_from_sequence(
+    value: Any,
+    *,
+    source_key: str,
+    source_shape: str,
+    strategy_bucket: str | None = None,
+) -> tuple[list[tuple[Mapping[str, Any], dict[str, Any]]], list[dict[str, Any]]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return [], [
+            _source_exclusion(
+                source_key=source_key,
+                reason="candidate_container_not_list",
+                source_shape=source_shape,
+                strategy_bucket=strategy_bucket,
+                value=value,
+            )
+        ]
+
+    rows: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    exclusions: list[dict[str, Any]] = []
+    for index, row in enumerate(value):
+        row_source_key = f"{source_key}[{index}]"
+        if not isinstance(row, Mapping):
+            exclusions.append(
+                _source_exclusion(
+                    source_key=row_source_key,
+                    reason="non_object_candidate_row",
+                    source_shape=source_shape,
+                    strategy_bucket=strategy_bucket,
+                    value=row,
+                )
+            )
+            continue
+        row_key = _source_row_key(row)
+        rows.append(
+            (
+                row,
+                {
+                    "source_key": row_source_key,
+                    "source_shape": source_shape,
+                    "strategy_buckets": [strategy_bucket] if strategy_bucket else [],
+                    "deduplication_key": row_key,
+                    "duplicate_source_keys": [],
+                },
+            )
+        )
+    return rows, exclusions
+
+
+def _deduplicate_source_rows(
+    rows: Sequence[tuple[Mapping[str, Any], dict[str, Any]]],
+) -> tuple[list[tuple[Mapping[str, Any], dict[str, Any]]], list[dict[str, Any]]]:
+    by_key: dict[str, tuple[Mapping[str, Any], dict[str, Any]]] = {}
+    duplicate_rows: list[dict[str, Any]] = []
+    for row, provenance in rows:
+        row_key = str(provenance["deduplication_key"])
+        existing = by_key.get(row_key)
+        if existing is None:
+            by_key[row_key] = (row, dict(provenance))
+            continue
+        _, existing_provenance = existing
+        existing_buckets = existing_provenance.setdefault("strategy_buckets", [])
+        for bucket in provenance.get("strategy_buckets", []):
+            if bucket not in existing_buckets:
+                existing_buckets.append(bucket)
+        duplicate_source_keys = existing_provenance.setdefault("duplicate_source_keys", [])
+        duplicate_source_keys.append(provenance["source_key"])
+        duplicate_rows.append(
+            {
+                "source_key": provenance["source_key"],
+                "deduplicated_into": existing_provenance["source_key"],
+                "deduplication_key": row_key,
+                "strategy_buckets": provenance.get("strategy_buckets", []),
+                "reason": "duplicate_candidate_row",
+            }
+        )
+    return list(by_key.values()), duplicate_rows
+
+
+def _count_reasons(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = str(row.get("reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _source_state_classification(diagnostics: Mapping[str, Any]) -> str:
+    if diagnostics.get("normalized_candidate_count"):
+        selected_source = diagnostics.get("selected_source")
+        if selected_source == "top_candidates_strategy_buckets":
+            return "strategy_keyed_top_candidates_normalized"
+        return "list_shaped_candidates_normalized"
+    if diagnostics.get("source_candidate_container_count") or diagnostics.get(
+        "strategy_bucket_candidate_count"
+    ):
+        return "source_rows_failed_closed_before_scoring"
+    if diagnostics.get("excluded_source_row_count"):
+        return "source_schema_or_provenance_failed_closed"
+    return "source_empty_zero_candidates"
+
+
+def _scan_candidates_with_diagnostics(
+    scan: Mapping[str, Any],
+) -> tuple[list[tuple[Mapping[str, Any], dict[str, Any]]], dict[str, Any]]:
+    top_candidates = scan.get("top_candidates")
+    candidates = scan.get("candidates")
+    diagnostics: dict[str, Any] = {
+        "top_candidates_type": _type_name(top_candidates),
+        "candidates_type": _type_name(candidates),
+        "selected_source": None,
+        "strategy_bucket_counts": {},
+        "strategy_bucket_candidate_count": 0,
+        "strategy_bucket_unique_candidate_count": 0,
+        "source_candidate_container_count": 0,
+        "normalized_candidate_count": 0,
+        "duplicate_source_row_count": 0,
+        "excluded_source_row_count": 0,
+        "exclusion_reason_counts": {},
+        "duplicate_source_rows": [],
+        "source_candidate_exclusions": [],
+    }
+
+    raw_rows: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    exclusions: list[dict[str, Any]] = []
+    selected_source: str | None = None
+    if isinstance(top_candidates, Sequence) and not isinstance(
+        top_candidates, (str, bytes, bytearray)
+    ):
+        selected_source = "top_candidates_list"
+        raw_rows, exclusions = _scan_rows_from_sequence(
+            top_candidates,
+            source_key="top_candidates",
+            source_shape="list_top_candidates",
+        )
+        diagnostics["source_candidate_container_count"] = len(top_candidates)
+    elif isinstance(top_candidates, Mapping):
+        selected_source = "top_candidates_strategy_buckets"
+        for bucket, bucket_rows in top_candidates.items():
+            bucket_name = str(bucket)
+            if isinstance(bucket_rows, Sequence) and not isinstance(
+                bucket_rows, (str, bytes, bytearray)
+            ):
+                diagnostics["strategy_bucket_counts"][bucket_name] = sum(
+                    1 for row in bucket_rows if isinstance(row, Mapping)
+                )
+                diagnostics["strategy_bucket_candidate_count"] += len(bucket_rows)
+            bucket_candidates, bucket_exclusions = _scan_rows_from_sequence(
+                bucket_rows,
+                source_key=f"top_candidates.{bucket_name}",
+                source_shape="strategy_keyed_top_candidates",
+                strategy_bucket=bucket_name,
+            )
+            raw_rows.extend(bucket_candidates)
+            exclusions.extend(bucket_exclusions)
+    elif isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes, bytearray)):
+        selected_source = "candidates_list"
+        raw_rows, exclusions = _scan_rows_from_sequence(
+            candidates,
+            source_key="candidates",
+            source_shape="list_candidates",
+        )
+        diagnostics["source_candidate_container_count"] = len(candidates)
+    elif top_candidates is not None:
+        exclusions.append(
+            _source_exclusion(
+                source_key="top_candidates",
+                reason="candidate_container_not_list_or_strategy_mapping",
+                source_shape="unsupported_top_candidates",
+                value=top_candidates,
+            )
+        )
+    elif candidates is not None:
+        exclusions.append(
+            _source_exclusion(
+                source_key="candidates",
+                reason="candidate_container_not_list",
+                source_shape="unsupported_candidates",
+                value=candidates,
+            )
+        )
+
+    deduplicated_rows, duplicate_rows = _deduplicate_source_rows(raw_rows)
+    diagnostics["selected_source"] = selected_source
+    diagnostics["strategy_bucket_counts"] = dict(
+        sorted(diagnostics["strategy_bucket_counts"].items())
+    )
+    diagnostics["strategy_bucket_unique_candidate_count"] = len(
+        {str(provenance["deduplication_key"]) for _, provenance in raw_rows}
+    )
+    diagnostics["normalized_candidate_count"] = len(deduplicated_rows)
+    diagnostics["duplicate_source_row_count"] = len(duplicate_rows)
+    diagnostics["excluded_source_row_count"] = len(exclusions)
+    diagnostics["duplicate_source_rows"] = duplicate_rows
+    diagnostics["source_candidate_exclusions"] = exclusions
+    diagnostics["exclusion_reason_counts"] = _count_reasons(exclusions)
+    diagnostics["source_state_classification"] = _source_state_classification(diagnostics)
+    return deduplicated_rows, diagnostics
+
+
 def _book_token_ids_match(candidate: Mapping[str, Any], clob_token_ids: Sequence[str]) -> bool:
     if len(clob_token_ids) != 2:
         return False
@@ -665,11 +903,7 @@ def score_candidate(
 
 
 def _scan_candidates(scan: Mapping[str, Any]) -> Sequence[Any]:
-    for key in ("top_candidates", "candidates"):
-        value = scan.get(key)
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            return value
-    return []
+    return [row for row, _ in _scan_candidates_with_diagnostics(scan)[0]]
 
 
 def _scan_timestamp(metadata: Mapping[str, Any]) -> Any:
@@ -695,9 +929,8 @@ def build_reward_manifest(
     source_artifacts = metadata.get("sources", metadata.get("data_sources", {}))
     generated_at = _parse_dt(source_scan_timestamp_utc) or datetime.now(UTC)
     scored: list[dict[str, Any]] = []
-    for candidate in _scan_candidates(scan):
-        if not isinstance(candidate, Mapping):
-            continue
+    source_rows, source_candidate_diagnostics = _scan_candidates_with_diagnostics(scan)
+    for candidate, source_candidate_provenance in source_rows:
         score = score_candidate(candidate, generated_at=generated_at, rules=rules)
         clob_token_ids = _clob_token_ids(candidate)
         provenance = _book_provenance(
@@ -715,6 +948,8 @@ def build_reward_manifest(
                 "condition_id": _first_present(candidate, "condition_id", "conditionId"),
                 "slug": candidate.get("slug"),
                 "question": candidate.get("question"),
+                "source_candidate_provenance": source_candidate_provenance,
+                "source_strategy_buckets": source_candidate_provenance.get("strategy_buckets", []),
                 "clob_token_ids": clob_token_ids,
                 "source_clob_token_ids": _candidate_token_ids(candidate),
                 "yes_token_id": clob_token_ids[0] if len(clob_token_ids) == 2 else None,
@@ -730,6 +965,14 @@ def build_reward_manifest(
                 **score,
             }
         )
+        scored[-1]["candidate_diagnostic"] = {
+            "included_in_manifest_diagnostics": True,
+            "excluded_from_backtest_queue": not scored[-1]["eligible_for_backtest_queue"],
+            "exclusion_reasons": list(scored[-1]["blockers"]),
+            "source_strategy_buckets": list(scored[-1]["source_strategy_buckets"]),
+            "source_key": source_candidate_provenance.get("source_key"),
+            "source_shape": source_candidate_provenance.get("source_shape"),
+        }
     scored.sort(key=lambda row: row["reward_proxy_score"], reverse=True)
     for rank, row in enumerate(scored, start=1):
         row["rank"] = rank
@@ -760,7 +1003,23 @@ def build_reward_manifest(
             "eligible_for_backtest_queue_count": eligible_count,
             "blocked_count": blocked_count,
             "explicit_reward_evidence_count": explicit_reward_count,
+            "source_normalized_candidate_count": source_candidate_diagnostics[
+                "normalized_candidate_count"
+            ],
+            "source_candidate_exclusion_count": source_candidate_diagnostics[
+                "excluded_source_row_count"
+            ],
+            "source_duplicate_candidate_count": source_candidate_diagnostics[
+                "duplicate_source_row_count"
+            ],
+            "source_strategy_bucket_candidate_count": source_candidate_diagnostics[
+                "strategy_bucket_candidate_count"
+            ],
+            "source_strategy_bucket_unique_candidate_count": source_candidate_diagnostics[
+                "strategy_bucket_unique_candidate_count"
+            ],
         },
+        "source_candidate_diagnostics": source_candidate_diagnostics,
         "safety": {
             "live_trading": False,
             "submit_orders": False,
@@ -815,6 +1074,18 @@ def write_manifest(
     manifest_text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     manifest_path.write_text(manifest_text, encoding="utf-8")
     rules = manifest.get("scoring_rules", {})
+    safety = manifest.get("safety", {})
+    safety_fields = (
+        "orders_submitted",
+        "orders_signed",
+        "orders_cancelled",
+        "credentials_required",
+        "live_trading_worker_started",
+        "worker_trading_started",
+    )
+    safety_text = "\n".join(
+        f"- {field}={str(safety.get(field)).lower()}" for field in safety_fields
+    )
     rules_text = (
         "# Reward Market Scanner Scoring Rules\n\n"
         "Mode: SHADOW/BACKTEST ONLY. No live trading, signing, order placement, or secret access.\n\n"
@@ -827,6 +1098,8 @@ def write_manifest(
         "- `wide_spread_adverse_selection_risk`: spread is too wide for reward proxy assumptions.\n"
         "- `thin_top_of_book_fill_risk`: visible top-of-book depth is below proxy threshold.\n"
         "- `one_sided_depth_queue_risk`: queue/depth imbalance may create unfavorable fills.\n"
+        "\n## Safety Booleans\n"
+        f"{safety_text}\n"
     )
     rules_path.write_text(rules_text, encoding="utf-8")
     if (

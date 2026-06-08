@@ -197,6 +197,87 @@ def test_build_reward_manifest_accepts_candidates_key_and_declares_no_live_tradi
     assert manifest["worker_trading_started"] is False
     assert [candidate["market_id"] for candidate in manifest["candidates"]] == ["tight", "wide"]
     assert "spread_too_wide_for_reward_proxy" in manifest["candidates"][1]["blockers"]
+    assert manifest["source_candidate_diagnostics"]["selected_source"] == "candidates_list"
+    assert (
+        manifest["source_candidate_diagnostics"]["source_state_classification"]
+        == "list_shaped_candidates_normalized"
+    )
+
+
+def test_build_reward_manifest_flattens_strategy_keyed_top_candidates_with_provenance() -> None:
+    shared = _candidate(market_id="shared", slug="shared-market")
+    low_fill_only = _candidate(
+        market_id="low-fill-only",
+        slug="low-fill-only",
+        yes_book={"token_id": "yes", "mid": 0.0015},
+        no_book={"token_id": "no"},
+    )
+    scan = {
+        "metadata": {"utc_timestamp": "2026-06-08T19:01:17Z"},
+        "top_candidates": {
+            "Microprice": [shared],
+            "LowFillRewardMaker": [shared, low_fill_only, "not-a-row"],
+        },
+    }
+
+    manifest = build_reward_manifest(scan, limit=5, source_artifact_path="/tmp/scan.json")
+
+    diagnostics = manifest["source_candidate_diagnostics"]
+    assert diagnostics["selected_source"] == "top_candidates_strategy_buckets"
+    assert diagnostics["source_state_classification"] == "strategy_keyed_top_candidates_normalized"
+    assert diagnostics["strategy_bucket_counts"] == {
+        "LowFillRewardMaker": 2,
+        "Microprice": 1,
+    }
+    assert diagnostics["strategy_bucket_candidate_count"] == 4
+    assert diagnostics["strategy_bucket_unique_candidate_count"] == 2
+    assert diagnostics["normalized_candidate_count"] == 2
+    assert diagnostics["duplicate_source_row_count"] == 1
+    assert diagnostics["excluded_source_row_count"] == 1
+    assert diagnostics["exclusion_reason_counts"] == {"non_object_candidate_row": 1}
+
+    by_market = {row["market_id"]: row for row in manifest["candidates"]}
+    assert by_market["shared"]["source_strategy_buckets"] == [
+        "Microprice",
+        "LowFillRewardMaker",
+    ]
+    assert by_market["shared"]["source_candidate_provenance"]["duplicate_source_keys"] == [
+        "top_candidates.LowFillRewardMaker[0]"
+    ]
+    assert by_market["low-fill-only"]["source_strategy_buckets"] == ["LowFillRewardMaker"]
+    assert (
+        by_market["low-fill-only"]["candidate_diagnostic"]["excluded_from_backtest_queue"] is True
+    )
+    assert (
+        "missing_complete_yes_no_clob_books"
+        in by_market["low-fill-only"]["candidate_diagnostic"]["exclusion_reasons"]
+    )
+    assert by_market["low-fill-only"]["book_provenance"]["status"] == "incomplete_fail_closed"
+
+
+def test_strategy_keyed_top_candidates_fail_closed_for_non_list_bucket() -> None:
+    manifest = build_reward_manifest(
+        {
+            "metadata": {"utc_timestamp": "2026-06-08T19:01:17Z"},
+            "top_candidates": {"LowFillRewardMaker": {"slug": "not-a-list"}},
+        },
+        limit=5,
+    )
+
+    diagnostics = manifest["source_candidate_diagnostics"]
+    assert manifest["candidates"] == []
+    assert manifest["summary"]["candidate_count"] == 0
+    assert diagnostics["selected_source"] == "top_candidates_strategy_buckets"
+    assert diagnostics["source_state_classification"] == "source_schema_or_provenance_failed_closed"
+    assert diagnostics["excluded_source_row_count"] == 1
+    assert diagnostics["exclusion_reason_counts"] == {"candidate_container_not_list": 1}
+    assert diagnostics["source_candidate_exclusions"][0] == {
+        "source_key": "top_candidates.LowFillRewardMaker",
+        "reason": "candidate_container_not_list",
+        "source_shape": "strategy_keyed_top_candidates",
+        "strategy_bucket": "LowFillRewardMaker",
+        "value_type": "dict",
+    }
 
 
 def test_invalid_clob_token_ids_block_backtest_queue() -> None:
