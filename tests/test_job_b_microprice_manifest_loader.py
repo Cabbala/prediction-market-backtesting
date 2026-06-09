@@ -1004,6 +1004,181 @@ def test_diagnose_attempt_attributes_filled_negative_pnl_fail_closed():
     assert summary["cause_counts"]["adverse_selection_markout"] == 1
     assert summary["cause_counts"]["spread_tick_cost_too_large"] == 1
     assert summary["cause_counts"]["queue_fill_timing"] == 1
+    guardrail = aggregate["negative_pnl_guardrail_summary"]
+    bucket_key = "non_extreme_tail|depth=1|edge=0.0005|entry=0.55|hold=10.0"
+    assert aggregate["profit_opportunity_demonstrated"] is False
+    assert guardrail["eligible"] is True
+    assert guardrail["classification"] == "negative_pnl_guardrail_active"
+    assert guardrail["guardrail_triggered"] is True
+    assert guardrail["positive_edge_claimable"] is False
+    assert guardrail["no_profit_claim"] is True
+    assert guardrail["per_tail_bucket"]["non_extreme_tail"]["attempt_count"] == 1
+    assert (
+        guardrail["per_tail_bucket"]["non_extreme_tail"][
+            "adverse_selection_or_markout_detected_attempts"
+        ]
+        == 1
+    )
+    assert guardrail["per_parameter_bucket"][bucket_key]["fail_closed"] is True
+    assert guardrail["per_parameter_bucket"][bucket_key]["total_fills"] == 2
+    assert (
+        round(guardrail["per_parameter_bucket"][bucket_key]["worst_round_trip_price_edge"], 6)
+        == -0.05
+    )
+    assert guardrail["per_tick_cost_bucket"]["too_large"]["attempt_count"] == 1
+    assert guardrail["adverse_selection_markout_bucket"]["detected"]["attempt_count"] == 1
+
+
+def test_aggregate_profit_gate_requires_positive_aggregate_pnl_with_activity():
+    params = {
+        "depth_levels": 1,
+        "entry_imbalance": 0.55,
+        "exit_imbalance": 0.50,
+        "min_microprice_edge": 0.0005,
+        "quote_lifetime_seconds": 10.0,
+    }
+    aggregate = job_b_microprice_batch._aggregate_diagnostics(
+        [
+            job_b_microprice_batch.BacktestAttempt(
+                slug="small-win",
+                question="small win",
+                token_index=0,
+                source_strategy="Microprice",
+                params=params,
+                status="completed",
+                result={"fills": 1, "pnl": 0.25, "portfolio_stats": {"total_orders": 1}},
+                error=None,
+                diagnostics={
+                    "fills": 1,
+                    "pnl": 0.25,
+                    "strategy_order_count": 1,
+                    "tail_bucket": "non_extreme_tail",
+                    "suspected_causes": [],
+                },
+            ),
+            job_b_microprice_batch.BacktestAttempt(
+                slug="larger-loss",
+                question="larger loss",
+                token_index=0,
+                source_strategy="Microprice",
+                params=params,
+                status="completed",
+                result={"fills": 1, "pnl": -0.50, "portfolio_stats": {"total_orders": 1}},
+                error=None,
+                diagnostics={
+                    "fills": 1,
+                    "pnl": -0.50,
+                    "strategy_order_count": 1,
+                    "tail_bucket": "non_extreme_tail",
+                    "suspected_causes": [],
+                },
+            ),
+        ]
+    )
+
+    assert aggregate["fills_orders_pnl"]["completed_pnl_sum"] == -0.25
+    assert aggregate["fills_orders_pnl"]["completed_positive_pnl_attempts"] == 1
+    assert aggregate["profit_opportunity_demonstrated"] is False
+    assert aggregate["negative_pnl_guardrail_summary"]["classification"] == (
+        "negative_pnl_guardrail_active"
+    )
+
+
+def test_write_batch_outputs_emit_negative_pnl_guardrail_summary(tmp_path):
+    safety = {
+        "live_trading": False,
+        "orders_submitted": False,
+        "orders_signed": False,
+        "orders_cancelled": False,
+        "credentials_required": False,
+        "worker_trading_started": False,
+        "live_trading_worker_started": False,
+    }
+    summary = {
+        "generated_at_utc": "2026-06-09T00:00:00Z",
+        "mode": job_b_microprice_batch.SAFETY_MODE,
+        "classification": "diagnostic_only",
+        "live_ready": False,
+        "no_profit_claim": True,
+        "pass_manifest_status": "pass",
+        "manifest": "fixture_manifest.json",
+        "window": {"start_time": "2026-06-09T01:00:00Z", "end_time": "2026-06-09T02:00:00Z"},
+        "requested_window": {
+            "start_time": "2026-06-09T01:00:00Z",
+            "end_time": "2026-06-09T02:00:00Z",
+        },
+        "selected_window": {
+            "start_time": "2026-06-09T01:00:00Z",
+            "end_time": "2026-06-09T02:00:00Z",
+        },
+        "min_book_events": 50,
+        "requested_min_book_events": 50,
+        "selected_min_book_events": 50,
+        "exact_window_status": "verified",
+        "warnings": [],
+        "blockers": [],
+        "attempt_isolation": "subprocess",
+        "safety": safety,
+        "candidate_count": 1,
+        "candidate_selection": {"window_policy": "candidate"},
+        "parameter_set_count": 1,
+        "attempt_count": 1,
+        "completed_count": 1,
+        "skipped_no_coverage_count": 0,
+        "error_count": 0,
+        "completed": 1,
+        "skipped": 0,
+        "skipped_no_coverage": 0,
+        "errors": 0,
+        "fills_orders_pnl": {
+            "total_fills": 2,
+            "total_strategy_orders": 2,
+            "completed_pnl_sum": -0.25,
+            "completed_positive_pnl_attempts": 0,
+            "completed_negative_pnl_attempts": 1,
+            "completed_zero_pnl_attempts": 0,
+        },
+        "negative_pnl_attribution_summary": {
+            "eligible": True,
+            "classification": "non_positive_pnl_after_orders_or_fills",
+        },
+        "negative_pnl_guardrail_summary": {
+            "eligible": True,
+            "classification": "negative_pnl_guardrail_active",
+            "per_tail_bucket": {"non_extreme_tail": {"attempt_count": 1}},
+        },
+        "tail_bucket_counts": {"non_extreme_tail": 1},
+        "tick_cost_buckets": {"too_large": 1},
+        "diagnostics": {
+            "negative_pnl_guardrail_summary": {
+                "eligible": True,
+                "classification": "negative_pnl_guardrail_active",
+            },
+            "no_order_cause_counts": {},
+            "no_order_primary_cause_counts": {},
+        },
+        "attempts": [],
+    }
+
+    outputs = job_b_microprice_batch._write_outputs(
+        summary,
+        tmp_path,
+        "20260609T000000Z",
+    )
+
+    emitted_json = json.loads(
+        (tmp_path / "job_B_microprice_batch_20260609T000000Z.json").read_text(encoding="utf-8")
+    )
+    emitted_markdown = (tmp_path / "job_B_microprice_batch_20260609T000000Z.md").read_text(
+        encoding="utf-8"
+    )
+    assert emitted_json["output_files"] == outputs
+    assert emitted_json["negative_pnl_guardrail_summary"]["classification"] == (
+        "negative_pnl_guardrail_active"
+    )
+    assert "negative_pnl_guardrail_summary" in emitted_markdown
+    assert "orders_submitted=false" in emitted_markdown
+    assert "orders_cancelled=false" in emitted_markdown
 
 
 def test_run_batch_fail_closes_on_exact_window_mismatch(monkeypatch, tmp_path):
@@ -1275,8 +1450,53 @@ def test_validate_artifact_derives_negative_pnl_attribution_from_legacy_artifact
     assert report["classification"] == "diagnostic_only"
     assert report["exact_window_status"] == "verified"
     assert report["live_ready"] is False
+    for safety_field in (
+        "orders_submitted",
+        "orders_signed",
+        "orders_cancelled",
+        "credentials_required",
+        "live_trading_worker_started",
+        "worker_trading_started",
+    ):
+        assert report["safety"][safety_field] is False
     assert summary["eligible"] is True
     assert summary["classification"] == "non_positive_pnl_after_orders_or_fills"
     assert summary["cause_counts"]["adverse_selection_markout"] == 1
     assert summary["cause_counts"]["spread_tick_cost_too_large"] == 1
     assert summary["cause_counts"]["queue_fill_timing"] == 1
+    guardrail = report["negative_pnl_guardrail_summary"]
+    bucket_key = "non_extreme_tail|depth=1|edge=0.0005|entry=0.55|hold=10.0"
+    assert guardrail["eligible"] is True
+    assert guardrail["classification"] == "negative_pnl_guardrail_active"
+    assert guardrail["guardrail_action"] == "downrank_or_fail_closed_tail_and_parameter_buckets"
+    assert guardrail["positive_edge_claimable"] is False
+    assert guardrail["per_tail_bucket"]["non_extreme_tail"]["total_pnl"] == -0.28315
+    assert guardrail["per_parameter_bucket"][bucket_key]["fail_closed"] is True
+    assert guardrail["per_parameter_bucket"][bucket_key]["downrank_reason_codes"] == [
+        "adverse_selection_markout",
+        "parameter_candidate_bucket",
+        "queue_fill_timing",
+        "spread_tick_cost_too_large",
+    ]
+    assert guardrail["per_tick_cost_bucket"]["too_large"]["attempt_count"] == 1
+    assert guardrail["adverse_selection_markout_bucket"]["detected"]["attempt_count"] == 1
+
+    outputs = job_b_microprice_batch._write_validation_outputs(
+        report,
+        tmp_path / "reports",
+        "20260609T000000Z",
+    )
+    json_path = (
+        tmp_path / "reports" / "job_B_microprice_exact_window_validation_20260609T000000Z.json"
+    )
+    md_path = tmp_path / "reports" / "job_B_microprice_exact_window_validation_20260609T000000Z.md"
+    assert outputs["json"] == str(json_path)
+    assert outputs["markdown"] == str(md_path)
+    emitted_json = json.loads(json_path.read_text(encoding="utf-8"))
+    emitted_markdown = md_path.read_text(encoding="utf-8")
+    assert emitted_json["negative_pnl_guardrail_summary"]["classification"] == (
+        "negative_pnl_guardrail_active"
+    )
+    assert "negative_pnl_guardrail_summary" in emitted_markdown
+    assert "orders_submitted=false" in emitted_markdown
+    assert "orders_cancelled=false" in emitted_markdown
