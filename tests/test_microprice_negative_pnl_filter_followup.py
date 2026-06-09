@@ -177,6 +177,24 @@ def test_build_filter_followup_report_fail_closes_when_attribution_missing(tmp_p
     )
 
 
+def test_build_filter_followup_report_unknown_shape_fail_closes(tmp_path):
+    artifact = _write_artifact(tmp_path, [{"unexpected": "list-artifact"}])
+
+    report = followup.build_filter_followup_report(artifact_path=artifact)
+
+    assert report["classification"] == "diagnostic_only"
+    assert report["live_ready"] is False
+    assert report["artifact_shape_status"] == "unknown_fail_closed"
+    assert "unknown_artifact_json_shape" in report["not_live_ready_reason_codes"]
+    assert report["filter_diagnostics"]["fail_closed"] is True
+    assert report["filter_diagnostics"]["eligible_negative_pnl_attempt_count"] == 0
+    assert report["filter_diagnostics"]["recommendations"][0]["name"] == (
+        "negative_pnl_attribution_missing_fail_closed"
+    )
+    assert all(report["safety"][field] is False for field in followup.REQUIRED_SAFETY_FIELDS)
+    assert all(report[field] is False for field in followup.REQUIRED_SAFETY_FIELDS)
+
+
 def test_cli_writes_json_and_markdown_reports(tmp_path, capsys):
     params = {
         "depth_levels": 1,

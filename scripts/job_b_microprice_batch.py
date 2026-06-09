@@ -2083,12 +2083,10 @@ def build_exact_window_validation_report(
     command: list[str],
     manifest_selection: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest_payload, dict):
-        raise TypeError("manifest must be a JSON object")
-    if not isinstance(artifact_payload, dict):
-        raise TypeError("artifact must be a JSON object")
+    raw_manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    manifest_payload = _safe_mapping_from(raw_manifest_payload)
+    artifact_payload = _safe_mapping_from(raw_artifact_payload)
 
     expected_records = _expected_window_records_from_payload(manifest_payload)
     actual_records = _artifact_window_records(artifact_payload)
@@ -2103,9 +2101,28 @@ def build_exact_window_validation_report(
         or _window_key_from_record(record)[1] is None
         or _window_key_from_record(record)[2] is None
     ]
-    candidate_count = _declared_candidate_count(manifest_path)
+    candidate_count = _declared_candidate_count(manifest_path) if manifest_payload else 0
     warnings: list[str] = []
     blockers: list[dict[str, Any]] = []
+
+    if not isinstance(raw_manifest_payload, Mapping):
+        warnings.append("coverage_pass_manifest_unknown_shape")
+        blockers.append(
+            {
+                "type": "coverage_pass_manifest_unknown_shape",
+                "message": "Selected coverage-pass manifest is not a JSON object.",
+                "json_type": type(raw_manifest_payload).__name__,
+            }
+        )
+    if not isinstance(raw_artifact_payload, Mapping):
+        warnings.append("job_b_artifact_unknown_shape")
+        blockers.append(
+            {
+                "type": "job_b_artifact_unknown_shape",
+                "message": "Job B artifact is not a JSON object; diagnostics fail closed.",
+                "json_type": type(raw_artifact_payload).__name__,
+            }
+        )
 
     if candidate_count <= 0:
         warnings.append("coverage_pass_manifest_no_pass")
@@ -2868,6 +2885,15 @@ def main() -> int:
         )
         args.manifest_selection = selection_records
         if selected_manifest is None:
+            safety = {
+                "live_trading": False,
+                "orders_submitted": False,
+                "orders_signed": False,
+                "orders_cancelled": False,
+                "credentials_required": False,
+                "worker_trading_started": False,
+                "live_trading_worker_started": False,
+            }
             print(
                 json.dumps(
                     {
@@ -2876,15 +2902,8 @@ def main() -> int:
                         "manifest_glob": args.manifest_glob,
                         "manifest_selection": selection_records,
                         "pass_manifest_status": "no_pass",
-                        "safety": {
-                            "live_trading": False,
-                            "orders_submitted": False,
-                            "orders_signed": False,
-                            "orders_cancelled": False,
-                            "credentials_required": False,
-                            "worker_trading_started": False,
-                            "live_trading_worker_started": False,
-                        },
+                        "safety": safety,
+                        **safety,
                     },
                     indent=2,
                     sort_keys=True,

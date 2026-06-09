@@ -1324,6 +1324,63 @@ def test_validate_artifact_fail_closes_against_selected_manifest_window(tmp_path
     assert report["blockers"][0]["type"] == "exact_window_metadata_blocker"
 
 
+def test_validate_artifact_unknown_json_shape_fail_closes(tmp_path):
+    manifest = tmp_path / "coverage_window.json"
+    artifact = tmp_path / "job_b_artifact.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "candidate_count": 1,
+                "window": {
+                    "start_time": "2026-05-25T08:00:00Z",
+                    "end_time": "2026-05-25T09:00:00Z",
+                },
+                "min_book_events": 50,
+                "candidates": [
+                    {
+                        "slug": "filled-loss",
+                        "source_strategy": "Microprice",
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 179,
+                            "min_book_events": 50,
+                            "window": {
+                                "start_time": "2026-05-25T08:00:00Z",
+                                "end_time": "2026-05-25T09:00:00Z",
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact.write_text(json.dumps([{"unexpected": "list-artifact"}]), encoding="utf-8")
+
+    report = job_b_microprice_batch.build_exact_window_validation_report(
+        manifest_path=manifest,
+        artifact_path=artifact,
+        command=["python", "scripts/job_b_microprice_batch.py", "--validate-artifact"],
+    )
+
+    assert report["classification"] == "blocked"
+    assert report["exact_window_status"] == "fail_closed"
+    assert "job_b_artifact_unknown_shape" in report["warnings"]
+    assert report["negative_pnl_attribution_summary"]["fail_closed"] is True
+    assert report["negative_pnl_guardrail_summary"]["fail_closed"] is True
+    for safety_field in (
+        "orders_submitted",
+        "orders_signed",
+        "orders_cancelled",
+        "credentials_required",
+        "live_trading_worker_started",
+        "worker_trading_started",
+    ):
+        assert report["safety"][safety_field] is False
+        assert report[safety_field] is False
+
+
 def test_validate_artifact_derives_negative_pnl_attribution_from_legacy_artifact(tmp_path):
     manifest = tmp_path / "coverage_window.json"
     artifact = tmp_path / "job_b_artifact.json"

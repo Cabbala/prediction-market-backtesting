@@ -329,14 +329,26 @@ def build_filter_followup_report(
     command: list[str] | None = None,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
-    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    if not isinstance(artifact, dict):
-        raise TypeError("Job B artifact must be a JSON object")
+    raw_artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact = _as_mapping(raw_artifact)
+    artifact_shape_status = "recognized"
+    artifact_shape_warnings: list[dict[str, Any]] = []
+    if not isinstance(raw_artifact, Mapping):
+        artifact_shape_status = "unknown_fail_closed"
+        artifact_shape_warnings.append(
+            {
+                "type": "unknown_artifact_json_shape",
+                "message": "Job B artifact is not a JSON object; diagnostics fail closed.",
+                "json_type": type(raw_artifact).__name__,
+            }
+        )
 
     attributions = _eligible_negative_attributions(artifact)
     metrics = _artifact_metrics(artifact)
     cause_counts = _cause_counts(attributions)
     reason_codes = _not_live_ready_reason_codes(metrics=metrics, attributions=attributions)
+    if artifact_shape_warnings:
+        reason_codes = sorted(dict.fromkeys([*reason_codes, "unknown_artifact_json_shape"]))
     report = {
         "schema_version": 1,
         "generated_at_utc": (generated_at or _utc_now()).isoformat().replace("+00:00", "Z"),
@@ -350,6 +362,8 @@ def build_filter_followup_report(
         "no_profit_claim": True,
         "profit_opportunity_demonstrated": False,
         "artifact": str(artifact_path),
+        "artifact_shape_status": artifact_shape_status,
+        "artifact_shape_warnings": artifact_shape_warnings,
         "source_metrics": metrics,
         "not_live_ready_reason_codes": reason_codes,
         "negative_pnl_attribution_summary": _as_mapping(
