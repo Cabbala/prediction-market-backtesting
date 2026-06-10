@@ -425,6 +425,8 @@ def test_manifest_observation_reads_book_provenance_and_keeps_ev_unknown(tmp_pat
     report = build_report(manifest, limit=1)
     row = report["observations"][0]
 
+    assert report["classification"] == "diagnostic_only"
+    assert report["summary"]["classification"] == "diagnostic_only"
     assert row["yes_mid"] == 0.02
     assert row["spread"] == 0.001
     assert row["evidence_sources"][0]["type"] == "book_provenance"
@@ -435,6 +437,11 @@ def test_manifest_observation_reads_book_provenance_and_keeps_ev_unknown(tmp_pat
     assert row["book_provenance_complete"] is True
     assert row["yes_book"]["best_bid"] == 0.0195
     assert row["no_book"]["best_ask"] == 0.9805
+
+    output_files = write_outputs(report, tmp_path / "out", "20260512T000000Z")
+    md = Path(output_files["markdown"]).read_text(encoding="utf-8")
+    assert "- classification: diagnostic_only" in md
+    assert "No reward, profit, or live-ready claim" in md
 
 
 def test_current_fresh_manifest_shape_preserves_source_tokens_but_fails_closed(

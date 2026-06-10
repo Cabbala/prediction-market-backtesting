@@ -1198,10 +1198,12 @@ def build_report(
     would_have_filled_known_count = sum(
         1 for row in observations if row["would_have_filled_status"].startswith("measured")
     )
+    classification = "diagnostic_only" if observations else "blocked"
     return {
         "schema_version": 1,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
+        "classification": classification,
         "safety": _safety_fields(),
         **_safety_fields(),
         "source_manifest": str(manifest),
@@ -1226,6 +1228,7 @@ def build_report(
                 for row in observations
                 if row["accidental_fill_risk"] == "high_relative_tick_cost"
             ),
+            "classification": classification,
         },
     }
 
@@ -1288,6 +1291,7 @@ def write_outputs(
         "# Low-fill Reward Maker Shadow Observation",
         "",
         f"- mode: {report['mode']}",
+        f"- classification: {report['classification']}",
         f"- source_manifest: {report['source_manifest']}",
         f"- candidates: {report['candidate_count']}",
         f"- summary: {json.dumps(report['summary'], sort_keys=True)}",
@@ -1299,6 +1303,8 @@ def write_outputs(
         f"- credentials_required={str(safety['credentials_required']).lower()}",
         f"- live_trading_worker_started={str(safety['live_trading_worker_started']).lower()}",
         f"- worker_trading_started={str(safety['worker_trading_started']).lower()}",
+        "",
+        "No reward, profit, or live-ready claim is made without multi-snapshot L2/shadow-quote fill and exit-risk evidence.",
         "",
         "| slug | time_in_band_snapshot | would_have_filled | accidental_fill_risk | exit_risk |",
         "|---|---:|---|---|---|",

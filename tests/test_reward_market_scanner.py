@@ -655,6 +655,19 @@ def test_current_scan_bid_ask_books_emit_complete_book_provenance() -> None:
 
     assert row["eligible_for_backtest_queue"] is True
     assert row["blockers"] == []
+    assert row["clob_token_ids"] == ["yes", "no"]
+    assert row["yes_token_id"] == "yes"
+    assert row["no_token_id"] == "no"
+    assert row["token_provenance"] == {
+        "status": "complete",
+        "canonical_complete": True,
+        "canonical_yes_token_id": "yes",
+        "canonical_no_token_id": "no",
+        "canonical_clob_token_ids": ["yes", "no"],
+        "source_clob_token_ids": ["yes", "no"],
+        "side_book_token_ids": {"yes": "yes", "no": "no"},
+        "fail_closed_reasons": [],
+    }
     assert row["book_provenance"]["complete"] is True
     assert row["book_provenance"]["source_artifact_path"] == "/tmp/current-scan.json"
     assert row["book_provenance"]["source_timestamp_utc"] == "2026-05-12T06:02:46Z"
@@ -662,6 +675,13 @@ def test_current_scan_bid_ask_books_emit_complete_book_provenance() -> None:
     assert row["book_provenance"]["sides"]["yes"]["best_bid"] == 0.003
     assert row["book_provenance"]["sides"]["yes"]["best_ask"] == 0.004
     assert row["book_provenance"]["sides"]["yes"]["depth_proxy"] == 5_000_000
+    assert row["book_provenance"]["sides"]["no"]["side"] == "no"
+    assert row["book_provenance"]["sides"]["no"]["best_bid"] == 0.996
+    assert row["book_provenance"]["sides"]["no"]["best_ask"] == 0.997
+    assert row["book_provenance"]["sides"]["no"]["depth_proxy"] == 5_000_000
+    assert row["no_book"]["token_id"] == "no"
+    assert row["no_book"]["best_bid"] == 0.996
+    assert row["no_book"]["best_ask"] == 0.997
 
 
 def test_flat_top_of_book_fields_are_supported_without_fabricating_books() -> None:
