@@ -68,7 +68,7 @@ def test_strategy_rankings_separate_extreme_tail_from_microprice_but_keep_reward
     reward = scan["top_candidates"][LOW_FILL_LIQUIDITY_REWARD_MAKER]
     assert reward[0]["slug"] == "extreme-tail-reward-book"
     assert reward[0]["strategy_rankings"][LOW_FILL_LIQUIDITY_REWARD_MAKER]["bucket"] == (
-        "tail_reward_observation"
+        "extreme_tail_reward_watchlist"
     )
     assert (
         reward[0]["strategy_rankings"][LOW_FILL_LIQUIDITY_REWARD_MAKER]["eligible_for_handoff"]
@@ -80,6 +80,13 @@ def test_strategy_rankings_separate_extreme_tail_from_microprice_but_keep_reward
     assert volatility[1]["strategy_rankings"][VOLATILITY_SPIKE_DEEP_LIMIT_MAKER]["bucket"] == (
         "separated_tail_watch"
     )
+    diagnostics = scan["ranking_diagnostics"]
+    assert diagnostics["low_fill_reward_tail"]["extreme_tail_watchlist_count"] == 1
+    assert diagnostics["overlap_diagnostics"]["low_fill_microprice_overlap_count"] == 2
+    assert diagnostics["top_candidate_bucket_counts"][LOW_FILL_LIQUIDITY_REWARD_MAKER] == {
+        "extreme_tail_reward_watchlist": 1,
+        "reward_observation": 1,
+    }
 
 
 def test_strategy_ranking_metadata_records_filters_and_shadow_safety_fields() -> None:
@@ -96,6 +103,34 @@ def test_strategy_ranking_metadata_records_filters_and_shadow_safety_fields() ->
     assert metadata["strategies"][MICROPRICE]["primary_bucket"] == "balanced_tight_order_book"
     assert "tail_policy" in metadata["strategies"][MICROPRICE]["filters"]
     assert metadata["strategies"][LOW_FILL_LIQUIDITY_REWARD_MAKER]["primary_bucket"] == (
-        "tail_reward_observation"
+        "extreme_tail_reward_watchlist"
     )
     assert all(value is False for value in metadata["safety_fields"].values())
+
+
+def test_strategy_rankings_fail_closed_for_missing_book_prices() -> None:
+    missing_book = {
+        "market_id": "missing-book",
+        "slug": "missing-book",
+        "question": "Will missing book happen?",
+        "yes_mid_gamma": 0.50,
+        "liquidity": 2_000_000.0,
+        "volume24hr": 500_000.0,
+        "reward_eligible_signal": True,
+    }
+
+    scan = build_strategy_ranked_scan([missing_book], limit=1)
+    row = scan["top_candidates"][LOW_FILL_LIQUIDITY_REWARD_MAKER][0]
+
+    for strategy in (
+        MICROPRICE,
+        VOLATILITY_SPIKE_DEEP_LIMIT_MAKER,
+        LOW_FILL_LIQUIDITY_REWARD_MAKER,
+    ):
+        ranking = row["strategy_rankings"][strategy]
+        assert ranking["bucket"] == "missing_book_fail_closed"
+        assert ranking["eligible_for_handoff"] is False
+        assert "missing_yes_book_prices" in ranking["downrank_reasons"]
+    assert (
+        scan["ranking_diagnostics"]["low_fill_reward_tail"]["missing_book_fail_closed_count"] == 1
+    )

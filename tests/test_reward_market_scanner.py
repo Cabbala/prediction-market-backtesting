@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from prediction_market_extensions.adapters.polymarket.public_scan_ranking import (
+    LOW_FILL_LIQUIDITY_REWARD_MAKER,
+    MICROPRICE,
+)
 from prediction_market_extensions.adapters.polymarket.reward_market_scanner import (
     CANONICAL_MANIFEST_PREFIX,
     LEGACY_MANIFEST_PREFIX,
@@ -175,6 +179,7 @@ def test_build_reward_manifest_accepts_candidates_key_and_declares_no_live_tradi
         "source_scan_timestamp_utc": "2026-05-04T06:01:34+00:00",
         "source_scan_mode": SHADOW_MODE,
         "source_artifacts": {},
+        "provenance_limitations": [],
     }
     assert manifest["safety"] == {
         "live_trading": False,
@@ -229,22 +234,50 @@ def test_build_reward_manifest_flattens_strategy_keyed_top_candidates_with_prove
         "LowFillRewardMaker": 2,
         "Microprice": 1,
     }
+    assert diagnostics["strategy_bucket_aliases"] == {
+        "LowFillRewardMaker": LOW_FILL_LIQUIDITY_REWARD_MAKER,
+        "Microprice": MICROPRICE,
+    }
+    assert diagnostics["canonical_strategy_bucket_counts"] == {
+        LOW_FILL_LIQUIDITY_REWARD_MAKER: 2,
+        MICROPRICE: 1,
+    }
     assert diagnostics["strategy_bucket_candidate_count"] == 4
     assert diagnostics["strategy_bucket_unique_candidate_count"] == 2
     assert diagnostics["normalized_candidate_count"] == 2
     assert diagnostics["duplicate_source_row_count"] == 1
     assert diagnostics["excluded_source_row_count"] == 1
     assert diagnostics["exclusion_reason_counts"] == {"non_object_candidate_row": 1}
+    assert diagnostics["strategy_overlap_diagnostics"]["low_fill_microprice_overlap_count"] == 1
+    assert diagnostics["low_fill_tail_diagnostics"]["low_fill_extreme_tail_watchlist_count"] == 1
+    assert diagnostics["low_fill_tail_diagnostics"]["low_fill_missing_book_source_count"] == 1
+    assert manifest["strategy_bucket_diagnostics"]["low_fill_microprice_overlap_count"] == 1
+    assert manifest["strategy_bucket_diagnostics"]["low_fill_extreme_tail_watchlist_count"] == 1
 
     by_market = {row["market_id"]: row for row in manifest["candidates"]}
     assert by_market["shared"]["source_strategy_buckets"] == [
         "Microprice",
         "LowFillRewardMaker",
     ]
+    assert by_market["shared"]["canonical_source_strategy_buckets"] == [
+        MICROPRICE,
+        LOW_FILL_LIQUIDITY_REWARD_MAKER,
+    ]
+    assert by_market["shared"]["source_strategy_overlap"] == {
+        "overlaps_low_fill_and_microprice": True,
+        "overlaps_low_fill_and_volatility": False,
+    }
+    assert (
+        by_market["shared"]["low_fill_reward_tail_bucket"] == "low_fill_non_tail_reward_observation"
+    )
     assert by_market["shared"]["source_candidate_provenance"]["duplicate_source_keys"] == [
         "top_candidates.LowFillRewardMaker[0]"
     ]
     assert by_market["low-fill-only"]["source_strategy_buckets"] == ["LowFillRewardMaker"]
+    assert (
+        by_market["low-fill-only"]["low_fill_reward_tail_bucket"]
+        == "low_fill_extreme_tail_watchlist"
+    )
     assert (
         by_market["low-fill-only"]["candidate_diagnostic"]["excluded_from_backtest_queue"] is True
     )
@@ -252,7 +285,49 @@ def test_build_reward_manifest_flattens_strategy_keyed_top_candidates_with_prove
         "missing_complete_yes_no_clob_books"
         in by_market["low-fill-only"]["candidate_diagnostic"]["exclusion_reasons"]
     )
+    assert (
+        "missing_no_best_ask"
+        in by_market["low-fill-only"]["candidate_diagnostic"]["fail_closed_reasons"]
+    )
     assert by_market["low-fill-only"]["book_provenance"]["status"] == "incomplete_fail_closed"
+
+
+def test_reward_manifest_downranks_missing_book_rows_but_keeps_diagnostics() -> None:
+    eligible = _candidate(market_id="eligible", slug="eligible-reward")
+    missing_book = _candidate(
+        market_id="missing-book",
+        slug="missing-book-tail",
+        liquidity=10_000_000,
+        volume=10_000_000,
+        yes_book={"token_id": "yes", "mid": 0.0015},
+        no_book={"token_id": "no"},
+    )
+
+    manifest = build_reward_manifest(
+        {
+            "metadata": {
+                "utc_timestamp": "2026-06-10T09:01:12Z",
+                "geoblock": {"ok": False, "error": "URLError:<urlopen error timed out>"},
+            },
+            "top_candidates": {"LowFillRewardMaker": [missing_book, eligible]},
+        },
+        limit=2,
+    )
+
+    assert [row["market_id"] for row in manifest["candidates"]] == ["eligible", "missing-book"]
+    assert manifest["source_provenance_limitations"] == ["geoblock_status_provenance_limited"]
+    blocked = manifest["candidates"][1]
+    assert blocked["eligible_for_backtest_queue"] is False
+    assert blocked["low_fill_reward_tail_bucket"] == "low_fill_extreme_tail_watchlist"
+    assert (
+        "missing_complete_yes_no_clob_books"
+        in blocked["candidate_diagnostic"]["fail_closed_reasons"]
+    )
+    assert "missing_no_best_bid" in blocked["candidate_diagnostic"]["fail_closed_reasons"]
+    assert blocked["candidate_diagnostic"]["provenance_limitations"] == [
+        "geoblock_status_provenance_limited"
+    ]
+    assert manifest["summary"]["low_fill_missing_book_fail_closed_count"] == 1
 
 
 def test_strategy_keyed_top_candidates_fail_closed_for_non_list_bucket() -> None:

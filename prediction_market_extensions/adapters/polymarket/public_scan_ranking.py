@@ -81,6 +81,13 @@ def _book(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
     return book if isinstance(book, Mapping) else {}
 
 
+def _has_yes_book_prices(candidate: Mapping[str, Any]) -> bool:
+    book = _book(candidate)
+    return _book_first(book, "best_bid", "bid", "best_bid_yes") not in (None, "") and _book_first(
+        book, "best_ask", "ask", "best_ask_yes"
+    ) not in (None, "")
+
+
 def _book_first(book: Mapping[str, Any], *keys: str) -> Any:
     for key in keys:
         value = book.get(key)
@@ -228,6 +235,7 @@ def public_scan_features(
         "volume_24h": volume_24h,
         "volume": volume,
         "top_book_depth": depth,
+        "has_yes_book_prices": _has_yes_book_prices(candidate),
         "reward_eligible": _reward_eligible(candidate),
         "tight_spread": spread is not None and spread <= rules.tight_spread,
         "usable_spread": spread is not None and spread <= rules.usable_spread,
@@ -287,6 +295,23 @@ def _microprice_ranking(features: Mapping[str, Any]) -> dict[str, Any]:
         + 0.10 * components["top_book_depth"]
     )
     downrank_reasons: list[str] = []
+    filters = {
+        "has_yes_book_prices": bool(features["has_yes_book_prices"]),
+        "balanced_price": bool(features["balanced_microprice"]),
+        "tight_spread": bool(features["tight_spread"]),
+        "high_liquidity_or_volume": bool(features["high_liquidity_or_volume"]),
+        "not_extreme_tail": not bool(features["extreme_tail"]),
+    }
+    if not features["has_yes_book_prices"]:
+        downrank_reasons.append("missing_yes_book_prices")
+        return _ranking_record(
+            score=score * 0.20,
+            bucket="missing_book_fail_closed",
+            bucket_priority=-1,
+            eligible_for_handoff=False,
+            filters_passed=filters,
+            downrank_reasons=downrank_reasons,
+        )
     if features["extreme_tail"]:
         downrank_reasons.append("extreme_tail_price")
         score *= 0.70
@@ -298,12 +323,6 @@ def _microprice_ranking(features: Mapping[str, Any]) -> dict[str, Any]:
     if not features["high_liquidity_or_volume"]:
         downrank_reasons.append("low_activity_or_liquidity")
 
-    filters = {
-        "balanced_price": bool(features["balanced_microprice"]),
-        "tight_spread": bool(features["tight_spread"]),
-        "high_liquidity_or_volume": bool(features["high_liquidity_or_volume"]),
-        "not_extreme_tail": not bool(features["extreme_tail"]),
-    }
     if (
         filters["balanced_price"]
         and filters["tight_spread"]
@@ -347,6 +366,23 @@ def _volatility_ranking(features: Mapping[str, Any]) -> dict[str, Any]:
         + 0.10 * components["top_book_depth"]
     )
     downrank_reasons: list[str] = []
+    filters = {
+        "has_yes_book_prices": bool(features["has_yes_book_prices"]),
+        "usable_spread": bool(features["usable_spread"]),
+        "active_liquidity_or_volume": bool(features["high_liquidity_or_volume"]),
+        "non_extreme_price": not bool(features["extreme_tail"]),
+        "volatility_price_band": bool(features["balanced_volatility"]),
+    }
+    if not features["has_yes_book_prices"]:
+        downrank_reasons.append("missing_yes_book_prices")
+        return _ranking_record(
+            score=score * 0.20,
+            bucket="missing_book_fail_closed",
+            bucket_priority=-1,
+            eligible_for_handoff=False,
+            filters_passed=filters,
+            downrank_reasons=downrank_reasons,
+        )
     if features["extreme_tail"]:
         downrank_reasons.append("extreme_tail_price")
         score *= 0.75
@@ -358,12 +394,6 @@ def _volatility_ranking(features: Mapping[str, Any]) -> dict[str, Any]:
     if not features["high_liquidity_or_volume"]:
         downrank_reasons.append("low_activity_or_liquidity")
 
-    filters = {
-        "usable_spread": bool(features["usable_spread"]),
-        "active_liquidity_or_volume": bool(features["high_liquidity_or_volume"]),
-        "non_extreme_price": not bool(features["extreme_tail"]),
-        "volatility_price_band": bool(features["balanced_volatility"]),
-    }
     if all(filters.values()):
         return _ranking_record(
             score=score,
@@ -404,17 +434,38 @@ def _reward_ranking(features: Mapping[str, Any]) -> dict[str, Any]:
         + 0.06 * components["top_book_depth"]
     )
     downrank_reasons: list[str] = []
+    filters = {
+        "has_yes_book_prices": bool(features["has_yes_book_prices"]),
+        "reward_signal_present": bool(features["reward_eligible"]),
+        "usable_spread": bool(features["usable_spread"]),
+        "extreme_tail_reward_watchlist": bool(features["extreme_tail"]),
+        "tail_reward_observation": bool(features["reward_tail"]),
+        "high_liquidity_or_volume": bool(features["high_liquidity_or_volume"]),
+    }
+    if not features["has_yes_book_prices"]:
+        downrank_reasons.append("missing_yes_book_prices")
+        return _ranking_record(
+            score=score * 0.20,
+            bucket="missing_book_fail_closed",
+            bucket_priority=-1,
+            eligible_for_handoff=False,
+            filters_passed=filters,
+            downrank_reasons=downrank_reasons,
+        )
     if not features["reward_eligible"]:
         downrank_reasons.append("missing_public_reward_signal")
         score *= 0.65
     if not features["usable_spread"]:
         downrank_reasons.append("spread_not_usable_for_reward_observation")
-    filters = {
-        "reward_signal_present": bool(features["reward_eligible"]),
-        "usable_spread": bool(features["usable_spread"]),
-        "tail_reward_observation": bool(features["reward_tail"]),
-        "high_liquidity_or_volume": bool(features["high_liquidity_or_volume"]),
-    }
+    if features["reward_eligible"] and features["extreme_tail"]:
+        return _ranking_record(
+            score=score,
+            bucket="extreme_tail_reward_watchlist",
+            bucket_priority=4,
+            eligible_for_handoff=True,
+            filters_passed=filters,
+            downrank_reasons=downrank_reasons,
+        )
     if features["reward_eligible"] and features["reward_tail"]:
         return _ranking_record(
             score=score,
@@ -484,6 +535,90 @@ def _strategy_sort_key(candidate: Mapping[str, Any], strategy: str) -> tuple[Any
     )
 
 
+def _candidate_key(candidate: Mapping[str, Any]) -> str:
+    for key in ("slug", "market_id", "id", "condition_id", "conditionId"):
+        value = candidate.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return str(candidate.get("question") or "")
+
+
+def _strategy_bucket_counts(
+    candidates: Sequence[Mapping[str, Any]], strategy: str
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        bucket = str(candidate["strategy_rankings"][strategy]["bucket"])
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _top_strategy_overlap_diagnostics(
+    top_candidates: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    top_keys = {
+        strategy: {_candidate_key(candidate) for candidate in top_candidates.get(strategy, [])}
+        for strategy in STRATEGY_KEYS
+    }
+    top_slugs = {
+        strategy: {
+            _candidate_key(candidate): str(candidate.get("slug") or _candidate_key(candidate))
+            for candidate in top_candidates.get(strategy, [])
+        }
+        for strategy in STRATEGY_KEYS
+    }
+    low_fill = top_keys[LOW_FILL_LIQUIDITY_REWARD_MAKER]
+    microprice_overlap = sorted(low_fill & top_keys[MICROPRICE])
+    volatility_overlap = sorted(low_fill & top_keys[VOLATILITY_SPIKE_DEEP_LIMIT_MAKER])
+    return {
+        "low_fill_microprice_overlap_count": len(microprice_overlap),
+        "low_fill_microprice_overlap_slugs": [
+            top_slugs[LOW_FILL_LIQUIDITY_REWARD_MAKER].get(key, key) for key in microprice_overlap
+        ],
+        "low_fill_volatility_overlap_count": len(volatility_overlap),
+        "low_fill_volatility_overlap_slugs": [
+            top_slugs[LOW_FILL_LIQUIDITY_REWARD_MAKER].get(key, key) for key in volatility_overlap
+        ],
+    }
+
+
+def _strategy_ranking_diagnostics(
+    scored: Sequence[Mapping[str, Any]],
+    top_candidates: Mapping[str, Sequence[Mapping[str, Any]]],
+    rules: PublicScanRankingRules,
+) -> dict[str, Any]:
+    low_fill_top = top_candidates.get(LOW_FILL_LIQUIDITY_REWARD_MAKER, [])
+    low_fill_bucket_counts = _strategy_bucket_counts(low_fill_top, LOW_FILL_LIQUIDITY_REWARD_MAKER)
+    return {
+        "schema_version": PUBLIC_SCAN_RANKING_SCHEMA_VERSION,
+        "shadow_backtest_only": True,
+        "safety_fields": dict(PUBLIC_SCAN_SAFETY_FIELDS),
+        "candidate_count": len(scored),
+        "top_candidate_counts": {
+            strategy: len(top_candidates.get(strategy, [])) for strategy in STRATEGY_KEYS
+        },
+        "all_candidate_bucket_counts": {
+            strategy: _strategy_bucket_counts(scored, strategy) for strategy in STRATEGY_KEYS
+        },
+        "top_candidate_bucket_counts": {
+            strategy: _strategy_bucket_counts(top_candidates.get(strategy, []), strategy)
+            for strategy in STRATEGY_KEYS
+        },
+        "low_fill_reward_tail": {
+            "extreme_tail_threshold": rules.extreme_tail_mid,
+            "reward_tail_threshold": rules.reward_tail_mid,
+            "extreme_tail_watchlist_count": low_fill_bucket_counts.get(
+                "extreme_tail_reward_watchlist", 0
+            ),
+            "tail_observation_count": low_fill_bucket_counts.get("tail_reward_observation", 0),
+            "missing_book_fail_closed_count": low_fill_bucket_counts.get(
+                "missing_book_fail_closed", 0
+            ),
+        },
+        "overlap_diagnostics": _top_strategy_overlap_diagnostics(top_candidates),
+    }
+
+
 def build_strategy_ranked_scan(
     candidates: Sequence[Mapping[str, Any]],
     *,
@@ -501,6 +636,7 @@ def build_strategy_ranked_scan(
 
     return {
         "objective_specific_ranking": strategy_ranking_metadata(rules),
+        "ranking_diagnostics": _strategy_ranking_diagnostics(scored, top_candidates, rules),
         "top_candidates": top_candidates,
         "all_scored_candidates": scored,
     }
@@ -543,12 +679,14 @@ def strategy_ranking_metadata(
             },
             LOW_FILL_LIQUIDITY_REWARD_MAKER: {
                 "objective": "Reward-signal markets, especially extreme tails, for low-fill liquidity reward observation only.",
-                "primary_bucket": "tail_reward_observation",
+                "primary_bucket": "extreme_tail_reward_watchlist",
                 "filters": {
                     "reward_signal_present": "Gamma/public reward fields present or scan reward flag true",
+                    "extreme_tail_reward_watchlist": f"min(yes_mid, 1 - yes_mid) <= {rules.extreme_tail_mid:.2f}",
                     "tail_reward_observation": f"min(yes_mid, 1 - yes_mid) <= {rules.reward_tail_mid:.2f}",
                     "usable_spread": f"yes spread <= {rules.usable_spread:.2f}",
-                    "tail_policy": "extreme tails are retained and prioritized for reward observation",
+                    "tail_policy": "extreme tails are reported as a separate reward watchlist, not as balanced Microprice/volatility candidates",
+                    "missing_book_policy": "missing yes best bid/ask rows fail closed for all strategy handoffs",
                 },
             },
         },

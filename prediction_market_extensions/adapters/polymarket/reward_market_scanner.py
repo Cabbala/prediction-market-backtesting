@@ -7,10 +7,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from prediction_market_extensions.adapters.polymarket.public_scan_ranking import (
+    LOW_FILL_LIQUIDITY_REWARD_MAKER,
+    MICROPRICE,
+    VOLATILITY_SPIKE_DEEP_LIMIT_MAKER,
+)
+
 SHADOW_MODE = "SHADOW_BACKTEST_ONLY_NO_LIVE_TRADING"
 MANIFEST_SCHEMA_VERSION = "polymarket.reward-market-manifest.v1"
 CANONICAL_MANIFEST_PREFIX = "reward_scanner_manifest"
 LEGACY_MANIFEST_PREFIX = "reward_market_manifest"
+LOW_FILL_EXTREME_TAIL_THRESHOLD = 0.02
+LOW_FILL_REWARD_TAIL_THRESHOLD = 0.08
 REWARD_EVIDENCE_KEYS = (
     "clobRewards",
     "rewards",
@@ -391,6 +399,137 @@ def _type_name(value: Any) -> str | None:
     return type(value).__name__ if value is not None else None
 
 
+def _normalized_strategy_label(value: Any) -> str:
+    return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+
+
+def _canonical_strategy_bucket(value: Any) -> str:
+    aliases = {
+        "microprice": MICROPRICE,
+        "volatilityspikedeeplimitmaker": VOLATILITY_SPIKE_DEEP_LIMIT_MAKER,
+        "volatilityspike": VOLATILITY_SPIKE_DEEP_LIMIT_MAKER,
+        "deeplimitmaker": VOLATILITY_SPIKE_DEEP_LIMIT_MAKER,
+        "lowfillrewardmaker": LOW_FILL_LIQUIDITY_REWARD_MAKER,
+        "lowfillliquidityrewardmaker": LOW_FILL_LIQUIDITY_REWARD_MAKER,
+        "lowfillprobabilityliquidityrewardmaker": LOW_FILL_LIQUIDITY_REWARD_MAKER,
+        "lowfillliquidityreward": LOW_FILL_LIQUIDITY_REWARD_MAKER,
+    }
+    return aliases.get(_normalized_strategy_label(value), str(value))
+
+
+def _canonical_strategy_buckets(values: Sequence[Any]) -> list[str]:
+    buckets: list[str] = []
+    for value in values:
+        canonical = _canonical_strategy_bucket(value)
+        if canonical and canonical not in buckets:
+            buckets.append(canonical)
+    return buckets
+
+
+def _tail_distance(candidate: Mapping[str, Any]) -> float | None:
+    mid = _mid(candidate, "yes")
+    if mid is None:
+        return None
+    return min(mid, 1.0 - mid)
+
+
+def _low_fill_reward_tail_bucket(
+    candidate: Mapping[str, Any],
+    canonical_strategy_buckets: Sequence[str],
+    *,
+    extreme_tail_threshold: float = LOW_FILL_EXTREME_TAIL_THRESHOLD,
+    reward_tail_threshold: float = LOW_FILL_REWARD_TAIL_THRESHOLD,
+) -> str:
+    if LOW_FILL_LIQUIDITY_REWARD_MAKER not in canonical_strategy_buckets:
+        return "not_low_fill_reward_source"
+    tail_distance = _tail_distance(candidate)
+    if tail_distance is None:
+        return "low_fill_missing_yes_mid_fail_closed"
+    if tail_distance <= extreme_tail_threshold:
+        return "low_fill_extreme_tail_watchlist"
+    if tail_distance <= reward_tail_threshold:
+        return "low_fill_tail_observation"
+    return "low_fill_non_tail_reward_observation"
+
+
+def _source_strategy_overlap(
+    canonical_strategy_buckets: Sequence[str],
+) -> dict[str, bool]:
+    bucket_set = set(canonical_strategy_buckets)
+    low_fill = LOW_FILL_LIQUIDITY_REWARD_MAKER in bucket_set
+    return {
+        "overlaps_low_fill_and_microprice": low_fill and MICROPRICE in bucket_set,
+        "overlaps_low_fill_and_volatility": low_fill
+        and VOLATILITY_SPIKE_DEEP_LIMIT_MAKER in bucket_set,
+    }
+
+
+def _strategy_overlap_diagnostics(
+    rows: Sequence[tuple[Mapping[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    by_strategy: dict[str, dict[str, str]] = {
+        MICROPRICE: {},
+        VOLATILITY_SPIKE_DEEP_LIMIT_MAKER: {},
+        LOW_FILL_LIQUIDITY_REWARD_MAKER: {},
+    }
+    for row, provenance in rows:
+        key = str(provenance["deduplication_key"])
+        slug = str(row.get("slug") or row.get("market_id") or row.get("id") or key)
+        for bucket in provenance.get("canonical_strategy_buckets", []):
+            if bucket in by_strategy:
+                by_strategy[bucket][key] = slug
+
+    low_fill_keys = set(by_strategy[LOW_FILL_LIQUIDITY_REWARD_MAKER])
+    microprice_overlap = sorted(low_fill_keys & set(by_strategy[MICROPRICE]))
+    volatility_overlap = sorted(low_fill_keys & set(by_strategy[VOLATILITY_SPIKE_DEEP_LIMIT_MAKER]))
+    return {
+        "low_fill_microprice_overlap_count": len(microprice_overlap),
+        "low_fill_microprice_overlap_slugs": [
+            by_strategy[LOW_FILL_LIQUIDITY_REWARD_MAKER][key] for key in microprice_overlap
+        ],
+        "low_fill_volatility_overlap_count": len(volatility_overlap),
+        "low_fill_volatility_overlap_slugs": [
+            by_strategy[LOW_FILL_LIQUIDITY_REWARD_MAKER][key] for key in volatility_overlap
+        ],
+    }
+
+
+def _count_canonical_strategy_buckets(
+    rows: Sequence[tuple[Mapping[str, Any], dict[str, Any]]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for _, provenance in rows:
+        for bucket in provenance.get("canonical_strategy_buckets", []):
+            counts[bucket] = counts.get(bucket, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _source_low_fill_tail_diagnostics(
+    rows: Sequence[tuple[Mapping[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    bucket_counts: dict[str, int] = {}
+    missing_book_count = 0
+    for row, provenance in rows:
+        canonical_buckets = provenance.get("canonical_strategy_buckets", [])
+        if LOW_FILL_LIQUIDITY_REWARD_MAKER not in canonical_buckets:
+            continue
+        bucket = _low_fill_reward_tail_bucket(row, canonical_buckets)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        if not (_has_book_prices(row, "yes") and _has_book_prices(row, "no")):
+            missing_book_count += 1
+    return {
+        "thresholds": {
+            "extreme_tail": LOW_FILL_EXTREME_TAIL_THRESHOLD,
+            "reward_tail": LOW_FILL_REWARD_TAIL_THRESHOLD,
+        },
+        "bucket_counts": dict(sorted(bucket_counts.items())),
+        "low_fill_extreme_tail_watchlist_count": bucket_counts.get(
+            "low_fill_extreme_tail_watchlist", 0
+        ),
+        "low_fill_missing_book_source_count": missing_book_count,
+    }
+
+
 def _source_exclusion(
     *,
     source_key: str,
@@ -452,6 +591,9 @@ def _scan_rows_from_sequence(
                     "source_key": row_source_key,
                     "source_shape": source_shape,
                     "strategy_buckets": [strategy_bucket] if strategy_bucket else [],
+                    "canonical_strategy_buckets": (
+                        _canonical_strategy_buckets([strategy_bucket]) if strategy_bucket else []
+                    ),
                     "deduplication_key": row_key,
                     "duplicate_source_keys": [],
                 },
@@ -469,13 +611,27 @@ def _deduplicate_source_rows(
         row_key = str(provenance["deduplication_key"])
         existing = by_key.get(row_key)
         if existing is None:
-            by_key[row_key] = (row, dict(provenance))
+            stored_provenance = dict(provenance)
+            stored_provenance["strategy_buckets"] = list(provenance.get("strategy_buckets", []))
+            stored_provenance["canonical_strategy_buckets"] = list(
+                provenance.get("canonical_strategy_buckets", [])
+            )
+            stored_provenance["duplicate_source_keys"] = list(
+                provenance.get("duplicate_source_keys", [])
+            )
+            by_key[row_key] = (row, stored_provenance)
             continue
         _, existing_provenance = existing
         existing_buckets = existing_provenance.setdefault("strategy_buckets", [])
         for bucket in provenance.get("strategy_buckets", []):
             if bucket not in existing_buckets:
                 existing_buckets.append(bucket)
+        existing_canonical_buckets = existing_provenance.setdefault(
+            "canonical_strategy_buckets", []
+        )
+        for bucket in provenance.get("canonical_strategy_buckets", []):
+            if bucket not in existing_canonical_buckets:
+                existing_canonical_buckets.append(bucket)
         duplicate_source_keys = existing_provenance.setdefault("duplicate_source_keys", [])
         duplicate_source_keys.append(provenance["source_key"])
         duplicate_rows.append(
@@ -484,6 +640,7 @@ def _deduplicate_source_rows(
                 "deduplicated_into": existing_provenance["source_key"],
                 "deduplication_key": row_key,
                 "strategy_buckets": provenance.get("strategy_buckets", []),
+                "canonical_strategy_buckets": provenance.get("canonical_strategy_buckets", []),
                 "reason": "duplicate_candidate_row",
             }
         )
@@ -523,6 +680,11 @@ def _scan_candidates_with_diagnostics(
         "candidates_type": _type_name(candidates),
         "selected_source": None,
         "strategy_bucket_counts": {},
+        "canonical_strategy_bucket_counts": {},
+        "canonical_strategy_bucket_unique_counts": {},
+        "strategy_bucket_aliases": {},
+        "strategy_overlap_diagnostics": {},
+        "low_fill_tail_diagnostics": {},
         "strategy_bucket_candidate_count": 0,
         "strategy_bucket_unique_candidate_count": 0,
         "source_candidate_container_count": 0,
@@ -601,6 +763,21 @@ def _scan_candidates_with_diagnostics(
     diagnostics["strategy_bucket_unique_candidate_count"] = len(
         {str(provenance["deduplication_key"]) for _, provenance in raw_rows}
     )
+    diagnostics["canonical_strategy_bucket_counts"] = _count_canonical_strategy_buckets(raw_rows)
+    diagnostics["canonical_strategy_bucket_unique_counts"] = _count_canonical_strategy_buckets(
+        deduplicated_rows
+    )
+    diagnostics["strategy_bucket_aliases"] = dict(
+        sorted(
+            {
+                raw_bucket: _canonical_strategy_bucket(raw_bucket)
+                for _, provenance in raw_rows
+                for raw_bucket in provenance.get("strategy_buckets", [])
+            }.items()
+        )
+    )
+    diagnostics["strategy_overlap_diagnostics"] = _strategy_overlap_diagnostics(deduplicated_rows)
+    diagnostics["low_fill_tail_diagnostics"] = _source_low_fill_tail_diagnostics(deduplicated_rows)
     diagnostics["normalized_candidate_count"] = len(deduplicated_rows)
     diagnostics["duplicate_source_row_count"] = len(duplicate_rows)
     diagnostics["excluded_source_row_count"] = len(exclusions)
@@ -754,6 +931,7 @@ class RewardScoreRules:
     max_days_to_end: float = 365.0
     min_market_age_hours: float = 1.0
     tail_price_threshold: float = 0.02
+    reward_tail_threshold: float = 0.08
 
 
 def accidental_fill_risk_flags(
@@ -914,6 +1092,74 @@ def _scan_timestamp(metadata: Mapping[str, Any]) -> Any:
     )
 
 
+def _source_provenance_limitations(metadata: Mapping[str, Any]) -> list[str]:
+    limitations: list[str] = []
+    geoblock = metadata.get("geoblock")
+    if isinstance(geoblock, Mapping) and geoblock.get("ok") is not True:
+        limitations.append("geoblock_status_provenance_limited")
+    return limitations
+
+
+def _candidate_fail_closed_reasons(row: Mapping[str, Any]) -> list[str]:
+    reasons: list[str] = [str(reason) for reason in row.get("blockers", [])]
+    book_provenance = row.get("book_provenance")
+    if isinstance(book_provenance, Mapping):
+        reasons.extend(str(reason) for reason in book_provenance.get("fail_closed_reasons", []))
+    token_provenance = row.get("token_provenance")
+    if isinstance(token_provenance, Mapping):
+        reasons.extend(str(reason) for reason in token_provenance.get("fail_closed_reasons", []))
+    return sorted(set(reasons))
+
+
+def _manifest_strategy_bucket_diagnostics(
+    scored: Sequence[Mapping[str, Any]],
+    rules: RewardScoreRules,
+) -> dict[str, Any]:
+    canonical_counts: dict[str, int] = {}
+    low_fill_tail_bucket_counts: dict[str, int] = {}
+    low_fill_missing_book_fail_closed_count = 0
+    low_fill_microprice_overlap_slugs: list[str] = []
+    low_fill_volatility_overlap_slugs: list[str] = []
+    for row in scored:
+        canonical_buckets = row.get("canonical_source_strategy_buckets", [])
+        if not isinstance(canonical_buckets, Sequence) or isinstance(
+            canonical_buckets, (str, bytes, bytearray)
+        ):
+            canonical_buckets = []
+        for bucket in canonical_buckets:
+            bucket_name = str(bucket)
+            canonical_counts[bucket_name] = canonical_counts.get(bucket_name, 0) + 1
+
+        reward_tail_bucket = str(row.get("low_fill_reward_tail_bucket"))
+        if LOW_FILL_LIQUIDITY_REWARD_MAKER in canonical_buckets:
+            low_fill_tail_bucket_counts[reward_tail_bucket] = (
+                low_fill_tail_bucket_counts.get(reward_tail_bucket, 0) + 1
+            )
+            if "missing_complete_yes_no_clob_books" in row.get("blockers", []):
+                low_fill_missing_book_fail_closed_count += 1
+            if MICROPRICE in canonical_buckets:
+                low_fill_microprice_overlap_slugs.append(str(row.get("slug") or row["market_id"]))
+            if VOLATILITY_SPIKE_DEEP_LIMIT_MAKER in canonical_buckets:
+                low_fill_volatility_overlap_slugs.append(str(row.get("slug") or row["market_id"]))
+
+    return {
+        "thresholds": {
+            "extreme_tail": rules.tail_price_threshold,
+            "reward_tail": rules.reward_tail_threshold,
+        },
+        "canonical_strategy_bucket_counts": dict(sorted(canonical_counts.items())),
+        "low_fill_reward_tail_bucket_counts": dict(sorted(low_fill_tail_bucket_counts.items())),
+        "low_fill_extreme_tail_watchlist_count": low_fill_tail_bucket_counts.get(
+            "low_fill_extreme_tail_watchlist", 0
+        ),
+        "low_fill_missing_book_fail_closed_count": low_fill_missing_book_fail_closed_count,
+        "low_fill_microprice_overlap_count": len(low_fill_microprice_overlap_slugs),
+        "low_fill_microprice_overlap_slugs": sorted(low_fill_microprice_overlap_slugs),
+        "low_fill_volatility_overlap_count": len(low_fill_volatility_overlap_slugs),
+        "low_fill_volatility_overlap_slugs": sorted(low_fill_volatility_overlap_slugs),
+    }
+
+
 def build_reward_manifest(
     scan: Mapping[str, Any],
     *,
@@ -930,6 +1176,7 @@ def build_reward_manifest(
     generated_at = _parse_dt(source_scan_timestamp_utc) or datetime.now(UTC)
     scored: list[dict[str, Any]] = []
     source_rows, source_candidate_diagnostics = _scan_candidates_with_diagnostics(scan)
+    source_provenance_limitations = _source_provenance_limitations(metadata)
     for candidate, source_candidate_provenance in source_rows:
         score = score_candidate(candidate, generated_at=generated_at, rules=rules)
         clob_token_ids = _clob_token_ids(candidate)
@@ -942,6 +1189,15 @@ def build_reward_manifest(
             ),
             source_timestamp_utc=_scan_timestamp(metadata),
         )
+        canonical_strategy_buckets = list(
+            source_candidate_provenance.get("canonical_strategy_buckets", [])
+        )
+        low_fill_reward_tail_bucket = _low_fill_reward_tail_bucket(
+            candidate,
+            canonical_strategy_buckets,
+            extreme_tail_threshold=rules.tail_price_threshold,
+            reward_tail_threshold=rules.reward_tail_threshold,
+        )
         scored.append(
             {
                 "market_id": str(_first_present(candidate, "market_id", "id") or ""),
@@ -950,6 +1206,16 @@ def build_reward_manifest(
                 "question": candidate.get("question"),
                 "source_candidate_provenance": source_candidate_provenance,
                 "source_strategy_buckets": source_candidate_provenance.get("strategy_buckets", []),
+                "canonical_source_strategy_buckets": canonical_strategy_buckets,
+                "source_strategy_overlap": _source_strategy_overlap(canonical_strategy_buckets),
+                "low_fill_reward_tail_bucket": low_fill_reward_tail_bucket,
+                "low_fill_reward_tail_diagnostic": {
+                    "bucket": low_fill_reward_tail_bucket,
+                    "tail_distance": _tail_distance(candidate),
+                    "extreme_tail_threshold": rules.tail_price_threshold,
+                    "reward_tail_threshold": rules.reward_tail_threshold,
+                    "canonical_source_strategy_buckets": canonical_strategy_buckets,
+                },
                 "clob_token_ids": clob_token_ids,
                 "source_clob_token_ids": _candidate_token_ids(candidate),
                 "yes_token_id": clob_token_ids[0] if len(clob_token_ids) == 2 else None,
@@ -965,15 +1231,24 @@ def build_reward_manifest(
                 **score,
             }
         )
+        fail_closed_reasons = _candidate_fail_closed_reasons(scored[-1])
         scored[-1]["candidate_diagnostic"] = {
             "included_in_manifest_diagnostics": True,
             "excluded_from_backtest_queue": not scored[-1]["eligible_for_backtest_queue"],
             "exclusion_reasons": list(scored[-1]["blockers"]),
+            "fail_closed_reasons": fail_closed_reasons,
+            "provenance_limitations": list(source_provenance_limitations),
             "source_strategy_buckets": list(scored[-1]["source_strategy_buckets"]),
+            "canonical_source_strategy_buckets": canonical_strategy_buckets,
+            "low_fill_reward_tail_bucket": low_fill_reward_tail_bucket,
+            "source_strategy_overlap": scored[-1]["source_strategy_overlap"],
             "source_key": source_candidate_provenance.get("source_key"),
             "source_shape": source_candidate_provenance.get("source_shape"),
         }
-    scored.sort(key=lambda row: row["reward_proxy_score"], reverse=True)
+    scored.sort(
+        key=lambda row: (row["eligible_for_backtest_queue"], row["reward_proxy_score"]),
+        reverse=True,
+    )
     for rank, row in enumerate(scored, start=1):
         row["rank"] = rank
     eligible_count = sum(1 for row in scored if row["eligible_for_backtest_queue"])
@@ -981,6 +1256,7 @@ def build_reward_manifest(
         1 for row in scored if row.get("features", {}).get("has_explicit_reward_evidence")
     )
     blocked_count = len(scored) - eligible_count
+    strategy_bucket_diagnostics = _manifest_strategy_bucket_diagnostics(scored, rules)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "mode": SHADOW_MODE,
@@ -996,6 +1272,7 @@ def build_reward_manifest(
             "source_scan_timestamp_utc": source_scan_timestamp_utc,
             "source_scan_mode": source_scan_mode,
             "source_artifacts": source_artifacts,
+            "provenance_limitations": source_provenance_limitations,
         },
         "summary": {
             "candidate_count": len(scored),
@@ -1018,8 +1295,22 @@ def build_reward_manifest(
             "source_strategy_bucket_unique_candidate_count": source_candidate_diagnostics[
                 "strategy_bucket_unique_candidate_count"
             ],
+            "low_fill_extreme_tail_watchlist_count": strategy_bucket_diagnostics[
+                "low_fill_extreme_tail_watchlist_count"
+            ],
+            "low_fill_microprice_overlap_count": strategy_bucket_diagnostics[
+                "low_fill_microprice_overlap_count"
+            ],
+            "low_fill_volatility_overlap_count": strategy_bucket_diagnostics[
+                "low_fill_volatility_overlap_count"
+            ],
+            "low_fill_missing_book_fail_closed_count": strategy_bucket_diagnostics[
+                "low_fill_missing_book_fail_closed_count"
+            ],
         },
         "source_candidate_diagnostics": source_candidate_diagnostics,
+        "strategy_bucket_diagnostics": strategy_bucket_diagnostics,
+        "source_provenance_limitations": source_provenance_limitations,
         "safety": {
             "live_trading": False,
             "submit_orders": False,
