@@ -5,9 +5,12 @@ import asyncio
 import csv
 import json
 import math
+import multiprocessing as mp
+import queue as queue_module
+import traceback
 import warnings
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from glob import glob
 from pathlib import Path
@@ -45,6 +48,7 @@ REQUIRED_SAFETY_FIELDS = (
     "live_trading_worker_started",
     "worker_trading_started",
 )
+DEFAULT_PROCESS_TIMEOUT_GRACE_SECONDS = 1
 
 
 @dataclass(frozen=True)
@@ -122,6 +126,11 @@ def _safety_fields(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         for field in REQUIRED_SAFETY_FIELDS:
             safety[field] = False
     return safety
+
+
+def _safety_top_level_fields(extra: dict[str, Any] | None = None) -> dict[str, bool]:
+    safety = _safety_fields(extra)
+    return {field: bool(safety[field]) for field in REQUIRED_SAFETY_FIELDS}
 
 
 def _looks_like_pmxt_raw_download_failure(message: str | None) -> bool:
@@ -280,6 +289,67 @@ def _result_from_candidate(
     )
 
 
+def _coverage_payload(result: CoverageProbeResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "diagnostic_category": result.diagnostic_category,
+        "selection_phase": result.selection_phase,
+        "source_manifest": result.source_manifest,
+        "window": {
+            "start_time": result.window_start_time,
+            "end_time": result.window_end_time,
+        },
+        "window_source": result.window_source,
+        "window_provenance": result.window_provenance,
+        "book_events": result.book_events,
+        "min_book_events": result.min_book_events,
+        "count_key": result.count_key,
+        "market_key": result.market_key,
+        "market_id": result.market_id,
+        "price_min": result.price_min,
+        "price_max": result.price_max,
+        "price_range": result.price_range,
+        "message": result.message,
+        "gap_hours_missing": result.gap_hours_missing,
+        "gap_warning": result.gap_warning,
+    }
+
+
+def _summary_result_row(result: CoverageProbeResult) -> dict[str, Any]:
+    row = asdict(result)
+    row["coverage"] = _coverage_payload(result)
+    row["safety"] = _safety_fields()
+    row.update(_safety_top_level_fields())
+    return row
+
+
+def _coverage_result_from_row(row: dict[str, Any]) -> CoverageProbeResult:
+    field_names = {field.name for field in fields(CoverageProbeResult)}
+    return CoverageProbeResult(**{key: value for key, value in row.items() if key in field_names})
+
+
+def _timeout_result_from_target(
+    target: ProbeTarget,
+    *,
+    timeout_seconds: int,
+    message: str | None = None,
+) -> CoverageProbeResult:
+    return _result_from_candidate(
+        target.candidate,
+        status="error",
+        book_events=0,
+        min_book_events=target.min_book_events,
+        message=message or f"Timed out after {timeout_seconds} seconds.",
+        diagnostic_category="probe_runtime_timeout",
+        selection_phase=target.selection_phase,
+        source_manifest=target.source_manifest,
+        window_start_time=target.start_time,
+        window_end_time=target.end_time,
+        window_source=target.window_source,
+        window_provenance=target.window_provenance,
+    )
+
+
 async def probe_candidate(
     candidate: Candidate,
     *,
@@ -417,20 +487,127 @@ async def _probe_with_timeout(
             ),
         )
     except TimeoutError:
+        return _timeout_result_from_target(
+            ProbeTarget(
+                candidate=candidate,
+                start_time=start_time,
+                end_time=end_time,
+                min_book_events=min_book_events,
+                source_manifest=source_manifest or "",
+                selection_phase=selection_phase,
+                window_source=window_source,
+                window_provenance=window_provenance,
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def _multiprocessing_context() -> mp.context.BaseContext:
+    methods = mp.get_all_start_methods()
+    method = "fork" if "fork" in methods else methods[0]
+    return mp.get_context(method)
+
+
+def _probe_target_child(
+    output_queue: mp.Queue,
+    target: ProbeTarget,
+    sources: tuple[str, ...],
+    timeout_seconds: int,
+) -> None:
+    try:
+        result = asyncio.run(
+            _probe_with_timeout(
+                target.candidate,
+                start_time=target.start_time,
+                end_time=target.end_time,
+                min_book_events=target.min_book_events,
+                sources=sources,
+                timeout_seconds=timeout_seconds,
+                selection_phase=target.selection_phase,
+                source_manifest=target.source_manifest,
+                window_source=target.window_source,
+                window_provenance=target.window_provenance,
+            )
+        )
+        output_queue.put({"ok": True, "result": asdict(result)})
+    except BaseException as exc:  # child isolation: parent records and keeps scanning
+        output_queue.put(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(limit=8),
+            }
+        )
+
+
+def _run_target_in_process(
+    target: ProbeTarget,
+    *,
+    sources: tuple[str, ...],
+    timeout_seconds: int,
+    timeout_grace_seconds: int,
+) -> CoverageProbeResult:
+    context = _multiprocessing_context()
+    output_queue: mp.Queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_probe_target_child,
+        args=(output_queue, target, sources, timeout_seconds),
+    )
+    process.daemon = True
+    process.start()
+    process.join(timeout=max(1, int(timeout_seconds) + int(timeout_grace_seconds)))
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(timeout=1)
+        return _timeout_result_from_target(
+            target,
+            timeout_seconds=timeout_seconds,
+            message=(
+                f"Timed out after {timeout_seconds} seconds; child process was terminated "
+                "before a candidate/window result was returned."
+            ),
+        )
+
+    try:
+        payload = output_queue.get_nowait()
+    except queue_module.Empty:
         return _result_from_candidate(
-            candidate,
+            target.candidate,
             status="error",
             book_events=0,
-            min_book_events=min_book_events,
-            message=f"Timed out after {timeout_seconds} seconds.",
+            min_book_events=target.min_book_events,
+            message=(
+                "Probe child process exited without returning a candidate/window result "
+                f"(exitcode={process.exitcode})."
+            ),
             diagnostic_category="probe_error",
-            selection_phase=selection_phase,
-            source_manifest=source_manifest,
-            window_start_time=start_time,
-            window_end_time=end_time,
-            window_source=window_source,
-            window_provenance=window_provenance,
+            selection_phase=target.selection_phase,
+            source_manifest=target.source_manifest,
+            window_start_time=target.start_time,
+            window_end_time=target.end_time,
+            window_source=target.window_source,
+            window_provenance=target.window_provenance,
         )
+
+    if payload.get("ok"):
+        return CoverageProbeResult(**payload["result"])
+    return _result_from_candidate(
+        target.candidate,
+        status="error",
+        book_events=0,
+        min_book_events=target.min_book_events,
+        message=str(payload.get("error") or "Probe child process failed."),
+        diagnostic_category="probe_error",
+        selection_phase=target.selection_phase,
+        source_manifest=target.source_manifest,
+        window_start_time=target.start_time,
+        window_end_time=target.end_time,
+        window_source=target.window_source,
+        window_provenance=target.window_provenance,
+    )
 
 
 def _pass_manifest_candidate(result: CoverageProbeResult) -> dict[str, Any]:
@@ -442,29 +619,9 @@ def _pass_manifest_candidate(result: CoverageProbeResult) -> dict[str, Any]:
             "question": result.question,
             "token_index": result.token_index,
             "source_strategy": result.source_strategy,
-            "coverage": {
-                "status": result.status,
-                "diagnostic_category": result.diagnostic_category,
-                "selection_phase": result.selection_phase,
-                "source_manifest": result.source_manifest,
-                "window": {
-                    "start_time": result.window_start_time,
-                    "end_time": result.window_end_time,
-                },
-                "window_source": result.window_source,
-                "window_provenance": result.window_provenance,
-                "book_events": result.book_events,
-                "min_book_events": result.min_book_events,
-                "count_key": result.count_key,
-                "market_key": result.market_key,
-                "market_id": result.market_id,
-                "price_min": result.price_min,
-                "price_max": result.price_max,
-                "price_range": result.price_range,
-                "message": result.message,
-                "gap_hours_missing": result.gap_hours_missing,
-                "gap_warning": result.gap_warning,
-            },
+            "coverage": _coverage_payload(result),
+            "safety": _safety_fields(),
+            **_safety_top_level_fields(),
         }
     )
     return candidate
@@ -480,13 +637,15 @@ def _build_pass_manifest(summary: dict[str, Any]) -> dict[str, Any]:
             continue
         seen.add(key)
         deduped_rows.append(row)
-    pass_results = [CoverageProbeResult(**row) for row in deduped_rows]
+    pass_results = [_coverage_result_from_row(row) for row in deduped_rows]
+    safety = _safety_fields(
+        summary.get("safety") if isinstance(summary.get("safety"), dict) else None
+    )
     return {
         "schema_version": 1,
         "mode": "shadow/backtest-only",
-        "safety": _safety_fields(
-            summary.get("safety") if isinstance(summary.get("safety"), dict) else None
-        ),
+        "safety": safety,
+        **_safety_top_level_fields(safety),
         "strategy": summary["strategy"],
         "source_manifest": summary.get("source_manifest") or summary.get("manifest"),
         "manifest_selection": summary.get("manifest_selection", []),
@@ -811,23 +970,35 @@ async def _run_targets(
     *,
     sources: tuple[str, ...],
     timeout_seconds: int,
+    process_isolation: bool,
+    timeout_grace_seconds: int,
 ) -> list[CoverageProbeResult]:
     results: list[CoverageProbeResult] = []
     for target in targets:
-        results.append(
-            await _probe_with_timeout(
-                target.candidate,
-                start_time=target.start_time,
-                end_time=target.end_time,
-                min_book_events=target.min_book_events,
-                sources=sources,
-                timeout_seconds=timeout_seconds,
-                selection_phase=target.selection_phase,
-                source_manifest=target.source_manifest,
-                window_source=target.window_source,
-                window_provenance=target.window_provenance,
+        if process_isolation:
+            results.append(
+                _run_target_in_process(
+                    target,
+                    sources=sources,
+                    timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
+                )
             )
-        )
+        else:
+            results.append(
+                await _probe_with_timeout(
+                    target.candidate,
+                    start_time=target.start_time,
+                    end_time=target.end_time,
+                    min_book_events=target.min_book_events,
+                    sources=sources,
+                    timeout_seconds=timeout_seconds,
+                    selection_phase=target.selection_phase,
+                    source_manifest=target.source_manifest,
+                    window_source=target.window_source,
+                    window_provenance=target.window_provenance,
+                )
+            )
     return results
 
 
@@ -842,6 +1013,7 @@ def _diagnostic_counts(
     for category in (
         "no_eligible_input_candidates",
         "pmxt_raw_download_failure",
+        "probe_runtime_timeout",
         "no_pmxt_l2_book_data",
         "min_book_events_not_met",
         "successful_pass_count",
@@ -888,10 +1060,18 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     primary_targets, expansion_targets, manifest_records, windows = _build_probe_targets(args)
     primary_start_time, primary_end_time = windows[0]
     sources = tuple(args.sources or DEFAULT_SOURCES)
+    process_isolation = bool(getattr(args, "process_isolation", True))
+    timeout_grace_seconds = _int_arg(
+        args,
+        "process_timeout_grace_seconds",
+        DEFAULT_PROCESS_TIMEOUT_GRACE_SECONDS,
+    )
     primary_results = await _run_targets(
         primary_targets,
         sources=sources,
         timeout_seconds=args.timeout_seconds,
+        process_isolation=process_isolation,
+        timeout_grace_seconds=timeout_grace_seconds,
     )
     expansion_triggered = bool(
         primary_results
@@ -903,6 +1083,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             expansion_targets,
             sources=sources,
             timeout_seconds=args.timeout_seconds,
+            process_isolation=process_isolation,
+            timeout_grace_seconds=timeout_grace_seconds,
         )
         if expansion_triggered
         else []
@@ -922,11 +1104,13 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         no_eligible_candidates=no_eligible_candidates,
     )
     probed_windows = _probed_windows(results, windows)
+    safety = _safety_fields()
     return {
         "schema_version": 1,
         "generated_at": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
-        "safety": _safety_fields(),
+        "safety": safety,
+        **_safety_top_level_fields(safety),
         "strategy": args.strategy,
         "source_manifest": str(args.manifest),
         "manifest_selection": manifest_records,
@@ -952,11 +1136,14 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "diagnostics": {
             "no_eligible_input_candidates": no_eligible_candidates,
             "pmxt_raw_download_failure_count": diagnostic_counts["pmxt_raw_download_failure"],
+            "probe_runtime_timeout_count": diagnostic_counts["probe_runtime_timeout"],
             "no_pmxt_l2_book_data_count": diagnostic_counts["no_pmxt_l2_book_data"],
             "min_book_events_not_met_count": diagnostic_counts["min_book_events_not_met"],
             "successful_pass_count": diagnostic_counts["successful_pass_count"],
+            "process_isolation": process_isolation,
+            "process_timeout_grace_seconds": timeout_grace_seconds,
         },
-        "results": [asdict(result) for result in results],
+        "results": [_summary_result_row(result) for result in results],
     }
 
 
@@ -982,8 +1169,16 @@ def _write_csv(summary: dict[str, Any], csv_path: Path) -> None:
                 "message",
                 "gap_hours_missing",
                 "gap_warning",
+                "window_start_time",
+                "window_end_time",
                 "window_provenance",
                 "window_source",
+                "orders_submitted",
+                "orders_signed",
+                "orders_cancelled",
+                "credentials_required",
+                "live_trading_worker_started",
+                "worker_trading_started",
             ],
         )
         writer.writeheader()
@@ -1129,6 +1324,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum recent manifests from --alternate-manifest-glob to consider.",
     )
     parser.add_argument("--timestamp", default=None, help="Override output timestamp for tests.")
+    parser.add_argument(
+        "--no-process-isolation",
+        action="store_false",
+        dest="process_isolation",
+        help=(
+            "Disable per-candidate child-process isolation. Intended only for local debugging; "
+            "the default isolates stuck candidate/window probes so artifacts can still be written."
+        ),
+    )
+    parser.set_defaults(process_isolation=True)
+    parser.add_argument(
+        "--process-timeout-grace-seconds",
+        type=int,
+        default=DEFAULT_PROCESS_TIMEOUT_GRACE_SECONDS,
+        help=(
+            "Additional seconds the parent waits for a child to serialize a timeout row before "
+            "terminating the child process."
+        ),
+    )
     parser.add_argument("--fail-on-errors", action="store_true")
     parser.add_argument("--fail-on-no-pass", action="store_true")
     args = parser.parse_args(argv)
@@ -1138,6 +1352,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("min-book-events must be >= 0")
     if args.timeout_seconds < 1:
         raise SystemExit("timeout-seconds must be >= 1")
+    if args.process_timeout_grace_seconds < 0:
+        raise SystemExit("process-timeout-grace-seconds must be >= 0")
     if args.recent_window_count < 1:
         raise SystemExit("recent-window-count must be >= 1")
     if args.window_step_hours < 1:

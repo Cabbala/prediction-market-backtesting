@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -122,6 +123,12 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
 
     pass_manifest = json.loads(Path(output_files["pass_manifest"]).read_text(encoding="utf-8"))
     assert pass_manifest["mode"] == "shadow/backtest-only"
+    assert pass_manifest["orders_submitted"] is False
+    assert pass_manifest["orders_signed"] is False
+    assert pass_manifest["orders_cancelled"] is False
+    assert pass_manifest["credentials_required"] is False
+    assert pass_manifest["worker_trading_started"] is False
+    assert pass_manifest["live_trading_worker_started"] is False
     assert pass_manifest["safety"]["orders_submitted"] is False
     assert pass_manifest["safety"]["orders_signed"] is False
     assert pass_manifest["safety"]["orders_cancelled"] is False
@@ -135,9 +142,15 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
     ]
     assert pass_manifest["candidates"][0]["source_strategy"] == "microprice_optimizer"
     assert pass_manifest["candidates"][0]["coverage"]["book_events"] == 75
+    assert pass_manifest["candidates"][0]["coverage"]["window"] == {
+        "start_time": "2026-03-22T09:00:00Z",
+        "end_time": "2026-03-22T10:00:00Z",
+    }
     assert pass_manifest["candidates"][0]["coverage"]["diagnostic_category"] == (
         "successful_pass_count"
     )
+    assert pass_manifest["candidates"][0]["safety"]["orders_submitted"] is False
+    assert pass_manifest["candidates"][0]["orders_submitted"] is False
     md = Path(output_files["markdown"]).read_text(encoding="utf-8")
     assert "- orders_submitted=false" in md
     assert "- orders_signed=false" in md
@@ -155,6 +168,104 @@ def test_probe_writes_outputs_and_pass_manifest_with_only_covered_candidates(
         ("covered-market", 0)
     ]
     assert loaded[0].source_strategy == "microprice_optimizer"
+
+
+def test_process_timeout_preserves_partial_candidate_window_outputs(monkeypatch, tmp_path) -> None:
+    source_manifest = tmp_path / "source_manifest.json"
+    _write_source_manifest(source_manifest)
+
+    async def _fake_probe_candidate(candidate, **kwargs):  # type: ignore[no-untyped-def]
+        if candidate.slug == "covered-market":
+            return probe_pmxt_l2_coverage._result_from_candidate(
+                candidate,
+                status="pass",
+                book_events=75,
+                min_book_events=50,
+                window_start_time=kwargs["start_time"],
+                window_end_time=kwargs["end_time"],
+            )
+        if candidate.slug == "broken-market":
+            time.sleep(5)
+        return probe_pmxt_l2_coverage._result_from_candidate(
+            candidate,
+            status="no_coverage",
+            book_events=0,
+            min_book_events=50,
+            message="No PMXT L2 book replay was loaded for the requested window.",
+            window_start_time=kwargs["start_time"],
+            window_end_time=kwargs["end_time"],
+        )
+
+    monkeypatch.setattr(probe_pmxt_l2_coverage, "probe_candidate", _fake_probe_candidate)
+    args = Namespace(
+        manifest=source_manifest,
+        output_dir=tmp_path / "reports",
+        pass_manifest_dir=tmp_path / "pass_manifests",
+        start_time="2026-03-22T09:00:00Z",
+        end_time="2026-03-22T10:00:00Z",
+        strategy="microprice_optimizer",
+        max_candidates=3,
+        min_book_events=50,
+        sources=None,
+        timeout_seconds=1,
+        recent_window_count=1,
+        window_step_hours=1,
+        process_isolation=True,
+        process_timeout_grace_seconds=0,
+    )
+
+    started_at = time.monotonic()
+    summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
+    elapsed = time.monotonic() - started_at
+    output_files = probe_pmxt_l2_coverage.write_outputs(
+        summary,
+        output_dir=args.output_dir,
+        pass_manifest_dir=args.pass_manifest_dir,
+        timestamp="20260504T000006Z",
+    )
+
+    assert elapsed < 4
+    assert summary["orders_submitted"] is False
+    assert summary["orders_signed"] is False
+    assert summary["orders_cancelled"] is False
+    assert summary["credentials_required"] is False
+    assert summary["worker_trading_started"] is False
+    assert summary["live_trading_worker_started"] is False
+    assert summary["pass_count"] == 1
+    assert summary["no_coverage_count"] == 1
+    assert summary["error_count"] == 1
+    assert summary["diagnostic_counts"]["probe_runtime_timeout"] == 1
+    assert [row["slug"] for row in summary["results"]] == [
+        "covered-market",
+        "thin-market",
+        "broken-market",
+    ]
+    timeout_row = summary["results"][2]
+    assert timeout_row["status"] == "error"
+    assert timeout_row["diagnostic_category"] == "probe_runtime_timeout"
+    assert timeout_row["coverage"]["window"] == {
+        "start_time": "2026-03-22T09:00:00Z",
+        "end_time": "2026-03-22T10:00:00Z",
+    }
+    assert timeout_row["safety"]["orders_submitted"] is False
+    assert timeout_row["orders_submitted"] is False
+
+    for artifact in output_files.values():
+        assert Path(artifact).exists()
+    json_report = json.loads(Path(output_files["json"]).read_text(encoding="utf-8"))
+    assert json_report["diagnostic_counts"]["probe_runtime_timeout"] == 1
+    assert json_report["results"][2]["coverage"]["window"]["start_time"] == ("2026-03-22T09:00:00Z")
+    csv_rows = list(csv.DictReader(Path(output_files["csv"]).open(encoding="utf-8")))
+    assert csv_rows[2]["diagnostic_category"] == "probe_runtime_timeout"
+    assert csv_rows[2]["window_start_time"] == "2026-03-22T09:00:00Z"
+    assert csv_rows[2]["orders_submitted"] == "False"
+    pass_manifest = json.loads(Path(output_files["pass_manifest"]).read_text(encoding="utf-8"))
+    assert pass_manifest["candidate_count"] == 1
+    assert pass_manifest["orders_submitted"] is False
+    assert pass_manifest["candidates"][0]["coverage"]["window"] == {
+        "start_time": "2026-03-22T09:00:00Z",
+        "end_time": "2026-03-22T10:00:00Z",
+    }
 
 
 def test_job_b_load_candidates_preserves_top_level_source_strategy(tmp_path) -> None:
