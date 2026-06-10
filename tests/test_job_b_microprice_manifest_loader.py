@@ -1147,6 +1147,24 @@ def test_write_batch_outputs_emit_negative_pnl_guardrail_summary(tmp_path):
             "classification": "negative_pnl_guardrail_active",
             "per_tail_bucket": {"non_extreme_tail": {"attempt_count": 1}},
         },
+        "negative_pnl_candidate_filter_recommendations": {
+            "classification": "negative_pnl_candidate_filter_active",
+            "evidence_valid": True,
+            "recommendations_emitted": True,
+            "exclusions_emitted": True,
+            "candidate_exclusions": [
+                {
+                    "key": "filled-loss#0",
+                    "filter_status": job_b_microprice_batch.NEGATIVE_PNL_CANDIDATE_EXCLUSION,
+                }
+            ],
+            "parameter_bucket_exclusions": [
+                {
+                    "key": "non_extreme_tail|depth=1|edge=0.0005|entry=0.55|hold=10.0",
+                    "filter_status": job_b_microprice_batch.NEGATIVE_PNL_PARAMETER_EXCLUSION,
+                }
+            ],
+        },
         "tail_bucket_counts": {"non_extreme_tail": 1},
         "tick_cost_buckets": {"too_large": 1},
         "diagnostics": {
@@ -1176,9 +1194,281 @@ def test_write_batch_outputs_emit_negative_pnl_guardrail_summary(tmp_path):
     assert emitted_json["negative_pnl_guardrail_summary"]["classification"] == (
         "negative_pnl_guardrail_active"
     )
+    assert emitted_json["negative_pnl_candidate_filter_recommendations"]["classification"] == (
+        "negative_pnl_candidate_filter_active"
+    )
     assert "negative_pnl_guardrail_summary" in emitted_markdown
+    assert "negative_pnl_candidate_filter_recommendations" in emitted_markdown
     assert "orders_submitted=false" in emitted_markdown
     assert "orders_cancelled=false" in emitted_markdown
+
+
+def _current_20260610_negative_pnl_fixture(tmp_path, *, manifest_window=None):
+    window = {
+        "start_time": "2026-06-09T13:00:00Z",
+        "end_time": "2026-06-09T14:00:00Z",
+    }
+    manifest_window = manifest_window or window
+    manifest = tmp_path / "job_B_pmxt_l2_coverage_pass_20260609T152725Z.json"
+    artifact = tmp_path / "job_B_microprice_batch_20260610T033236Z.json"
+    slugs = [
+        ("will-belgium-win-the-2026-fifa-world-cup-358", 0.0225),
+        ("will-usa-win-the-2026-fifa-world-cup-467", 0.0115),
+        ("will-turkiye-win-the-2026-fifa-world-cup", 0.0115),
+    ]
+    params_fast = {
+        "depth_levels": 1,
+        "entry_imbalance": 0.55,
+        "exit_imbalance": 0.5,
+        "min_microprice_edge": 0.0005,
+        "quote_lifetime_seconds": 10.0,
+    }
+    params_slow = {
+        "depth_levels": 3,
+        "entry_imbalance": 0.57,
+        "exit_imbalance": 0.5,
+        "min_microprice_edge": 0.001,
+        "quote_lifetime_seconds": 30.0,
+    }
+    rows = [
+        (slugs[0], params_fast, -1.14447, 10.0, 10.0),
+        (slugs[0], params_slow, -0.47339, 5.0, 6.0),
+        (slugs[1], params_fast, -0.80190, 12.0, 12.0),
+        (slugs[1], params_slow, -0.54553, 8.0, 8.0),
+        (slugs[2], params_fast, -0.32089, 5.0, 6.0),
+        (slugs[2], params_slow, -0.16341, 3.0, 4.0),
+    ]
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "candidate_count": len(slugs),
+                "window": manifest_window,
+                "min_book_events": 50,
+                "candidates": [
+                    {
+                        "slug": slug,
+                        "source_strategy": "Microprice",
+                        "token_index": 0,
+                        "scan_mid": scan_mid,
+                        "scan_spread": 0.0010000000000000009,
+                        "coverage": {
+                            "status": "pass",
+                            "book_events": 1000,
+                            "min_book_events": 50,
+                            "window": manifest_window,
+                        },
+                    }
+                    for slug, scan_mid in slugs
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    attempts = []
+    for (slug, scan_mid), params, pnl, fills, orders in rows:
+        bucket_key = (
+            "non_extreme_tail|"
+            f"depth={params['depth_levels']}|"
+            f"edge={params['min_microprice_edge']}|"
+            f"entry={params['entry_imbalance']}|"
+            f"hold={params['quote_lifetime_seconds']}"
+        )
+        attempts.append(
+            {
+                "slug": slug,
+                "token_index": 0,
+                "source_strategy": "Microprice",
+                "status": "completed",
+                "params": params,
+                "diagnostics": {
+                    "window": window,
+                    "min_book_events": 50,
+                    "pnl": pnl,
+                    "fills": fills,
+                    "strategy_order_count": orders,
+                    "negative_pnl_attribution": {
+                        "schema_version": 1,
+                        "eligible": True,
+                        "classification": "non_positive_pnl_after_fills",
+                        "fail_closed": True,
+                        "primary_cause": "adverse_selection_markout",
+                        "causes": [
+                            "adverse_selection_markout",
+                            "spread_tick_cost_too_large",
+                            "queue_fill_timing",
+                            "parameter_candidate_bucket",
+                        ],
+                        "cause_counts": {
+                            "adverse_selection_markout": 1,
+                            "spread_tick_cost_too_large": 1,
+                            "queue_fill_timing": 1,
+                            "parameter_candidate_bucket": 1,
+                        },
+                        "pnl": pnl,
+                        "fills": fills,
+                        "strategy_order_count": orders,
+                        "adverse_selection_markout": {
+                            "available": True,
+                            "adverse_selection_or_markout_detected": True,
+                            "round_trip_price_edge": -0.035,
+                            "terminal_long_markout": -0.02,
+                        },
+                        "spread_tick_cost": {
+                            "spread_tick_cost_too_large": True,
+                            "round_trip_move_exceeded_effective_spread": True,
+                        },
+                        "queue_fill_timing": {
+                            "queue_or_fill_timing_suspected": True,
+                            "fills": fills,
+                            "strategy_order_count": orders,
+                        },
+                        "parameter_candidate_bucket": {
+                            "slug": slug,
+                            "token_index": 0,
+                            "source_strategy": "Microprice",
+                            "tail_bucket": "non_extreme_tail",
+                            "scan_mid": scan_mid,
+                            "scan_spread": 0.0010000000000000009,
+                            "params": params,
+                            "bucket_key": bucket_key,
+                        },
+                    },
+                },
+            }
+        )
+
+    artifact.write_text(
+        json.dumps(
+            {
+                "classification": "diagnostic_only",
+                "exact_window_status": "verified",
+                "pass_manifest_status": "pass",
+                "attempt_count": 6,
+                "completed_count": 6,
+                "error_count": 0,
+                "fills_orders_pnl": {
+                    "total_fills": 43.0,
+                    "total_strategy_orders": 46.0,
+                    "completed_pnl_sum": -3.44959,
+                    "completed_positive_pnl_attempts": 0,
+                    "completed_negative_pnl_attempts": 6,
+                    "completed_zero_pnl_attempts": 0,
+                },
+                "attempts": attempts,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest, artifact
+
+
+def test_validate_artifact_emits_20260610_negative_pnl_candidate_filter_when_valid(tmp_path):
+    manifest, artifact = _current_20260610_negative_pnl_fixture(tmp_path)
+
+    report = job_b_microprice_batch.build_exact_window_validation_report(
+        manifest_path=manifest,
+        artifact_path=artifact,
+        command=["python", "scripts/job_b_microprice_batch.py", "--validate-artifact"],
+    )
+
+    recommendations = report["negative_pnl_candidate_filter_recommendations"]
+    assert report["classification"] == "diagnostic_only"
+    assert report["exact_window_status"] == "verified"
+    assert report["pass_manifest_status"] == "pass"
+    assert recommendations["classification"] == "negative_pnl_candidate_filter_active"
+    assert recommendations["evidence_valid"] is True
+    assert recommendations["recommendations_emitted"] is True
+    assert recommendations["exclusions_emitted"] is True
+    assert recommendations["eligible_negative_pnl_attempt_count"] == 6
+    assert recommendations["cause_counts"] == {
+        "adverse_selection_markout": 6,
+        "parameter_candidate_bucket": 6,
+        "queue_fill_timing": 6,
+        "spread_tick_cost_too_large": 6,
+    }
+    assert len(recommendations["candidate_exclusions"]) == 3
+    assert len(recommendations["parameter_bucket_exclusions"]) == 2
+    assert len(recommendations["tail_bucket_downranks"]) == 1
+    assert all(
+        row["filter_status"] == job_b_microprice_batch.NEGATIVE_PNL_CANDIDATE_EXCLUSION
+        for row in recommendations["candidate_exclusions"]
+    )
+    assert all(
+        row["filter_status"] == job_b_microprice_batch.NEGATIVE_PNL_PARAMETER_EXCLUSION
+        for row in recommendations["parameter_bucket_exclusions"]
+    )
+    assert recommendations["tail_bucket_downranks"][0]["filter_status"] == (
+        job_b_microprice_batch.NEGATIVE_PNL_TAIL_DOWNRANK
+    )
+    assert (
+        round(sum(row["total_pnl"] for row in recommendations["parameter_bucket_exclusions"]), 5)
+        == -3.44959
+    )
+    names = {item["name"] for item in recommendations["recommendations"]}
+    assert "block_adverse_selection_markout_bucket" in names
+    assert "block_spread_tick_cost_bucket" in names
+    assert "downrank_queue_fill_timing_bucket" in names
+    assert "exclude_negative_parameter_candidate_bucket" in names
+
+
+def test_validate_artifact_withholds_negative_pnl_exclusions_without_valid_evidence(tmp_path):
+    manifest, artifact = _current_20260610_negative_pnl_fixture(
+        tmp_path,
+        manifest_window={
+            "start_time": "2026-06-09T12:00:00Z",
+            "end_time": "2026-06-09T13:00:00Z",
+        },
+    )
+
+    report = job_b_microprice_batch.build_exact_window_validation_report(
+        manifest_path=manifest,
+        artifact_path=artifact,
+        command=["python", "scripts/job_b_microprice_batch.py", "--validate-artifact"],
+    )
+
+    recommendations = report["negative_pnl_candidate_filter_recommendations"]
+    assert report["classification"] == "blocked"
+    assert report["exact_window_status"] == "fail_closed"
+    assert recommendations["classification"] == "evidence_invalid_fail_closed"
+    assert recommendations["evidence_valid"] is False
+    assert recommendations["recommendations_emitted"] is False
+    assert recommendations["exclusions_emitted"] is False
+    assert recommendations["eligible_negative_pnl_attempt_count"] == 0
+    assert recommendations["source_eligible_negative_pnl_attempt_count"] == 6
+    assert recommendations["candidate_exclusions"] == []
+    assert recommendations["parameter_bucket_exclusions"] == []
+    assert recommendations["tail_bucket_downranks"] == []
+    assert "exact_window_not_verified" in recommendations["fail_closed_reason_codes"]
+
+    empty_manifest = tmp_path / "job_B_pmxt_l2_coverage_pass_empty.json"
+    empty_manifest.write_text(
+        json.dumps(
+            {
+                "strategy": "Microprice",
+                "candidate_count": 0,
+                "window": {
+                    "start_time": "2026-06-09T13:00:00Z",
+                    "end_time": "2026-06-09T14:00:00Z",
+                },
+                "min_book_events": 50,
+                "candidates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    empty_report = job_b_microprice_batch.build_exact_window_validation_report(
+        manifest_path=empty_manifest,
+        artifact_path=artifact,
+        command=["python", "scripts/job_b_microprice_batch.py", "--validate-artifact"],
+    )
+    empty_recommendations = empty_report["negative_pnl_candidate_filter_recommendations"]
+    assert empty_report["pass_manifest_status"] == "no_pass"
+    assert empty_recommendations["candidate_exclusions"] == []
+    assert empty_recommendations["parameter_bucket_exclusions"] == []
+    assert "pass_manifest_not_pass" in empty_recommendations["fail_closed_reason_codes"]
 
 
 def test_run_batch_fail_closes_on_exact_window_mismatch(monkeypatch, tmp_path):

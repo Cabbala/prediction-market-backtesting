@@ -35,6 +35,11 @@ from prediction_market_extensions.backtesting.data_sources import Book, PMXT, Po
 from strategies import BookMicropriceImbalanceConfig, BookMicropriceImbalanceStrategy  # noqa: E402
 
 SAFETY_MODE = "backtest_only_no_live_trading"
+NEGATIVE_PNL_EVIDENCE_BLOCK = "fail_closed_wait_for_verified_exact_window_pass_manifest"
+NEGATIVE_PNL_CANDIDATE_EXCLUSION = "fail_closed_exclude_negative_pnl_candidate"
+NEGATIVE_PNL_PARAMETER_EXCLUSION = "fail_closed_exclude_negative_pnl_parameter_bucket"
+NEGATIVE_PNL_TAIL_DOWNRANK = "fail_closed_downrank_negative_pnl_tail_bucket"
+NEGATIVE_PNL_CAUSE_BLOCK = "fail_closed_block_negative_pnl_cause_bucket"
 DEFAULT_SOURCES = (
     "local:/opt/polymarket-lab/data/pmxt/raw",
     "archive:r2v2.pmxt.dev",
@@ -1379,6 +1384,317 @@ def _negative_pnl_guardrail_summary(
     }
 
 
+def _negative_pnl_evidence_requirements(
+    *, exact_window_status: str | None, pass_manifest_status: str | None
+) -> dict[str, Any]:
+    exact_window_verified = str(exact_window_status or "") == "verified"
+    pass_manifest_pass = str(pass_manifest_status or "") == "pass"
+    missing: list[str] = []
+    if not exact_window_verified:
+        missing.append("exact_window_not_verified")
+    if not pass_manifest_pass:
+        missing.append("pass_manifest_not_pass")
+    return {
+        "valid": exact_window_verified and pass_manifest_pass,
+        "exact_window_status": exact_window_status,
+        "pass_manifest_status": pass_manifest_status,
+        "requirements": {
+            "exact_window_verified": exact_window_verified,
+            "pass_manifest_pass": pass_manifest_pass,
+        },
+        "missing_requirements": missing,
+    }
+
+
+def _negative_pnl_filter_attributions(
+    attempts: list[BacktestAttempt] | list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    attributions: list[dict[str, Any]] = []
+    for attempt in attempts:
+        attribution = _attribution_from_attempt_record(attempt)
+        if attribution.get("eligible") is True:
+            attributions.append(attribution)
+    return attributions
+
+
+def _attribution_causes(attribution: Mapping[str, Any]) -> list[str]:
+    causes = attribution.get("causes")
+    if not isinstance(causes, list):
+        return []
+    return sorted({str(cause) for cause in causes if cause})
+
+
+def _filter_market_key(bucket: Mapping[str, Any], attribution: Mapping[str, Any]) -> str:
+    slug = bucket.get("slug") or attribution.get("slug") or "unknown"
+    token_index = bucket.get("token_index")
+    if token_index is None:
+        token_index = attribution.get("token_index")
+    return f"{slug}#{token_index if token_index is not None else 'unknown'}"
+
+
+def _filter_parameter_key(bucket: Mapping[str, Any]) -> str:
+    key = bucket.get("bucket_key")
+    if isinstance(key, str) and key:
+        return key
+    params = json.dumps(_safe_mapping_from(bucket.get("params")), sort_keys=True)
+    token_index = bucket.get("token_index")
+    return (
+        f"{bucket.get('tail_bucket') or 'unknown'}|"
+        f"{bucket.get('slug') or 'unknown'}#"
+        f"{token_index if token_index is not None else 'unknown'}|{params}"
+    )
+
+
+def _new_filter_group(
+    *,
+    key: str,
+    group_type: str,
+    filter_status: str,
+    action: str,
+    first_bucket: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "group_type": group_type,
+        "filter_status": filter_status,
+        "action": action,
+        "fail_closed": True,
+        "attempt_count": 0,
+        "total_pnl": 0.0,
+        "total_fills": 0.0,
+        "total_strategy_orders": 0.0,
+        "positive_pnl_attempt_count": 0,
+        "cause_counts": {},
+        "primary_cause_counts": {},
+        "reason_codes": [],
+        "parameter_bucket_keys": [],
+        "tail_buckets": [],
+        "example_markets": [],
+        "slug": first_bucket.get("slug"),
+        "token_index": first_bucket.get("token_index"),
+        "source_strategy": first_bucket.get("source_strategy"),
+        "params": first_bucket.get("params") or {},
+        "scan_mid": first_bucket.get("scan_mid"),
+        "scan_spread": first_bucket.get("scan_spread"),
+        "liquidity": first_bucket.get("liquidity"),
+        "tail_bucket": first_bucket.get("tail_bucket"),
+    }
+
+
+def _merge_filter_group(group: dict[str, Any], attribution: Mapping[str, Any]) -> None:
+    group["attempt_count"] += 1
+    pnl = _parse_float(attribution.get("pnl"))
+    if pnl is not None:
+        group["total_pnl"] += pnl
+        if pnl > 0:
+            group["positive_pnl_attempt_count"] += 1
+    fills = _parse_float(attribution.get("fills"))
+    if fills is not None:
+        group["total_fills"] += fills
+    strategy_order_count = _parse_float(attribution.get("strategy_order_count"))
+    if strategy_order_count is not None:
+        group["total_strategy_orders"] += strategy_order_count
+    for cause in _attribution_causes(attribution):
+        _increment_count(group["cause_counts"], cause)
+    _increment_count(group["primary_cause_counts"], attribution.get("primary_cause"))
+
+    bucket = _safe_mapping_from(attribution.get("parameter_candidate_bucket"))
+    parameter_key = _filter_parameter_key(bucket)
+    if parameter_key not in group["parameter_bucket_keys"]:
+        group["parameter_bucket_keys"].append(parameter_key)
+    tail_bucket = str(bucket.get("tail_bucket") or "unknown")
+    if tail_bucket not in group["tail_buckets"]:
+        group["tail_buckets"].append(tail_bucket)
+    market_key = _filter_market_key(bucket, attribution)
+    if market_key not in group["example_markets"] and len(group["example_markets"]) < 10:
+        group["example_markets"].append(market_key)
+
+
+def _finalize_filter_group(group: dict[str, Any]) -> dict[str, Any]:
+    cause_counts = dict(sorted(group.get("cause_counts", {}).items()))
+    primary_cause_counts = dict(sorted(group.get("primary_cause_counts", {}).items()))
+    return {
+        **group,
+        "cause_counts": cause_counts,
+        "primary_cause_counts": primary_cause_counts,
+        "reason_codes": sorted(cause_counts),
+        "parameter_bucket_keys": sorted(group.get("parameter_bucket_keys", [])),
+        "tail_buckets": sorted(group.get("tail_buckets", [])),
+        "example_markets": sorted(group.get("example_markets", [])),
+    }
+
+
+def _group_negative_pnl_filters(
+    attributions: list[dict[str, Any]],
+    *,
+    group_type: str,
+    filter_status: str,
+    action: str,
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for attribution in attributions:
+        bucket = _safe_mapping_from(attribution.get("parameter_candidate_bucket"))
+        if group_type == "candidate":
+            key = _filter_market_key(bucket, attribution)
+        elif group_type == "parameter_bucket":
+            key = _filter_parameter_key(bucket)
+        elif group_type == "tail_bucket":
+            key = str(bucket.get("tail_bucket") or "unknown")
+        else:
+            key = group_type
+        group = groups.setdefault(
+            key,
+            _new_filter_group(
+                key=key,
+                group_type=group_type,
+                filter_status=filter_status,
+                action=action,
+                first_bucket=bucket,
+            ),
+        )
+        _merge_filter_group(group, attribution)
+    return [_finalize_filter_group(groups[key]) for key in sorted(groups)]
+
+
+def _negative_pnl_cause_recommendations(
+    *,
+    cause_counts: Mapping[str, Any],
+    attributions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    recommendations: list[dict[str, Any]] = []
+    cause_actions = (
+        (
+            "adverse_selection_markout",
+            "block_adverse_selection_markout_bucket",
+            "Exclude candidate/parameter buckets with adverse round-trip or terminal markout.",
+        ),
+        (
+            "spread_tick_cost_too_large",
+            "block_spread_tick_cost_bucket",
+            "Exclude candidate/parameter buckets where spread, tick move, or commission cost overwhelmed fills.",
+        ),
+        (
+            "queue_fill_timing",
+            "downrank_queue_fill_timing_bucket",
+            "Downrank candidate/parameter buckets with queue or fill-timing suspicion.",
+        ),
+        (
+            "parameter_candidate_bucket",
+            "exclude_negative_parameter_candidate_bucket",
+            "Exclude negative after-cost parameter buckets before the next Job B replay.",
+        ),
+    )
+    for cause, name, rationale in cause_actions:
+        count = _safe_count(cause_counts.get(cause))
+        if count <= 0:
+            continue
+        recommendations.append(
+            {
+                "name": name,
+                "reason_code": cause,
+                "filter_status": NEGATIVE_PNL_CAUSE_BLOCK,
+                "fail_closed": True,
+                "affected_attempt_count": count,
+                "rationale": rationale,
+            }
+        )
+    recommendations.append(
+        {
+            "name": "require_positive_after_costs_and_cleared_attribution_before_replay_promotion",
+            "filter_status": "required_before_any_future_promotion",
+            "fail_closed": True,
+            "affected_attempt_count": len(attributions),
+            "rationale": (
+                "Future Microprice replay promotion requires valid exact-window coverage, fills, "
+                "positive after-cost PnL, and no active negative-PnL attribution."
+            ),
+        }
+    )
+    return recommendations
+
+
+def _negative_pnl_candidate_filter_recommendations(
+    attempts: list[BacktestAttempt] | list[Mapping[str, Any]],
+    fills_orders_pnl: dict[str, Any],
+    *,
+    exact_window_status: str | None,
+    pass_manifest_status: str | None,
+) -> dict[str, Any]:
+    evidence = _negative_pnl_evidence_requirements(
+        exact_window_status=exact_window_status,
+        pass_manifest_status=pass_manifest_status,
+    )
+    attributions = _negative_pnl_filter_attributions(attempts)
+    guardrail = _negative_pnl_guardrail_summary(attempts, fills_orders_pnl)
+    cause_counts: dict[str, int] = {}
+    for attribution in attributions:
+        for cause in _attribution_causes(attribution):
+            cause_counts[cause] = cause_counts.get(cause, 0) + 1
+
+    active = bool(evidence["valid"] and guardrail.get("guardrail_triggered") and attributions)
+    if not evidence["valid"]:
+        classification = "evidence_invalid_fail_closed"
+    elif active:
+        classification = "negative_pnl_candidate_filter_active"
+    else:
+        classification = "not_applicable_no_valid_negative_pnl_guardrail"
+
+    candidate_exclusions: list[dict[str, Any]] = []
+    parameter_bucket_exclusions: list[dict[str, Any]] = []
+    tail_bucket_downranks: list[dict[str, Any]] = []
+    recommendations: list[dict[str, Any]] = []
+    if active:
+        candidate_exclusions = _group_negative_pnl_filters(
+            attributions,
+            group_type="candidate",
+            filter_status=NEGATIVE_PNL_CANDIDATE_EXCLUSION,
+            action="exclude_candidate_from_next_job_b_replay",
+        )
+        parameter_bucket_exclusions = _group_negative_pnl_filters(
+            attributions,
+            group_type="parameter_bucket",
+            filter_status=NEGATIVE_PNL_PARAMETER_EXCLUSION,
+            action="exclude_parameter_bucket_from_next_job_b_replay",
+        )
+        tail_bucket_downranks = _group_negative_pnl_filters(
+            attributions,
+            group_type="tail_bucket",
+            filter_status=NEGATIVE_PNL_TAIL_DOWNRANK,
+            action="downrank_tail_bucket_before_next_job_b_candidate_selection",
+        )
+        recommendations = _negative_pnl_cause_recommendations(
+            cause_counts=cause_counts,
+            attributions=attributions,
+        )
+
+    filter_status = NEGATIVE_PNL_CANDIDATE_EXCLUSION if active else NEGATIVE_PNL_EVIDENCE_BLOCK
+    if evidence["valid"] and not active:
+        filter_status = "not_applicable_no_valid_negative_pnl_guardrail"
+
+    return {
+        "schema_version": 1,
+        "classification": classification,
+        "fail_closed": True,
+        "evidence": evidence,
+        "evidence_valid": bool(evidence["valid"]),
+        "guardrail_classification": guardrail.get("classification"),
+        "guardrail_triggered": bool(guardrail.get("guardrail_triggered")),
+        "positive_edge_claimable": bool(guardrail.get("positive_edge_claimable")),
+        "no_profit_claim": True,
+        "recommendations_emitted": bool(recommendations),
+        "exclusions_emitted": bool(candidate_exclusions or parameter_bucket_exclusions),
+        "filter_status": filter_status,
+        "fail_closed_reason_codes": list(evidence.get("missing_requirements", [])),
+        "eligible_negative_pnl_attempt_count": len(attributions) if evidence["valid"] else 0,
+        "source_eligible_negative_pnl_attempt_count": len(attributions),
+        "cause_counts": dict(sorted(cause_counts.items())) if evidence["valid"] else {},
+        "candidate_exclusions": candidate_exclusions,
+        "parameter_bucket_exclusions": parameter_bucket_exclusions,
+        "tail_bucket_downranks": tail_bucket_downranks,
+        "recommendations": recommendations,
+    }
+
+
 def _tick_cost_diagnostic(
     *, scan_mid: float | None, scan_spread: float | None, observed_min_spread: float | None
 ) -> dict[str, Any]:
@@ -2170,6 +2486,7 @@ def build_exact_window_validation_report(
         candidate_count=candidate_count,
         exact_window_status=exact_window_status,
     )
+    pass_manifest_status = "pass" if candidate_count > 0 else "no_pass"
     artifact_fills_orders_pnl = (
         artifact_payload.get("fills_orders_pnl")
         if isinstance(artifact_payload.get("fills_orders_pnl"), dict)
@@ -2192,6 +2509,12 @@ def build_exact_window_validation_report(
             [attempt for attempt in attempts if isinstance(attempt, Mapping)],
             artifact_fills_orders_pnl,
         )
+    artifact_negative_pnl_filter_recommendations = _negative_pnl_candidate_filter_recommendations(
+        [attempt for attempt in attempts if isinstance(attempt, Mapping)],
+        artifact_fills_orders_pnl,
+        exact_window_status=exact_window_status,
+        pass_manifest_status=pass_manifest_status,
+    )
     return {
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "mode": SAFETY_MODE,
@@ -2199,11 +2522,14 @@ def build_exact_window_validation_report(
         "live_ready": False,
         "no_profit_claim": True,
         "exact_window_status": exact_window_status,
-        "pass_manifest_status": "pass" if candidate_count > 0 else "no_pass",
+        "pass_manifest_status": pass_manifest_status,
         "manifest": str(manifest_path),
         "artifact": str(artifact_path),
         "negative_pnl_attribution_summary": artifact_negative_pnl_summary,
         "negative_pnl_guardrail_summary": artifact_negative_pnl_guardrail_summary,
+        "negative_pnl_candidate_filter_recommendations": (
+            artifact_negative_pnl_filter_recommendations
+        ),
         "manifest_selection": manifest_selection
         or [{"path": str(manifest_path), "selected": True, "reason": "explicit_manifest"}],
         "expected_selected_windows": expected_records,
@@ -2558,6 +2884,13 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         attempts=attempts,
     )
     aggregate_diagnostics = _aggregate_diagnostics(attempts)
+    pass_manifest_status = "pass" if candidates else "no_pass"
+    negative_pnl_candidate_filter_recommendations = _negative_pnl_candidate_filter_recommendations(
+        attempts,
+        aggregate_diagnostics["fills_orders_pnl"],
+        exact_window_status=str(exact_window["status"]),
+        pass_manifest_status=pass_manifest_status,
+    )
     classification = _classification_for_exact_window(
         candidate_count=len(candidates),
         exact_window_status=str(exact_window["status"]),
@@ -2568,7 +2901,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "classification": classification,
         "live_ready": False,
         "no_profit_claim": True,
-        "pass_manifest_status": "pass" if candidates else "no_pass",
+        "pass_manifest_status": pass_manifest_status,
         "safety": {
             "live_trading": False,
             "orders_submitted": False,
@@ -2619,6 +2952,9 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
             "negative_pnl_attribution_summary"
         ],
         "negative_pnl_guardrail_summary": aggregate_diagnostics["negative_pnl_guardrail_summary"],
+        "negative_pnl_candidate_filter_recommendations": (
+            negative_pnl_candidate_filter_recommendations
+        ),
         "tail_bucket_counts": aggregate_diagnostics["tail_bucket_counts"],
         "tick_cost_buckets": aggregate_diagnostics["tick_cost_bucket_counts"],
         "candidate_selection": {
@@ -2734,6 +3070,7 @@ def _write_outputs(summary: dict[str, Any], output_dir: Path, timestamp: str) ->
         f"- fills_orders_pnl: {json.dumps(summary.get('fills_orders_pnl', {}), sort_keys=True)}",
         f"- negative_pnl_attribution_summary: {json.dumps(summary.get('negative_pnl_attribution_summary', {}), sort_keys=True)}",
         f"- negative_pnl_guardrail_summary: {json.dumps(summary.get('negative_pnl_guardrail_summary', {}), sort_keys=True)}",
+        f"- negative_pnl_candidate_filter_recommendations: {json.dumps(summary.get('negative_pnl_candidate_filter_recommendations', {}), sort_keys=True)}",
         f"- tail_bucket_counts: {json.dumps(summary.get('tail_bucket_counts', {}), sort_keys=True)}",
         f"- tick_cost_buckets: {json.dumps(summary.get('tick_cost_buckets', {}), sort_keys=True)}",
         f"- no_order_cause_counts: {json.dumps(aggregate_diagnostics.get('no_order_cause_counts', {}), sort_keys=True)}",
@@ -2810,6 +3147,7 @@ def _write_validation_outputs(
         f"- worker_trading_started={str(report.get('safety', {}).get('worker_trading_started')).lower()}",
         f"- negative_pnl_attribution_summary: {json.dumps(report.get('negative_pnl_attribution_summary', {}), sort_keys=True)}",
         f"- negative_pnl_guardrail_summary: {json.dumps(report.get('negative_pnl_guardrail_summary', {}), sort_keys=True)}",
+        f"- negative_pnl_candidate_filter_recommendations: {json.dumps(report.get('negative_pnl_candidate_filter_recommendations', {}), sort_keys=True)}",
         "",
         "Safety: backtest/shadow only; no live trading, signing, cancellation, order submission, credentials, or worker-trading.",
     ]
