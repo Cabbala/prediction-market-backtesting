@@ -7,6 +7,7 @@ import json
 import math
 import multiprocessing as mp
 import queue as queue_module
+import signal
 import traceback
 import warnings
 from contextlib import contextmanager
@@ -49,6 +50,12 @@ REQUIRED_SAFETY_FIELDS = (
     "worker_trading_started",
 )
 DEFAULT_PROCESS_TIMEOUT_GRACE_SECONDS = 1
+
+
+class ProbeRunInterrupted(RuntimeError):
+    def __init__(self, signal_name: str) -> None:
+        super().__init__(f"PMXT coverage probe interrupted by {signal_name}")
+        self.signal_name = signal_name
 
 
 @dataclass(frozen=True)
@@ -323,6 +330,17 @@ def _summary_result_row(result: CoverageProbeResult) -> dict[str, Any]:
     return row
 
 
+def _result_key(result: CoverageProbeResult) -> tuple[str, str, int, str, str, str]:
+    return (
+        result.slug,
+        str(result.token_index),
+        int(result.min_book_events),
+        result.window_start_time or "",
+        result.window_end_time or "",
+        result.source_manifest or "",
+    )
+
+
 def _coverage_result_from_row(row: dict[str, Any]) -> CoverageProbeResult:
     field_names = {field.name for field in fields(CoverageProbeResult)}
     return CoverageProbeResult(**{key: value for key, value in row.items() if key in field_names})
@@ -555,7 +573,16 @@ def _run_target_in_process(
     )
     process.daemon = True
     process.start()
-    process.join(timeout=max(1, int(timeout_seconds) + int(timeout_grace_seconds)))
+    try:
+        process.join(timeout=max(1, int(timeout_seconds) + int(timeout_grace_seconds)))
+    except ProbeRunInterrupted:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=1)
+        raise
     if process.is_alive():
         process.terminate()
         process.join(timeout=1)
@@ -965,43 +992,6 @@ def _build_probe_targets(
     return primary_targets, expansion_targets[:max_alternate_probes], manifest_records, cli_windows
 
 
-async def _run_targets(
-    targets: list[ProbeTarget],
-    *,
-    sources: tuple[str, ...],
-    timeout_seconds: int,
-    process_isolation: bool,
-    timeout_grace_seconds: int,
-) -> list[CoverageProbeResult]:
-    results: list[CoverageProbeResult] = []
-    for target in targets:
-        if process_isolation:
-            results.append(
-                _run_target_in_process(
-                    target,
-                    sources=sources,
-                    timeout_seconds=timeout_seconds,
-                    timeout_grace_seconds=timeout_grace_seconds,
-                )
-            )
-        else:
-            results.append(
-                await _probe_with_timeout(
-                    target.candidate,
-                    start_time=target.start_time,
-                    end_time=target.end_time,
-                    min_book_events=target.min_book_events,
-                    sources=sources,
-                    timeout_seconds=timeout_seconds,
-                    selection_phase=target.selection_phase,
-                    source_manifest=target.source_manifest,
-                    window_source=target.window_source,
-                    window_provenance=target.window_provenance,
-                )
-            )
-    return results
-
-
 def _diagnostic_counts(
     results: list[CoverageProbeResult], *, no_eligible_candidates: bool
 ) -> dict[str, int]:
@@ -1056,41 +1046,24 @@ def _probed_windows(
     ]
 
 
-async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
-    primary_targets, expansion_targets, manifest_records, windows = _build_probe_targets(args)
+def _build_probe_summary(
+    args: argparse.Namespace,
+    *,
+    primary_targets: list[ProbeTarget],
+    expansion_targets: list[ProbeTarget],
+    manifest_records: list[dict[str, Any]],
+    windows: list[tuple[str, str]],
+    sources: tuple[str, ...],
+    process_isolation: bool,
+    timeout_grace_seconds: int,
+    primary_results: list[CoverageProbeResult],
+    expansion_results: list[CoverageProbeResult],
+    expansion_triggered: bool,
+    runtime_status: str,
+    runtime_message: str | None = None,
+) -> dict[str, Any]:
     primary_start_time, primary_end_time = windows[0]
-    sources = tuple(args.sources or DEFAULT_SOURCES)
-    process_isolation = bool(getattr(args, "process_isolation", True))
-    timeout_grace_seconds = _int_arg(
-        args,
-        "process_timeout_grace_seconds",
-        DEFAULT_PROCESS_TIMEOUT_GRACE_SECONDS,
-    )
-    primary_results = await _run_targets(
-        primary_targets,
-        sources=sources,
-        timeout_seconds=args.timeout_seconds,
-        process_isolation=process_isolation,
-        timeout_grace_seconds=timeout_grace_seconds,
-    )
-    expansion_triggered = bool(
-        primary_results
-        and not any(result.status == "pass" for result in primary_results)
-        and expansion_targets
-    )
-    expansion_results = (
-        await _run_targets(
-            expansion_targets,
-            sources=sources,
-            timeout_seconds=args.timeout_seconds,
-            process_isolation=process_isolation,
-            timeout_grace_seconds=timeout_grace_seconds,
-        )
-        if expansion_triggered
-        else []
-    )
     results = primary_results + expansion_results
-
     pass_count = sum(1 for result in results if result.status == "pass")
     no_coverage_count = sum(1 for result in results if result.status == "no_coverage")
     error_count = sum(1 for result in results if result.status == "error")
@@ -1105,9 +1078,11 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     )
     probed_windows = _probed_windows(results, windows)
     safety = _safety_fields()
+    classification = "complete" if runtime_status == "complete" else "probe_runtime_timeout"
     return {
         "schema_version": 1,
         "generated_at": _utc_now().isoformat().replace("+00:00", "Z"),
+        "classification": classification,
         "mode": SAFETY_MODE,
         "safety": safety,
         **_safety_top_level_fields(safety),
@@ -1122,6 +1097,16 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "primary_candidate_count": len(primary_targets),
         "expansion_candidate_count": max(0, len(probed_candidates) - len(primary_targets)),
         "probe_window_count": len(probed_windows),
+        "target_probe_count": len(primary_targets)
+        + (len(expansion_targets) if expansion_triggered else 0),
+        "target_candidate_count": len(
+            {
+                (target.candidate.slug, target.candidate.token_index)
+                for target in (
+                    primary_targets + expansion_targets if expansion_triggered else primary_targets
+                )
+            }
+        ),
         "probe_count": len(results),
         "primary_probe_count": len(primary_results),
         "expansion_probe_count": len(expansion_results),
@@ -1143,8 +1128,148 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "process_isolation": process_isolation,
             "process_timeout_grace_seconds": timeout_grace_seconds,
         },
+        "runtime": {
+            "status": runtime_status,
+            "message": runtime_message,
+            "streaming_artifacts": bool(getattr(args, "stream_artifacts", False)),
+        },
         "results": [_summary_result_row(result) for result in results],
     }
+
+
+def _pending_timeout_results(
+    targets: list[ProbeTarget],
+    completed_results: list[CoverageProbeResult],
+    *,
+    timeout_seconds: int,
+    message: str,
+) -> list[CoverageProbeResult]:
+    completed = {_result_key(result) for result in completed_results}
+    pending: list[CoverageProbeResult] = []
+    for target in targets:
+        if _target_key(target) in completed:
+            continue
+        pending.append(
+            _timeout_result_from_target(
+                target,
+                timeout_seconds=timeout_seconds,
+                message=message,
+            )
+        )
+    return pending
+
+
+class _StreamingArtifactWriter:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.enabled = bool(getattr(args, "stream_artifacts", False))
+        self.output_dir = getattr(args, "output_dir", DEFAULT_OUTPUT_DIR)
+        self.pass_manifest_dir = getattr(args, "pass_manifest_dir", DEFAULT_PASS_MANIFEST_DIR)
+        self.timestamp = _timestamp(getattr(args, "timestamp", None))
+        self.output_files: dict[str, str] = {}
+
+    def write(self, summary: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self.output_files = write_outputs(
+            summary,
+            output_dir=self.output_dir,
+            pass_manifest_dir=self.pass_manifest_dir,
+            timestamp=self.timestamp,
+        )
+
+
+async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+    primary_targets, expansion_targets, manifest_records, windows = _build_probe_targets(args)
+    sources = tuple(args.sources or DEFAULT_SOURCES)
+    process_isolation = bool(getattr(args, "process_isolation", True))
+    timeout_grace_seconds = _int_arg(
+        args,
+        "process_timeout_grace_seconds",
+        DEFAULT_PROCESS_TIMEOUT_GRACE_SECONDS,
+    )
+    primary_results: list[CoverageProbeResult] = []
+    expansion_results: list[CoverageProbeResult] = []
+    expansion_triggered = False
+    artifact_writer = _StreamingArtifactWriter(args)
+
+    def write_partial(runtime_status: str, runtime_message: str | None = None) -> dict[str, Any]:
+        summary = _build_probe_summary(
+            args,
+            primary_targets=primary_targets,
+            expansion_targets=expansion_targets,
+            manifest_records=manifest_records,
+            windows=windows,
+            sources=sources,
+            process_isolation=process_isolation,
+            timeout_grace_seconds=timeout_grace_seconds,
+            primary_results=primary_results,
+            expansion_results=expansion_results,
+            expansion_triggered=expansion_triggered,
+            runtime_status=runtime_status,
+            runtime_message=runtime_message,
+        )
+        artifact_writer.write(summary)
+        return summary
+
+    async def run_target(target: ProbeTarget) -> CoverageProbeResult:
+        if process_isolation:
+            return _run_target_in_process(
+                target,
+                sources=sources,
+                timeout_seconds=args.timeout_seconds,
+                timeout_grace_seconds=timeout_grace_seconds,
+            )
+        return await _probe_with_timeout(
+            target.candidate,
+            start_time=target.start_time,
+            end_time=target.end_time,
+            min_book_events=target.min_book_events,
+            sources=sources,
+            timeout_seconds=args.timeout_seconds,
+            selection_phase=target.selection_phase,
+            source_manifest=target.source_manifest,
+            window_source=target.window_source,
+            window_provenance=target.window_provenance,
+        )
+
+    write_partial("running_partial")
+    try:
+        for target in primary_targets:
+            primary_results.append(await run_target(target))
+            write_partial("running_partial")
+        expansion_triggered = bool(
+            primary_results
+            and not any(result.status == "pass" for result in primary_results)
+            and expansion_targets
+        )
+        if expansion_triggered:
+            for target in expansion_targets:
+                expansion_results.append(await run_target(target))
+                write_partial("running_partial")
+    except ProbeRunInterrupted as exc:
+        message = (
+            f"Interrupted by {exc.signal_name}; remaining candidate/window probes were "
+            "recorded as non-pass runtime timeouts."
+        )
+        primary_results.extend(
+            _pending_timeout_results(
+                primary_targets,
+                primary_results,
+                timeout_seconds=args.timeout_seconds,
+                message=message,
+            )
+        )
+        if expansion_triggered:
+            expansion_results.extend(
+                _pending_timeout_results(
+                    expansion_targets,
+                    expansion_results,
+                    timeout_seconds=args.timeout_seconds,
+                    message=message,
+                )
+            )
+        return write_partial("interrupted_fail_closed", message)
+    return write_partial("complete")
 
 
 def _write_csv(summary: dict[str, Any], csv_path: Path) -> None:
@@ -1246,6 +1371,13 @@ def write_outputs(
     md_path = output_dir / f"pmxt_l2_coverage_{timestamp}.md"
     pass_manifest_path = pass_manifest_dir / f"job_B_pmxt_l2_coverage_pass_{timestamp}.json"
 
+    output_files = {
+        "json": str(json_path),
+        "csv": str(csv_path),
+        "markdown": str(md_path),
+        "pass_manifest": str(pass_manifest_path),
+    }
+    summary["output_files"] = output_files
     pass_manifest = _build_pass_manifest(summary)
     json_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     _write_csv(summary, csv_path)
@@ -1254,12 +1386,32 @@ def write_outputs(
         encoding="utf-8",
     )
     _write_markdown(summary, md_path, pass_manifest_path)
-    return {
-        "json": str(json_path),
-        "csv": str(csv_path),
-        "markdown": str(md_path),
-        "pass_manifest": str(pass_manifest_path),
-    }
+    return output_files
+
+
+@contextmanager
+def _fail_closed_signal_handlers():  # type: ignore[no-untyped-def]
+    previous_handlers: dict[signal.Signals, Any] = {}
+
+    def _raise_interrupted(signum, frame):  # type: ignore[no-untyped-def]
+        del frame
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = str(signum)
+        raise ProbeRunInterrupted(signal_name)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _raise_interrupted)
+        except (AttributeError, OSError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1343,6 +1495,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "terminating the child process."
         ),
     )
+    parser.add_argument(
+        "--stream-artifacts",
+        action="store_true",
+        dest="stream_artifacts",
+        help=(
+            "Rewrite JSON/CSV/Markdown/pass-manifest artifacts after each candidate/window "
+            "row so bounded wrapper timeouts leave parseable fail-closed outputs."
+        ),
+    )
+    parser.add_argument(
+        "--no-stream-artifacts",
+        action="store_false",
+        dest="stream_artifacts",
+        help="Disable incremental artifact writes; final artifacts are still written on completion.",
+    )
+    parser.set_defaults(stream_artifacts=True)
     parser.add_argument("--fail-on-errors", action="store_true")
     parser.add_argument("--fail-on-no-pass", action="store_true")
     args = parser.parse_args(argv)
@@ -1371,7 +1539,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    summary = asyncio.run(run_probe(args))
+    with _fail_closed_signal_handlers():
+        summary = asyncio.run(run_probe(args))
     output_files = write_outputs(
         summary,
         output_dir=args.output_dir,

@@ -268,6 +268,182 @@ def test_process_timeout_preserves_partial_candidate_window_outputs(monkeypatch,
     }
 
 
+def test_streaming_artifacts_update_after_each_candidate_window_timeout(
+    monkeypatch, tmp_path
+) -> None:
+    source_manifest = tmp_path / "source_manifest.json"
+    _write_source_manifest(source_manifest)
+    output_dir = tmp_path / "reports"
+    pass_manifest_dir = tmp_path / "pass_manifests"
+    timestamp = "20260504T000007Z"
+
+    def _fake_run_target_in_process(target, **kwargs):  # type: ignore[no-untyped-def]
+        if target.candidate.slug == "covered-market":
+            return probe_pmxt_l2_coverage._result_from_candidate(
+                target.candidate,
+                status="pass",
+                book_events=75,
+                min_book_events=target.min_book_events,
+                selection_phase=target.selection_phase,
+                source_manifest=target.source_manifest,
+                window_start_time=target.start_time,
+                window_end_time=target.end_time,
+            )
+
+        interim_json = output_dir / f"pmxt_l2_coverage_{timestamp}.json"
+        interim_pass = pass_manifest_dir / f"job_B_pmxt_l2_coverage_pass_{timestamp}.json"
+        assert interim_json.exists()
+        assert interim_pass.exists()
+        interim_report = json.loads(interim_json.read_text(encoding="utf-8"))
+        assert [row["slug"] for row in interim_report["results"]] == ["covered-market"]
+        assert interim_report["classification"] == "probe_runtime_timeout"
+        assert interim_report["orders_submitted"] is False
+        assert interim_report["runtime"]["status"] == "running_partial"
+
+        return probe_pmxt_l2_coverage._timeout_result_from_target(
+            target,
+            timeout_seconds=kwargs["timeout_seconds"],
+        )
+
+    monkeypatch.setattr(
+        probe_pmxt_l2_coverage,
+        "_run_target_in_process",
+        _fake_run_target_in_process,
+    )
+    args = Namespace(
+        manifest=source_manifest,
+        output_dir=output_dir,
+        pass_manifest_dir=pass_manifest_dir,
+        start_time="2026-03-22T09:00:00Z",
+        end_time="2026-03-22T10:00:00Z",
+        strategy="microprice_optimizer",
+        max_candidates=2,
+        min_book_events=50,
+        sources=None,
+        timeout_seconds=1,
+        recent_window_count=1,
+        window_step_hours=1,
+        process_isolation=True,
+        process_timeout_grace_seconds=0,
+        stream_artifacts=True,
+        timestamp=timestamp,
+    )
+
+    summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
+
+    assert summary["runtime"]["status"] == "complete"
+    assert summary["pass_count"] == 1
+    assert summary["error_count"] == 1
+    assert summary["diagnostic_counts"]["probe_runtime_timeout"] == 1
+    json_report = json.loads(
+        (output_dir / f"pmxt_l2_coverage_{timestamp}.json").read_text(encoding="utf-8")
+    )
+    csv_rows = list(
+        csv.DictReader((output_dir / f"pmxt_l2_coverage_{timestamp}.csv").open(encoding="utf-8"))
+    )
+    pass_manifest = json.loads(
+        (pass_manifest_dir / f"job_B_pmxt_l2_coverage_pass_{timestamp}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [row["status"] for row in json_report["results"]] == ["pass", "error"]
+    assert csv_rows[1]["diagnostic_category"] == "probe_runtime_timeout"
+    assert pass_manifest["candidate_count"] == 1
+    assert [candidate["market_slug"] for candidate in pass_manifest["candidates"]] == [
+        "covered-market"
+    ]
+    assert pass_manifest["orders_submitted"] is False
+
+
+def test_interrupted_streaming_run_finalizes_unreturned_targets_as_fail_closed(
+    monkeypatch, tmp_path
+) -> None:
+    source_manifest = tmp_path / "source_manifest.json"
+    _write_source_manifest(source_manifest)
+    output_dir = tmp_path / "reports"
+    pass_manifest_dir = tmp_path / "pass_manifests"
+    timestamp = "20260504T000008Z"
+    calls: list[str] = []
+
+    def _fake_run_target_in_process(target, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        calls.append(target.candidate.slug)
+        if target.candidate.slug == "covered-market":
+            return probe_pmxt_l2_coverage._result_from_candidate(
+                target.candidate,
+                status="pass",
+                book_events=75,
+                min_book_events=target.min_book_events,
+                selection_phase=target.selection_phase,
+                source_manifest=target.source_manifest,
+                window_start_time=target.start_time,
+                window_end_time=target.end_time,
+            )
+        raise probe_pmxt_l2_coverage.ProbeRunInterrupted("SIGTERM")
+
+    monkeypatch.setattr(
+        probe_pmxt_l2_coverage,
+        "_run_target_in_process",
+        _fake_run_target_in_process,
+    )
+    args = Namespace(
+        manifest=source_manifest,
+        output_dir=output_dir,
+        pass_manifest_dir=pass_manifest_dir,
+        start_time="2026-03-22T09:00:00Z",
+        end_time="2026-03-22T10:00:00Z",
+        strategy="microprice_optimizer",
+        max_candidates=3,
+        min_book_events=50,
+        sources=None,
+        timeout_seconds=1,
+        recent_window_count=1,
+        window_step_hours=1,
+        process_isolation=True,
+        process_timeout_grace_seconds=0,
+        stream_artifacts=True,
+        timestamp=timestamp,
+    )
+
+    summary = asyncio.run(probe_pmxt_l2_coverage.run_probe(args))
+
+    assert calls == ["covered-market", "thin-market"]
+    assert summary["classification"] == "probe_runtime_timeout"
+    assert summary["runtime"]["status"] == "interrupted_fail_closed"
+    assert summary["pass_count"] == 1
+    assert summary["error_count"] == 2
+    assert summary["diagnostic_counts"]["probe_runtime_timeout"] == 2
+    assert [row["slug"] for row in summary["results"]] == [
+        "covered-market",
+        "thin-market",
+        "broken-market",
+    ]
+    assert [row["status"] for row in summary["results"]] == ["pass", "error", "error"]
+    assert all(
+        row["diagnostic_category"] == "probe_runtime_timeout" for row in summary["results"][1:]
+    )
+    json_report = json.loads(
+        (output_dir / f"pmxt_l2_coverage_{timestamp}.json").read_text(encoding="utf-8")
+    )
+    pass_manifest = json.loads(
+        (pass_manifest_dir / f"job_B_pmxt_l2_coverage_pass_{timestamp}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert json_report["classification"] == "probe_runtime_timeout"
+    assert json_report["orders_submitted"] is False
+    assert json_report["orders_signed"] is False
+    assert json_report["orders_cancelled"] is False
+    assert json_report["credentials_required"] is False
+    assert json_report["live_trading_worker_started"] is False
+    assert json_report["worker_trading_started"] is False
+    assert pass_manifest["candidate_count"] == 1
+    assert pass_manifest["orders_submitted"] is False
+    assert [candidate["market_slug"] for candidate in pass_manifest["candidates"]] == [
+        "covered-market"
+    ]
+
+
 def test_job_b_load_candidates_preserves_top_level_source_strategy(tmp_path) -> None:
     pass_manifest = tmp_path / "coverage_pass_manifest.json"
     pass_manifest.write_text(
